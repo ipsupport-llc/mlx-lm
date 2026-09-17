@@ -301,6 +301,10 @@ class ModelProvider:
         self._model_map["default_model"] = self.cli_args.model
         self._adapter_map["default_model"] = self.cli_args.adapter_path
         self._draft_model_map["default_model"] = self.cli_args.draft_model
+        for _alias in (self.cli_args.model_alias or []):
+            self._model_map[_alias] = self.cli_args.model
+            self._adapter_map[_alias] = self.cli_args.adapter_path
+            self._draft_model_map[_alias] = self.cli_args.draft_model
 
         # Build the tokenizer config for later use in load
         self._tokenizer_config = {"trust_remote_code": cli_args.trust_remote_code}
@@ -1566,6 +1570,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(response_json)
                 self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # Client disconnected mid-stream (Ctrl-C, timeout, navigated
+            # away) -- the generation already did its useful work, so just
+            # stop cleanly instead of crashing the request thread.
+            logging.debug(f"Client disconnected mid-response, stopping generation: {e!r}")
         finally:
             ctx.stop()
 
@@ -1639,7 +1648,11 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        if self.path.startswith("/v1/models") or self.path.startswith("/api/v0/models"):
+            # /api/v0/models is LM Studio's own REST convention -- some
+            # clients probe that shape by default. Same OpenAI-shaped
+            # response as /v1/models, not LM Studio's richer schema, but
+            # enough to stop 404s and hand back a usable model list.
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
@@ -1816,6 +1829,13 @@ def main():
         "--trust-remote-code",
         action="store_true",
         help="Enable trusting remote code for tokenizer",
+    )
+    parser.add_argument(
+        "--model-alias",
+        action="append",
+        default=None,
+        help="Extra model name a client may request that should route to --model "
+        "instead of mlx_lm trying to fetch it from the HF Hub. Repeatable.",
     )
     parser.add_argument(
         "--log-level",
