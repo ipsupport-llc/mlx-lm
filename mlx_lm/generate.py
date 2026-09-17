@@ -655,6 +655,101 @@ def speculative_generate_step(
             _rewind_cache(num_draft, n)
 
 
+def _model_supports_nemotron_h_mtp(model: nn.Module) -> bool:
+    return (
+        getattr(model, "mtp", None) is not None
+        and hasattr(model, "mtp_step")
+        and hasattr(model, "make_mtp_cache")
+        and hasattr(model, "rollback_speculative_cache")
+    )
+
+
+def nemotron_h_mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Sampler] = None,
+    prompt_cache: Optional[Any] = None,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """Self-speculative decoding using Nemotron-H's in-checkpoint MTP head.
+
+    Each step verifies one MTP-drafted token per backbone forward pass: the
+    backbone processes ``[last confirmed token, draft token]`` together, and
+    the draft is accepted iff the backbone's own top-1 pick for the first
+    position matches it. Acceptance yields a second "bonus" token for free
+    from the same pass. Rejection substitutes the backbone's own pick and
+    rolls the caches back via ``rollback_speculative_cache``.
+
+    Single sequence (batch size 1) only. Greedy acceptance only -- the draft
+    is accepted iff it equals the backbone's own top-1 pick.
+
+    Yields:
+        Tuple[int, mx.array, bool]: (token, log-probabilities, from_draft).
+    """
+    if not _model_supports_nemotron_h_mtp(model):
+        raise ValueError("The model does not have a usable Nemotron-H MTP head.")
+    if prompt.ndim != 1:
+        raise ValueError(
+            "nemotron_h_mtp_generate_step supports a single sequence only."
+        )
+
+    sampler = sampler or greedy_sampler
+    model_cache = prompt_cache if prompt_cache is not None else model.make_cache()
+    mtp_cache = model.make_mtp_cache()
+
+    def _sample(logits: mx.array) -> Tuple[mx.array, mx.array]:
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return sampler(logprobs), logprobs.squeeze(0)
+
+    with mx.stream(generation_stream):
+        hidden = model.backbone(prompt[None], cache=model_cache)
+        tok, logprobs = _sample(model.lm_head(hidden[:, -1, :]))
+        hidden_last = hidden[:, -1:, :]
+
+    n = 1
+    yield tok.item(), logprobs, False
+
+    while n < max_tokens:
+        with mx.stream(generation_stream):
+            draft_logits, _ = model.mtp_step(hidden_last, tok.reshape(1, 1), mtp_cache)
+            draft_tok, draft_logprobs = _sample(draft_logits[:, -1, :])
+
+            block = mx.concatenate(
+                [tok.reshape(1, 1), draft_tok.reshape(1, 1)], axis=1
+            )
+            ssm_sink = []
+            hidden2 = model.backbone(block, cache=model_cache, ssm_sink=ssm_sink)
+            logits2 = model.lm_head(hidden2)
+            verify_tok, verify_logprobs = _sample(logits2[:, 0, :])
+            accepted = bool((verify_tok == draft_tok).item())
+
+            if accepted:
+                bonus_tok, bonus_logprobs = _sample(logits2[:, 1, :])
+                hidden_last = hidden2[:, 1:2, :]
+            else:
+                model.rollback_speculative_cache(
+                    model_cache, ssm_sink, keep=1, block_size=2
+                )
+                for c in mtp_cache:
+                    if c is not None and c.is_trimmable():
+                        c.trim(1)
+                hidden_last = hidden2[:, 0:1, :]
+
+        if accepted:
+            yield draft_tok.item(), draft_logprobs, True
+            n += 1
+            if n >= max_tokens:
+                break
+            yield bonus_tok.item(), bonus_logprobs, False
+            n += 1
+            tok = bonus_tok
+        else:
+            yield verify_tok.item(), verify_logprobs, False
+            n += 1
+            tok = verify_tok
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],

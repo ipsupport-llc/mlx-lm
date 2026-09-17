@@ -14,7 +14,7 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-from .ssm import ssm_update
+from .ssm import ssm_attn, ssm_update
 from .switch_layers import SwitchMLP
 
 
@@ -698,7 +698,12 @@ class Model(nn.Module):
                 c[1] = state
                 c[0] = padded[:, : K - 1]
                 continue
-            _, new_state = ssm_update(
+            # ssm_update dispatches keep==1 to the fused single-step Metal
+            # kernel, which assumes `state` is its own immediately-prior
+            # output. Here `state` is replayed from a captured sink, which
+            # that kernel computes wrong -- ssm_attn is the general scan and
+            # is correct for any keep.
+            _, new_state = ssm_attn(
                 x[:, :keep],
                 A_log,
                 B[:, :keep],
