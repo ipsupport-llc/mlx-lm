@@ -24,7 +24,6 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     hidden_size: int
     intermediate_size: int
-    num_hidden_layers: int
     max_position_embeddings: int
     num_attention_heads: int
     num_key_value_heads: int
@@ -39,6 +38,8 @@ class ModelArgs(BaseModelArgs):
     layer_norm_epsilon: float
     use_bias: bool
     use_conv_bias: bool
+    # Deprecated in newer configs once layers_block_type is given directly.
+    num_hidden_layers: Optional[int] = None
     hybrid_override_pattern: Optional[List[str]] = None
     layers_block_type: Optional[List[str]] = None
     head_dim: Optional[int] = None
@@ -62,8 +63,17 @@ class ModelArgs(BaseModelArgs):
     mtp_layers_block_type: Optional[List[str]] = None
     mtp_hybrid_override_pattern: Optional[List[str]] = None
 
-    # Map from layers_block_type names to single-char pattern codes
-    _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
+    # Map from layers_block_type names to single-char pattern codes.
+    # Newer configs use "linear_attention"/"full_attention" instead of
+    # "mamba"/"attention".
+    _block_type_to_char = {
+        "mamba": "M",
+        "linear_attention": "M",
+        "attention": "*",
+        "full_attention": "*",
+        "moe": "E",
+        "mlp": "-",
+    }
 
     def __post_init__(self):
         if self.time_step_limit is None:
