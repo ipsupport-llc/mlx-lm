@@ -18,6 +18,16 @@ from .ssm import ssm_attn, ssm_update
 from .switch_layers import SwitchMLP
 
 
+def _decode_hf_float(v: Any) -> Any:
+    # transformers' PretrainedConfig.to_json_string() encodes inf/-inf/nan
+    # as {"__float__": "Infinity"} since plain JSON has no literal for them
+    # -- any config that has round-tripped through save_pretrained() (e.g.
+    # after a LoRA merge or GPTQ pass) carries this instead of a bare float.
+    if isinstance(v, dict) and "__float__" in v:
+        return float(v["__float__"])
+    return v
+
+
 @dataclass()
 class ModelArgs(BaseModelArgs):
     model_type: str
@@ -78,6 +88,8 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if self.time_step_limit is None:
             self.time_step_limit = (0.0, float("inf"))
+        else:
+            self.time_step_limit = tuple(_decode_hf_float(v) for v in self.time_step_limit)
 
         # Normalize to hybrid_override_pattern (single-char list)
         if self.hybrid_override_pattern is None and self.layers_block_type is not None:
