@@ -52,6 +52,8 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: Optional[int] = None
     hybrid_override_pattern: Optional[List[str]] = None
     layers_block_type: Optional[List[str]] = None
+    # Alias transformers exposes the list under.
+    layer_types: Optional[List[str]] = None
     head_dim: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
     moe_shared_expert_intermediate_size: Optional[int] = None
@@ -73,16 +75,15 @@ class ModelArgs(BaseModelArgs):
     mtp_layers_block_type: Optional[List[str]] = None
     mtp_hybrid_override_pattern: Optional[List[str]] = None
 
-    # Map from layers_block_type names to single-char pattern codes.
-    # Newer configs use "linear_attention"/"full_attention" instead of
-    # "mamba"/"attention".
     _block_type_to_char = {
-        "mamba": "M",
-        "linear_attention": "M",
-        "attention": "*",
         "full_attention": "*",
+        "linear_attention": "M",
         "moe": "E",
         "mlp": "-",
+        # legacy spellings, remapped since transformers 5.13
+        "attention": "*",
+        "mamba": "M",
+        "conv": "M",
     }
 
     def __post_init__(self):
@@ -92,12 +93,24 @@ class ModelArgs(BaseModelArgs):
             self.time_step_limit = tuple(_decode_hf_float(v) for v in self.time_step_limit)
 
         # Normalize to hybrid_override_pattern (single-char list)
-        if self.hybrid_override_pattern is None and self.layers_block_type is not None:
+        block_types = self.layers_block_type or self.layer_types
+        if self.hybrid_override_pattern is None and block_types is not None:
+            unknown = sorted(set(block_types) - self._block_type_to_char.keys())
+            if unknown:
+                raise ValueError(
+                    f"Unsupported layers_block_type {unknown}, expected any of "
+                    f"{sorted(self._block_type_to_char)}."
+                )
             self.hybrid_override_pattern = [
-                self._block_type_to_char[t] for t in self.layers_block_type
+                self._block_type_to_char[t] for t in block_types
             ]
         if self.hybrid_override_pattern is not None:
             self.num_hidden_layers = len(self.hybrid_override_pattern)
+        else:
+            raise ValueError(
+                "The config must have layers_block_type or hybrid_override_pattern "
+                "to describe the layer stack."
+            )
 
         if (
             self.mtp_hybrid_override_pattern is None
