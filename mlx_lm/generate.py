@@ -802,11 +802,36 @@ def stream_generate(
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, stream, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
+        # Auto-dispatch to the in-checkpoint MTP head instead of plain
+        # decoding when the model has one: same output (bit-exact, see
+        # tests/test_nemotron_h_mtp_generate.py), just faster. Only for the
+        # exact subset of generate_step's surface nemotron_h_mtp_generate_step
+        # actually supports (single sequence, greedy, no logits processors /
+        # KV quantization / max_kv_size) -- anything outside that silently
+        # falls back to plain generate_step rather than ignoring the request.
+        use_mtp = (
+            _model_supports_nemotron_h_mtp(model)
+            and prompt.ndim == 1
+            and kwargs.get("sampler") in (None, greedy_sampler)
+            and not kwargs.get("logits_processors")
+            and kwargs.get("kv_bits") is None
+            and kwargs.get("max_kv_size") is None
+            and kwargs.get("input_embeddings") is None
         )
+        if use_mtp:
+            token_generator = nemotron_h_mtp_generate_step(
+                prompt,
+                model,
+                max_tokens=kwargs["max_tokens"],
+                sampler=kwargs.get("sampler"),
+                prompt_cache=kwargs.get("prompt_cache"),
+            )
+        else:
+            token_generator = generate_step(prompt, model, stream, **kwargs)
+            # from_draft always false for non-speculative generation
+            token_generator = (
+                (token, logprobs, False) for token, logprobs in token_generator
+            )
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
