@@ -427,16 +427,19 @@ def _adapt_prism_hadamard_repack(config: dict, model_path: Path) -> None:
 
 
 def _shape_quantization(module, weights, path, default):
-    """True (the default bits / group size) or the bits and group size the
-    weights at `path` were quantized with, when they differ: a weight file
-    added next to a model (e.g. an MTP head) can use other ones."""
+    """True (the default bits / group size / mode) or the ones the weights
+    at `path` were quantized with, when they differ: a weight file added
+    next to a model (e.g. an MTP head), or a projection sanitize() derives
+    (MLA), can use other ones."""
     weight = getattr(module, "weight", None)
-    if (
-        default.get("mode", "affine") != "affine"
-        or weight is None
-        or f"{path}.weight" not in weights
-    ):
+    if weight is None or f"{path}.weight" not in weights:
         return True
+    # A non-affine pack (uint8 scales): the mode follows from bits and group.
+    if default.get("mode", "affine") != "affine" or weights[f"{path}.scales"].dtype == mx.uint8:
+        params = infer_quant_config(path, module, weights)
+        same = (params["group_size"], params["bits"], params["mode"]) == (
+            default["group_size"], default["bits"], default.get("mode", "affine"))
+        return True if same else params
     n_in = weight.shape[-1]
     n_groups = weights[f"{path}.scales"].shape[-1]
     n_packed = weights[f"{path}.weight"].shape[-1]
@@ -446,6 +449,33 @@ def _shape_quantization(module, weights, path, default):
     if (group_size, bits) == (default["group_size"], default["bits"]):
         return True
     return {"group_size": group_size, "bits": bits, "mode": "affine"}
+
+
+def infer_quant_config(path: str, module: nn.Module, weights: dict) -> dict:
+    """Recover the group_size, bits and mode a saved weight was packed with.
+
+    Use this for paths the per-tensor quantization map does not name, where the
+    top-level default can be wrong. ``module`` must still be unquantized.
+    """
+    scales = weights[f"{path}.scales"]
+    in_dims = module.weight.shape[-1]
+    group_size = in_dims // scales.shape[-1]
+    bits = (weights[f"{path}.weight"].shape[-1] * 32) // in_dims
+    # Only affine keeps the scales in the weight dtype. Each of the other modes
+    # allows exactly one (bits, group_size) pair.
+    if scales.dtype != mx.uint8:
+        return {"group_size": group_size, "bits": bits, "mode": "affine"}
+    if (bits, group_size) == (4, 16):
+        return {"group_size": group_size, "bits": bits, "mode": "nvfp4"}
+    if (bits, group_size) == (4, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp4"}
+    if (bits, group_size) == (8, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp8"}
+
+    raise ValueError(
+        f"Cannot infer the quantization mode of {path}: "
+        f"{bits} bits with group size {group_size}."
+    )
 
 
 def load_model(
