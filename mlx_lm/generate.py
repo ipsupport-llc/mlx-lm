@@ -671,6 +671,9 @@ def nemotron_h_mtp_generate_step(
     max_tokens: int = 256,
     sampler: Optional[Sampler] = None,
     prompt_cache: Optional[Any] = None,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding using Nemotron-H's in-checkpoint MTP head.
 
@@ -683,6 +686,15 @@ def nemotron_h_mtp_generate_step(
 
     Single sequence (batch size 1) only. Greedy acceptance only -- the draft
     is accepted iff it equals the backbone's own top-1 pick.
+
+    KV-bit quantization only ever applies to the backbone's own full-
+    attention cache (``model_cache``): Mamba caches have no ``to_quantized``
+    so ``maybe_quantize_kv_cache`` always skips them, and the MTP head's own
+    tiny attention cache (``mtp_cache``, at most one block) is left at full
+    precision -- quantizing it would save almost nothing and the head's own
+    accept-rate math is unaffected either way. ``rollback_speculative_cache``
+    needs no quantization-aware branch: ``QuantizedKVCache.trim()`` is a
+    plain offset decrement, identical in effect to ``KVCache.trim()``.
 
     Yields:
         Tuple[int, mx.array, bool]: (token, log-probabilities, from_draft).
@@ -697,6 +709,12 @@ def nemotron_h_mtp_generate_step(
     sampler = sampler or greedy_sampler
     model_cache = prompt_cache if prompt_cache is not None else model.make_cache()
     mtp_cache = model.make_mtp_cache()
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
 
     def _sample(logits: mx.array) -> Tuple[mx.array, mx.array]:
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -704,6 +722,7 @@ def nemotron_h_mtp_generate_step(
 
     with mx.stream(generation_stream):
         hidden = model.backbone(prompt[None], cache=model_cache)
+        quantize_cache_fn(model_cache)
         tok, logprobs = _sample(model.lm_head(hidden[:, -1, :]))
         hidden_last = hidden[:, -1:, :]
 
@@ -720,6 +739,7 @@ def nemotron_h_mtp_generate_step(
             )
             ssm_sink = []
             hidden2 = model.backbone(block, cache=model_cache, ssm_sink=ssm_sink)
+            quantize_cache_fn(model_cache)
             logits2 = model.lm_head(hidden2)
             verify_tok, verify_logprobs = _sample(logits2[:, 0, :])
             accepted = bool((verify_tok == draft_tok).item())
@@ -807,14 +827,15 @@ def stream_generate(
         # tests/test_nemotron_h_mtp_generate.py), just faster. Only for the
         # exact subset of generate_step's surface nemotron_h_mtp_generate_step
         # actually supports (single sequence, greedy, no logits processors /
-        # KV quantization / max_kv_size) -- anything outside that silently
-        # falls back to plain generate_step rather than ignoring the request.
+        # max_kv_size) -- anything outside that silently falls back to plain
+        # generate_step rather than ignoring the request. KV-bit
+        # quantization IS supported (see nemotron_h_mtp_generate_step's
+        # docstring for why rollback needs no quantization-aware branch).
         use_mtp = (
             _model_supports_nemotron_h_mtp(model)
             and prompt.ndim == 1
             and kwargs.get("sampler") in (None, greedy_sampler)
             and not kwargs.get("logits_processors")
-            and kwargs.get("kv_bits") is None
             and kwargs.get("max_kv_size") is None
             and kwargs.get("input_embeddings") is None
         )
@@ -825,6 +846,11 @@ def stream_generate(
                 max_tokens=kwargs["max_tokens"],
                 sampler=kwargs.get("sampler"),
                 prompt_cache=kwargs.get("prompt_cache"),
+                kv_bits=kwargs.get("kv_bits"),
+                kv_group_size=kwargs.get("kv_group_size", 64),
+                quantized_kv_start=kwargs.get(
+                    "quantized_kv_start", DEFAULT_QUANTIZED_KV_START
+                ),
             )
         else:
             token_generator = generate_step(prompt, model, stream, **kwargs)
