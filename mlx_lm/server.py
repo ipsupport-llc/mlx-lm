@@ -35,6 +35,7 @@ from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
     TextStateMachine,
+    _model_supports_nemotron_h_mtp,
     make_stop_sequences,
     make_text_state_machine,
     stream_generate,
@@ -370,6 +371,20 @@ class ModelProvider:
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
+        # A Nemotron-H MTP head only ever gets used via _serve_single's
+        # stream_generate call, which auto-dispatches to it for a single
+        # unbatched sequence -- BatchGenerator (the batchable path) is
+        # generic multi-sequence decoding with no knowledge of mtp_step at
+        # all. Every cache type here (including Mamba's ArraysCache)
+        # supports merge(), so is_batchable would otherwise be True and
+        # _is_batchable() would route every request through BatchGenerator
+        # regardless of decode-concurrency's value -- silently disabling
+        # self-speculative decoding for any MTP-capable model with KV
+        # quantization off (the default), independent of whether MTP is
+        # actually wanted. Confirmed live: identical decode tok/s whether
+        # the MTP-enabled fork was installed or not, because neither
+        # request ever reached the MTP dispatch code path.
+        is_batchable = is_batchable and not _model_supports_nemotron_h_mtp(model)
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
