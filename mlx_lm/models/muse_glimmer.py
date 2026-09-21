@@ -245,8 +245,12 @@ class Model(nn.Module):
     def sanitize(self, weights):
         out = {}
         for k, v in weights.items():
-            # Drop the vision tower — this is a text-only port.
-            if k.startswith(("vision_tower", "vision_adapter", "vision_projection")):
+            # Drop the vision tower — this is a text-only port. Some
+            # checkpoints nest these directly (vision_tower.*), others
+            # under a top-level model. prefix (model.vision_tower.*) --
+            # check the key with that prefix stripped either way.
+            bare = k[len("model.") :] if k.startswith("model.") else k
+            if bare.startswith(("vision_tower", "vision_adapter", "vision_projection")):
                 continue
             # Meta/MLX nest the text tower under language_model.*
             if k.startswith("language_model.model."):
