@@ -50,6 +50,35 @@ class ModelArgs(BaseModelArgs):
 
     @classmethod
     def from_dict(cls, params):
+        # Some component-quantized checkpoints write config["quantization"]'s
+        # per-module overrides keyed by the checkpoint's own raw tensor-name
+        # convention (language_model.model.*, language_model.lm_head) rather
+        # than this model's actual internal module-tree path (model.*,
+        # lm_head) -- Model.sanitize() strips the "language_model." prefix
+        # on load, but load_model()'s quantize step reads config["quantization"]
+        # directly by internal path, so a raw-keyed override silently misses
+        # and falls back to the global default bit-width instead of the
+        # checkpoint's intended one. params IS the same dict object
+        # load_model() later reads config["quantization"] from, so
+        # normalizing these keys here (in place) fixes it for every caller,
+        # not just this classmethod.
+        quant = params.get("quantization")
+        if isinstance(quant, dict):
+            for key in list(quant):
+                value = quant[key]
+                if not isinstance(value, dict):
+                    continue
+                if key.startswith("language_model.model."):
+                    new_key = "model." + key[len("language_model.model.") :]
+                elif key == "language_model.lm_head" or key.startswith(
+                    "language_model.lm_head."
+                ):
+                    new_key = "lm_head" + key[len("language_model.lm_head") :]
+                elif key.startswith("model.language_model."):
+                    new_key = "model." + key[len("model.language_model.") :]
+                else:
+                    continue
+                quant[new_key] = quant.pop(key)
         # Meta's original checkpoint nests the language-model fields under
         # "text_config"; the mlx-community conversions flatten them. Accept both.
         if "text_config" in params:
