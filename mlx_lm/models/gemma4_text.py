@@ -237,6 +237,7 @@ class Attention(nn.Module):
         cache: Optional[Any] = None,
         shared_kv: Optional[tuple] = None,
         offset: Optional[Any] = None,
+        source_cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -270,8 +271,16 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
+        # KV-shared layers have no cache of their own (cache is None here);
+        # source_cache is the ORIGINAL layer's cache object that actually
+        # produced these keys/values, needed so scaled_dot_product_attention
+        # can correctly detect a quantized cache (dispatch checks
+        # `hasattr(cache, "bits")`) instead of always taking the
+        # plain-array path with an already-quantized (packed, scales,
+        # biases) tuple.
+        sdpa_cache = cache if cache is not None else source_cache
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries, keys, values, cache=sdpa_cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
@@ -340,12 +349,13 @@ class DecoderLayer(nn.Module):
         per_layer_input: Optional[mx.array] = None,
         shared_kv: Optional[tuple] = None,
         offset: Optional[Any] = None,
+        source_cache: Optional[Any] = None,
     ) -> mx.array:
         residual = x
 
         h = self.input_layernorm(x)
         h, shared_kv, offset = self.self_attn(
-            h, mask, cache, shared_kv=shared_kv, offset=offset
+            h, mask, cache, shared_kv=shared_kv, offset=offset, source_cache=source_cache
         )
         h = self.post_attention_layernorm(h)
         h = residual + h
@@ -551,7 +561,19 @@ class Gemma4TextModel(nn.Module):
         # Apply each layer. We save all intermediate kvs and offset and grab
         # the previous one for the shared kv layers.
         masks = self._make_masks(h, cache)
-        intermediates = [(None, None)] * len(self.layers)
+        # Also keep the ORIGINAL layer's cache object alongside its (keys,
+        # values) -- a KV-shared layer always gets `c=None` (see the padding
+        # above), so it can't pass its own cache to
+        # scaled_dot_product_attention for quantized-KV dispatch (that
+        # dispatch keys off `hasattr(cache, "bits")`, checked in
+        # models/base.py). Without the source cache, a shared layer whose
+        # borrowed keys/values were quantized (once the source cache crossed
+        # `quantized_kv_start`) would hand a quantized (packed, scales,
+        # biases) tuple to the *unquantized* SDPA path and crash. Passing the
+        # source cache through lets it dispatch correctly while still
+        # reusing the already-computed keys/values (no redundant
+        # update_and_fetch call).
+        intermediates = [(None, None, None)] * len(self.layers)
         for idx, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
             zip(
                 self.layers,
@@ -561,7 +583,7 @@ class Gemma4TextModel(nn.Module):
                 per_layer_inputs,
             )
         ):
-            kvs, offset = intermediates[prev_idx]
+            kvs, offset, source_cache = intermediates[prev_idx]
 
             h, kvs, offset = layer(
                 h,
@@ -570,9 +592,10 @@ class Gemma4TextModel(nn.Module):
                 per_layer_input=per_layer_input,
                 shared_kv=kvs,
                 offset=offset,
+                source_cache=source_cache,
             )
 
-            intermediates[idx] = (kvs, offset)
+            intermediates[idx] = (kvs, offset, c)
 
         return self.norm(h)
 
