@@ -154,6 +154,28 @@ class TestGemma4MTP(unittest.TestCase):
                 self.assertGreater(n_draft, 0)
                 self.assertLess(n_draft, len(out))
 
+    def test_prompt_cache_already_holding_a_prefix(self):
+        # The server passes only the uncached tail of the prompt together
+        # with a cache that already holds the prefix. The drafter's query
+        # position must count the cached prefix too (the oracle asserts
+        # position == length of the main model's full-attention KV).
+        for cached in (1, 5, 12):
+            cache = make_prompt_cache(self.model)
+            self.model(self.prompt[None, :cached], cache=cache)
+            oracle = OracleDrafter(self.ref, len(self.prompt), 3)
+            out = [
+                t
+                for t, _, _ in gemma4_mtp_generate_step(
+                    self.prompt[cached:],
+                    self.model,
+                    oracle,
+                    num_draft_tokens=3,
+                    max_tokens=60,
+                    prompt_cache=cache,
+                )
+            ]
+            self.assertEqual(out, self.ref, cached)
+
     def test_small_prefill_steps(self):
         oracle = OracleDrafter(self.ref, len(self.prompt), 3)
         out = self._mtp(oracle, 3, prefill_step_size=4)
