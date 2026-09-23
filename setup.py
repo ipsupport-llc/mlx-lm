@@ -31,6 +31,9 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        # Image inputs in mlx_lm.server chat completions (mlx_lm/multimodal.py
+        # uses HF's PIL-backed Gemma 4 image processor; no torch needed).
+        "pillow",
     ],
     packages=[
         "mlx_lm",
