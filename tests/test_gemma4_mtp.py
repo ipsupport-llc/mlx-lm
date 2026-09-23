@@ -33,8 +33,8 @@ def _main_model():
         num_hidden_layers=4,
         intermediate_size=128,
         num_attention_heads=4,
-        head_dim=16,
-        global_head_dim=32,
+        head_dim=32,
+        global_head_dim=64,
         vocab_size=VOCAB,
         vocab_size_per_layer_input=VOCAB,
         num_key_value_heads=2,
@@ -68,8 +68,8 @@ def _drafter():
             num_hidden_layers=2,
             intermediate_size=64,
             num_attention_heads=4,
-            head_dim=16,
-            global_head_dim=32,
+            head_dim=32,
+            global_head_dim=64,
             vocab_size=VOCAB,
             num_key_value_heads=2,
             num_global_key_value_heads=1,
@@ -190,6 +190,46 @@ class TestGemma4MTP(unittest.TestCase):
             full = mx.concatenate([self.prompt, mx.array(self.ref[: stop_after + 1])])
             want = self.model(full[None])[0, -1]
             self.assertTrue(mx.allclose(got, want, atol=0.05).item(), stop_after)
+
+    def test_quantized_kv_cache(self):
+        # kv_bits: caches are swapped for quantized ones in the caller's own
+        # list (the server keeps that list), and drafter KV reads /
+        # rollbacks work on the quantized forms.
+        cache = make_prompt_cache(self.model)
+        plain_q = [
+            t
+            for t, _ in generate_step(
+                self.prompt,
+                self.model,
+                max_tokens=40,
+                prompt_cache=make_prompt_cache(self.model),
+                kv_bits=8,
+                kv_group_size=32,
+                quantized_kv_start=0,
+            )
+        ]
+        oracle = OracleDrafter(plain_q, len(self.prompt), 3)
+        out = [
+            t
+            for t, _, _ in gemma4_mtp_generate_step(
+                self.prompt,
+                self.model,
+                oracle,
+                num_draft_tokens=3,
+                max_tokens=40,
+                prompt_cache=cache,
+                kv_bits=8,
+                kv_group_size=32,
+                quantized_kv_start=0,
+            )
+        ]
+        self.assertEqual(out, plain_q)
+        self.assertTrue(all(hasattr(c, "bits") for c in cache))
+        self.assertEqual(
+            [c.offset for c in cache], [len(self.prompt) + len(out)] * len(cache)
+        )
+        _drafter_out = self._mtp(_drafter(), 3, kv_bits=8, kv_group_size=32, quantized_kv_start=0)
+        self.assertEqual(len(_drafter_out), 60)
 
     def test_rotating_cache_rollback_past_window(self):
         # Verify-then-trim must leave the caches exactly as if only the kept

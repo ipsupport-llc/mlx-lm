@@ -898,8 +898,14 @@ def gemma4_mtp_generate_step(
     window = draft_model.sliding_window
 
     sampler = sampler or greedy_sampler
+    # Used (and quantized in place by quantize_cache_fn) as the caller's own
+    # list, not a slice of it: the server keeps and re-stores that list.
+    # The drafter contributes no entries (its make_cache() is empty).
     cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
-    cache = cache[: len(lm.layers)]
+    if len(cache) != len(lm.layers):
+        raise ValueError(
+            f"Expected {len(lm.layers)} main-model cache entries, got {len(cache)}."
+        )
     if prompt_progress_callback is None:
         prompt_progress_callback = lambda *_: None
     quantize_cache_fn = functools.partial(
