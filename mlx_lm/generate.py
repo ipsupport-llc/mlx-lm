@@ -19,6 +19,8 @@ from transformers import PreTrainedTokenizer
 from .generate_utils import BatchCounters, BatchCountersSnapshot, BatchStats
 from .models.cache import (
     QuantizedKVCache,
+    QuantizedRotatingKVCache,
+    RotatingKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
     load_prompt_cache,
@@ -789,6 +791,250 @@ def nemotron_h_mtp_generate_step(
                 quantize_cache_fn(model_cache)
                 mx.eval([c.state for c in model_cache if c is not None])
 
+def _is_gemma4_assistant(draft_model: Optional[nn.Module]) -> bool:
+    return getattr(draft_model, "model_type", None) == "gemma4_assistant"
+
+
+def _gemma4_text_model(model: nn.Module) -> nn.Module:
+    # gemma4 (multimodal wrapper) or gemma4_text
+    return getattr(model, "language_model", model)
+
+
+def _kv_to_dense(c, x):
+    if isinstance(x, (list, tuple)):  # quantized (packed, scales, biases)
+        return mx.dequantize(*x, group_size=c.group_size, bits=c.bits)
+    return x
+
+
+def _slice_kv(x, start, stop):
+    if isinstance(x, (list, tuple)):
+        return [a[..., start:stop, :] for a in x]
+    return x[..., start:stop, :]
+
+
+def _gemma4_valid_kv(c, window: Optional[int]):
+    """The accepted (post-rollback) keys/values held by one main-model cache,
+    dense, optionally limited to the last `window` positions. Order does not
+    matter to the drafter (keys already carry RoPE, and it attends with no
+    mask), so a rotated buffer is fine as long as it has no stale slots."""
+    if isinstance(c, (RotatingKVCache, QuantizedRotatingKVCache)):
+        if c.offset >= c.max_size and c._idx != _kv_len(c.keys):
+            # Rotated in-place buffer: every slot is valid, all max_size.
+            keys, values = c.keys, c.values
+        else:
+            keys = _slice_kv(c.keys, 0, min(c._idx, c.offset))
+            values = _slice_kv(c.values, 0, min(c._idx, c.offset))
+        n = _kv_len(keys)
+        if window is not None and n > window:
+            keys = _slice_kv(keys, n - window, n)
+            values = _slice_kv(values, n - window, n)
+    else:
+        keys = _slice_kv(c.keys, 0, c.offset)
+        values = _slice_kv(c.values, 0, c.offset)
+    return _kv_to_dense(c, keys), _kv_to_dense(c, values)
+
+
+def _kv_len(x):
+    return (x[0] if isinstance(x, (list, tuple)) else x).shape[2]
+
+
+def _gemma4_trim_cache(caches, n: int):
+    """Drop the last `n` positions from every main-model cache after a
+    verify forward that rejected `n` draft tokens.
+
+    KVCache / QuantizedKVCache trim is an offset decrement. RotatingKVCache
+    refuses to trim once it has wrapped (is_trimmable() is False past
+    max_size), which is why mlx-lm's generic speculative decoding cannot run
+    Gemma 4's sliding layers past 1024 tokens. But the verify forward is
+    always multi-token, so the rotating caches just went through
+    `_update_concat` and hold a buffer in temporal order of length
+    >= max_size - 1 + block: slicing its tail off is an exact rollback and
+    still leaves every kept token its full window."""
+    if n <= 0:
+        return
+    for c in caches:
+        if isinstance(c, (RotatingKVCache, QuantizedRotatingKVCache)):
+            keys = c._temporal_order(c.keys)
+            values = c._temporal_order(c.values)
+            keep = _kv_len(keys) - n
+            c.keys = _slice_kv(keys, 0, keep)
+            c.values = _slice_kv(values, 0, keep)
+            c.offset -= n
+            c._idx = keep
+        else:
+            c.trim(n)
+
+
+def gemma4_mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    draft_model: nn.Module,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
+    *,
+    num_draft_tokens: int = 3,
+    max_tokens: int = 256,
+    sampler: Optional[Sampler] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """Speculative decoding for Gemma 4 with its MTP drafter
+    (``gemma4_assistant``, e.g. google/gemma-4-26B-A4B-it-assistant).
+
+    Unlike a regular draft model the drafter has no KV cache and no token
+    history of its own: each draft step reads the main model's final hidden
+    state and the KV of the main model's last full- and last sliding-attention
+    layers (see models/gemma4_assistant.py). One iteration:
+
+    1. draft ``num_draft_tokens`` tokens greedily with the drafter, starting
+       from (last token, main hidden state that predicted it);
+    2. run the main model once over ``[last token, drafts...]``;
+    3. sample the main model's own token at every position; accept the
+       longest prefix of drafts equal to those samples, emit the main
+       model's sample right after it (correction or bonus token);
+    4. roll the main caches back over the rejected drafts.
+
+    Every emitted token is the main model's own sample given the accepted
+    prefix, so the output distribution is exactly the main model's (with the
+    greedy sampler: the exact same tokens as plain decoding).
+
+    Single sequence only; no logits processors (stream_generate falls back to
+    plain decoding for those).
+
+    Yields:
+        Tuple[int, mx.array, bool]: (token, log-probabilities, from_draft).
+    """
+    if prompt.ndim != 1:
+        raise ValueError("gemma4_mtp_generate_step supports a single sequence only.")
+    lm = _gemma4_text_model(model)
+    text = lm.model
+    layer_types = lm.args.layer_types
+    last_full = max(i for i, t in enumerate(layer_types) if t == "full_attention")
+    last_swa = max(i for i, t in enumerate(layer_types) if t == "sliding_attention")
+    window = draft_model.sliding_window
+
+    sampler = sampler or greedy_sampler
+    # Used (and quantized in place by quantize_cache_fn) as the caller's own
+    # list, not a slice of it: the server keeps and re-stores that list.
+    # The drafter contributes no entries (its make_cache() is empty).
+    cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
+    if len(cache) != len(lm.layers):
+        raise ValueError(
+            f"Expected {len(lm.layers)} main-model cache entries, got {len(cache)}."
+        )
+    if prompt_progress_callback is None:
+        prompt_progress_callback = lambda *_: None
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    def _sample(logits):
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return sampler(logprobs), logprobs
+
+    def _embed(tokens):
+        return text.embed_tokens(tokens) * text.embed_scale
+
+    def _shared_kv():
+        return {
+            "full_attention": _gemma4_valid_kv(cache[last_full], None),
+            "sliding_attention": _gemma4_valid_kv(cache[last_swa], window),
+        }
+
+    with mx.stream(stream):
+        total = len(prompt)
+        done = 0
+        prompt_progress_callback(done, total)
+        while total - done > 1:
+            n = min(prefill_step_size, total - done - 1)
+            text(prompt[done : done + n][None], cache=cache)
+            quantize_cache_fn(cache)
+            mx.eval([c.state for c in cache])
+            done += n
+            prompt_progress_callback(done, total)
+            mx.clear_cache()
+        hidden = text(prompt[done:][None], cache=cache)
+        quantize_cache_fn(cache)
+        tok, logprobs = _sample(lm.logits_from_hidden(hidden[:, -1, :]))
+        hidden = hidden[:, -1:, :]
+        mx.eval(tok, logprobs)
+        prompt_progress_callback(total, total)
+
+    # On exit the main cache must hold exactly prompt + every token yielded
+    # so far, like plain generate_step leaves it: callers such as the
+    # server store it keyed by those tokens and later trim / extend it for
+    # the next request. stream_generate stops pulling at max_tokens / EOS
+    # (the generator is closed at that yield), when this loop's cache is
+    # either ahead (stopped partway through the accepted drafts, whose KV is
+    # already in) or one behind (stopped at the main model's own token, not
+    # yet fed). `fixup` records which, for the most recent yield.
+    fixup = ("feed", tok)
+    position = total  # absolute position of `tok` (not yet in the cache)
+    n_out = 1
+    try:
+        yield tok.item(), logprobs.squeeze(0), False
+
+        while n_out < max_tokens:
+            k = min(num_draft_tokens, max_tokens - n_out)
+            fixup = None  # mid-iteration: cache state not well defined
+            with mx.stream(stream):
+                drafts = []
+                if k > 0:
+                    shared = _shared_kv()
+                    d, h = tok.reshape(1, 1), hidden
+                    for _ in range(k):
+                        logits, h = draft_model(
+                            mx.concatenate([_embed(d), h], axis=-1), shared, position
+                        )
+                        d = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
+                        drafts.append(d)
+                block = mx.concatenate([tok.reshape(1, 1)] + drafts, axis=1)
+                hid = text(block, cache=cache)
+                quantize_cache_fn(cache)
+                toks, lps = _sample(lm.logits_from_hidden(hid[0]))
+                draft_ids = (
+                    mx.concatenate(drafts, axis=1)[0]
+                    if drafts
+                    else mx.array([], mx.uint32)
+                )
+                mx.eval(toks, lps, draft_ids)
+            toks_l = toks.tolist()
+            draft_l = draft_ids.tolist()
+            n_acc = 0
+            while n_acc < k and draft_l[n_acc] == toks_l[n_acc]:
+                n_acc += 1
+
+            _gemma4_trim_cache(cache, k - n_acc)
+            position += n_acc + 1
+            tok = toks[n_acc]
+            hidden = hid[:, n_acc : n_acc + 1, :]
+
+            for i in range(n_acc):
+                fixup = ("trim", n_acc - 1 - i)
+                yield toks_l[i], lps[i], True
+                n_out += 1
+                if n_out >= max_tokens:
+                    return
+            fixup = ("feed", tok)
+            yield toks_l[n_acc], lps[n_acc], False
+            n_out += 1
+    finally:
+        if fixup is not None:
+            kind, arg = fixup
+            if kind == "trim":
+                _gemma4_trim_cache(cache, arg)
+            else:
+                with mx.stream(stream):
+                    text(arg.reshape(1, 1), cache=cache)
+                    quantize_cache_fn(cache)
+                    mx.eval([c.state for c in cache])
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -876,6 +1122,46 @@ def stream_generate(
             # from_draft always false for non-speculative generation
             token_generator = (
                 (token, logprobs, False) for token, logprobs in token_generator
+            )
+    elif _is_gemma4_assistant(draft_model):
+        # Gemma 4 MTP drafter. Anything its step doesn't support (logits
+        # processors, image input_embeddings, a bounded max_kv_size) falls
+        # back to plain decoding without the drafter -- same output, just
+        # not faster -- rather than silently ignoring the request option.
+        use_mtp = (
+            prompt.ndim == 1
+            and not kwargs.get("logits_processors")
+            and kwargs.get("max_kv_size") is None
+            and kwargs.get("input_embeddings") is None
+        )
+        if use_mtp:
+            token_generator = gemma4_mtp_generate_step(
+                prompt,
+                model,
+                draft_model,
+                stream,
+                **{
+                    k: v
+                    for k, v in kwargs.items()
+                    if k
+                    in (
+                        "num_draft_tokens",
+                        "max_tokens",
+                        "sampler",
+                        "prompt_cache",
+                        "prefill_step_size",
+                        "kv_bits",
+                        "kv_group_size",
+                        "quantized_kv_start",
+                        "prompt_progress_callback",
+                    )
+                },
+            )
+        else:
+            kwargs.pop("num_draft_tokens", None)
+            token_generator = (
+                (token, logprobs, False)
+                for token, logprobs in generate_step(prompt, model, stream, **kwargs)
             )
     else:
         kwargs.pop("max_kv_size", None)

@@ -624,10 +624,15 @@ class Model(nn.Module):
             input_embeddings=input_embeddings,
             per_layer_inputs=per_layer_inputs,
         )
+        return self.logits_from_hidden(out)
+
+    def logits_from_hidden(self, h: mx.array) -> mx.array:
+        """LM head (+ final softcap) on the text model's final normed hidden
+        state; split out so MTP decoding can get both from one forward."""
         if self.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+            out = self.model.embed_tokens.as_linear(h)
         else:
-            out = self.lm_head(out)
+            out = self.lm_head(h)
         if self.final_logit_softcapping is not None:
             out = logit_softcap(self.final_logit_softcapping, out)
         return out
