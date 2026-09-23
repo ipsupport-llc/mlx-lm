@@ -947,6 +947,12 @@ def gemma4_mtp_generate_step(
             "sliding_attention": _gemma4_valid_kv(cache[last_swa], window),
         }
 
+    # Absolute position of the first token of `prompt`: callers such as the
+    # server pass only the uncached tail of the prompt, with a cache that
+    # already holds the prefix. The drafter's RoPE query position has to
+    # count that prefix too.
+    base = cache[last_full].offset
+
     with mx.stream(stream):
         total = len(prompt)
         done = 0
@@ -975,7 +981,7 @@ def gemma4_mtp_generate_step(
     # already in) or one behind (stopped at the main model's own token, not
     # yet fed). `fixup` records which, for the most recent yield.
     fixup = ("feed", tok)
-    position = total  # absolute position of `tok` (not yet in the cache)
+    position = base + total  # absolute position of `tok` (not yet in the cache)
     n_out = 1
     try:
         yield tok.item(), logprobs.squeeze(0), False
