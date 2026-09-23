@@ -728,49 +728,68 @@ def nemotron_h_mtp_generate_step(
         tok, logprobs = _sample(model.lm_head(hidden[:, -1, :]))
         hidden_last = hidden[:, -1:, :]
 
+    # On exit the backbone cache must hold exactly prompt + every token
+    # yielded so far, like plain generate_step leaves it: mlx_lm.server
+    # stores it keyed by those tokens and continues the next turn from it.
+    # The backbone's own token (bonus / correction) is yielded before it has
+    # been fed, so if the consumer stops there (max_tokens / EOS closes the
+    # generator at that yield) it is fed on the way out; an accepted draft
+    # is already in the cache.
+    unfed = tok
     n = 1
-    yield tok.item(), logprobs, False
+    try:
+        yield tok.item(), logprobs, False
 
-    while n < max_tokens:
-        with mx.stream(generation_stream):
-            draft_logits, _ = model.mtp_step(hidden_last, tok.reshape(1, 1), mtp_cache)
-            draft_tok, draft_logprobs = _sample(draft_logits[:, -1, :])
+        while n < max_tokens:
+            unfed = None  # mid-iteration: tok is being fed by the verify pass
+            with mx.stream(generation_stream):
+                draft_logits, _ = model.mtp_step(
+                    hidden_last, tok.reshape(1, 1), mtp_cache
+                )
+                draft_tok, draft_logprobs = _sample(draft_logits[:, -1, :])
 
-            block = mx.concatenate(
-                [tok.reshape(1, 1), draft_tok.reshape(1, 1)], axis=1
-            )
-            ssm_sink = []
-            hidden2 = model.backbone(block, cache=model_cache, ssm_sink=ssm_sink)
-            quantize_cache_fn(model_cache)
-            logits2 = model.lm_head(hidden2)
-            verify_tok, verify_logprobs = _sample(logits2[:, 0, :])
-            accepted = bool((verify_tok == draft_tok).item())
+                block = mx.concatenate(
+                    [tok.reshape(1, 1), draft_tok.reshape(1, 1)], axis=1
+                )
+                ssm_sink = []
+                hidden2 = model.backbone(block, cache=model_cache, ssm_sink=ssm_sink)
+                quantize_cache_fn(model_cache)
+                logits2 = model.lm_head(hidden2)
+                verify_tok, verify_logprobs = _sample(logits2[:, 0, :])
+                accepted = bool((verify_tok == draft_tok).item())
+
+                if accepted:
+                    bonus_tok, bonus_logprobs = _sample(logits2[:, 1, :])
+                    hidden_last = hidden2[:, 1:2, :]
+                else:
+                    model.rollback_speculative_cache(
+                        model_cache, ssm_sink, keep=1, block_size=2
+                    )
+                    for c in mtp_cache:
+                        if c is not None and c.is_trimmable():
+                            c.trim(1)
+                    hidden_last = hidden2[:, 0:1, :]
 
             if accepted:
-                bonus_tok, bonus_logprobs = _sample(logits2[:, 1, :])
-                hidden_last = hidden2[:, 1:2, :]
+                yield draft_tok.item(), draft_logprobs, True
+                n += 1
+                if n >= max_tokens:
+                    break
+                unfed = bonus_tok
+                yield bonus_tok.item(), bonus_logprobs, False
+                n += 1
+                tok = bonus_tok
             else:
-                model.rollback_speculative_cache(
-                    model_cache, ssm_sink, keep=1, block_size=2
-                )
-                for c in mtp_cache:
-                    if c is not None and c.is_trimmable():
-                        c.trim(1)
-                hidden_last = hidden2[:, 0:1, :]
-
-        if accepted:
-            yield draft_tok.item(), draft_logprobs, True
-            n += 1
-            if n >= max_tokens:
-                break
-            yield bonus_tok.item(), bonus_logprobs, False
-            n += 1
-            tok = bonus_tok
-        else:
-            yield verify_tok.item(), verify_logprobs, False
-            n += 1
-            tok = verify_tok
-
+                unfed = verify_tok
+                yield verify_tok.item(), verify_logprobs, False
+                n += 1
+                tok = verify_tok
+    finally:
+        if unfed is not None:
+            with mx.stream(generation_stream):
+                model.backbone(unfed.reshape(1, 1), cache=model_cache)
+                quantize_cache_fn(model_cache)
+                mx.eval([c.state for c in model_cache if c is not None])
 
 def _is_gemma4_assistant(draft_model: Optional[nn.Module]) -> bool:
     return getattr(draft_model, "model_type", None) == "gemma4_assistant"
