@@ -95,6 +95,29 @@ class TestNemotronHMTPGenerate(unittest.TestCase):
                 mx.allclose(got, want, atol=2e-2).item(), f"stop_after={stop_after}"
             )
 
+    def test_chunked_prefill_matches_one_shot(self):
+        """The prompt is prefilled in prefill_step_size chunks (bounded peak
+        memory on long prompts); the tokens must not change, and progress is
+        reported per chunk."""
+        mx.random.seed(0)
+        model = Model(tiny_args())
+        prompt = mx.random.randint(0, 64, (23,))
+        one_shot = [
+            t for t, _, _ in nemotron_h_mtp_generate_step(prompt, model, max_tokens=12, prefill_step_size=4096)
+        ]
+        progress = []
+        chunked = [
+            t
+            for t, _, _ in nemotron_h_mtp_generate_step(
+                prompt, model, max_tokens=12, prefill_step_size=5,
+                prompt_progress_callback=lambda n, total: progress.append((n, total)),
+            )
+        ]
+        self.assertEqual(chunked, one_shot)
+        self.assertEqual(progress[0], (0, 23))
+        self.assertEqual(progress[-1], (23, 23))
+        self.assertIn((20, 23), progress)
+
     def test_matches_greedy_decoding_with_quantized_kv_cache(self):
         """kv_bits must produce the exact same token stream as plain
         backbone-only decoding quantized the same way -- NOT vs a
