@@ -676,6 +676,8 @@ def nemotron_h_mtp_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
+    prefill_step_size: int = 2048,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding using Nemotron-H's in-checkpoint MTP head.
 
@@ -722,11 +724,31 @@ def nemotron_h_mtp_generate_step(
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         return sampler(logprobs), logprobs.squeeze(0)
 
+    # Prefill in prefill_step_size chunks, like generate_step. Feeding the
+    # whole prompt in one backbone call made peak memory grow with prompt
+    # length without bound (MoE / Mamba activations for every prompt token at
+    # once): on a 26GB Mac the 30B model hit Metal OOM at a 400-token prompt,
+    # and a tester's coding agent reached 36+GB before OOM. Only the last
+    # chunk's hidden state is needed (the MTP head starts from the last prompt
+    # token), so chunking changes nothing else.
+    if prompt_progress_callback is None:
+        prompt_progress_callback = lambda *_: None
+    total = len(prompt)
     with mx.stream(generation_stream):
-        hidden = model.backbone(prompt[None], cache=model_cache)
+        done = 0
+        prompt_progress_callback(done, total)
+        while total - done > prefill_step_size:
+            model.backbone(prompt[done : done + prefill_step_size][None], cache=model_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache if c is not None])
+            done += prefill_step_size
+            prompt_progress_callback(done, total)
+            mx.clear_cache()
+        hidden = model.backbone(prompt[done:][None], cache=model_cache)
         quantize_cache_fn(model_cache)
         tok, logprobs = _sample(model.lm_head(hidden[:, -1, :]))
         hidden_last = hidden[:, -1:, :]
+        prompt_progress_callback(total, total)
 
     # On exit the backbone cache must hold exactly prompt + every token
     # yielded so far, like plain generate_step leaves it: mlx_lm.server
@@ -1122,6 +1144,8 @@ def stream_generate(
                 quantized_kv_start=kwargs.get(
                     "quantized_kv_start", DEFAULT_QUANTIZED_KV_START
                 ),
+                prefill_step_size=kwargs.get("prefill_step_size", 2048),
+                prompt_progress_callback=kwargs.get("prompt_progress_callback"),
             )
         else:
             token_generator = generate_step(prompt, model, stream, **kwargs)
