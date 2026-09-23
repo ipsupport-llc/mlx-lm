@@ -41,6 +41,7 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
+from .multimodal import extract_images, load_image_inputs
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
@@ -137,7 +138,15 @@ def process_message_content(messages):
     """
     for message in messages:
         content = message.get("content")
-        if isinstance(content, list):
+        if isinstance(content, list) and any(
+            fragment.get("type") == "image" for fragment in content
+        ):
+            # Image request (image_url parts were already extracted and
+            # rewritten to {"type": "image"} by multimodal.extract_images):
+            # leave the list for the chat template, which renders one image
+            # placeholder token per image part.
+            pass
+        elif isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
             ]
@@ -207,6 +216,10 @@ class CompletionRequest:
     messages: List[Any]
     tools: Optional[List[Any]]
     role_mapping: Optional[Dict[str, Any]]
+
+    # Raw bytes of any images attached to the chat messages, in order (see
+    # mlx_lm/multimodal.py). None/empty for text-only requests.
+    images: Optional[List[bytes]] = None
 
 
 @dataclass
@@ -285,6 +298,7 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self.image_inputs = None
 
         group = mx.distributed.init()
         self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
@@ -318,6 +332,7 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self.image_inputs = None
 
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
@@ -392,6 +407,11 @@ class ModelProvider:
         self.tokenizer = tokenizer
         self.draft_model = draft_model
         self.is_batchable = is_batchable
+
+        # Image preprocessing for vision-capable models (None otherwise).
+        # Built at load time so a malformed processor config fails loudly
+        # here, not on the first image request.
+        self.image_inputs = load_image_inputs(model, model_path)
 
     def load_default(self):
         if self._model_map["default_model"] is not None:
@@ -664,11 +684,15 @@ class ResponseGenerator:
 
         return stop_sequences, text_sm
 
-    def _is_batchable(self, args):
+    def _is_batchable(self, args, request=None):
+        # Image requests need their input embeddings built up front (see
+        # _serve_single); BatchGenerator only takes token segments.
+        has_images = bool(getattr(request, "images", None))
         return (
             self.model_provider.is_batchable
             and args.seed is None
             and self.cli_args.kv_bits is None
+            and not has_images
         )
 
     def _generate(self):
@@ -717,7 +741,7 @@ class ResponseGenerator:
                 if (
                     batch_generator is not None
                     and current_model == args.model
-                    and self._is_batchable(args)
+                    and self._is_batchable(args, request)
                 ):
                     try:
                         prompt, segments, segment_types, initial_state = self._tokenize(
@@ -795,7 +819,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    if not self._is_batchable(args, request):
                         self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
@@ -932,8 +956,30 @@ class ResponseGenerator:
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
 
+            image_inputs = None
+            if request.images:
+                image_inputs = self.model_provider.image_inputs
+                if image_inputs is None:
+                    raise ValueError(
+                        "This model does not accept image inputs (no vision "
+                        "tower / image processor). Use a vision-capable model "
+                        "or remove the image."
+                    )
+
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+
+            # Image requests: expand each image placeholder into its real
+            # soft-token span and fuse the image features into the prompt
+            # embeddings once, up front. `cache_prompt` keys the prompt cache
+            # (image positions hashed by image content -- see
+            # multimodal.ImageInputs.build).
+            input_embeddings = None
+            cache_prompt = prompt
+            if image_inputs is not None:
+                prompt, input_embeddings, cache_prompt = image_inputs.build(
+                    prompt, request.images
+                )
             stop_sequences, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -962,13 +1008,25 @@ class ResponseGenerator:
             # Load the KV cache
             self._log_cache_stats()
             cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+                self.model_provider.model_key, cache_prompt
             )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
-            cache_key = prompt[:]
+            ctx.prompt_cache_count = len(cache_prompt) - len(rest)
+            cache_key = cache_prompt[:]
+            if input_embeddings is not None:
+                # `rest` is a slice of the cache key (pseudo ids at image
+                # positions); feed the real ids + embeddings for that tail.
+                n_cached = ctx.prompt_cache_count
+                rest = prompt[n_cached:]
+                input_embeddings = input_embeddings[n_cached:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
+                # Speculative decoding is skipped for image requests (the
+                # draft model can't consume the fused image embeddings), so
+                # don't give it a cache slot there either.
+                if (
+                    self.model_provider.draft_model is not None
+                    and input_embeddings is None
+                ):
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
@@ -983,8 +1041,9 @@ class ResponseGenerator:
                 sampler=sampler,
                 logits_processors=logits_processors,
                 prompt_cache=cache,
-                draft_model=draft_model,
+                draft_model=draft_model if input_embeddings is None else None,
                 num_draft_tokens=args.num_draft_tokens,
+                input_embeddings=input_embeddings,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 kv_bits=self.cli_args.kv_bits,
@@ -1215,7 +1274,15 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
+        try:
+            request = request_factories[self.path]()
+        except ValueError as e:
+            # e.g. a malformed / unfetchable image_url -- report it instead of
+            # dropping the connection.
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
         self.handle_completion(request, stop_words)
 
     def _validate(
@@ -1632,12 +1699,16 @@ class APIHandler(BaseHTTPRequestHandler):
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
         self.object_type = "chat.completion.chunk" if self.stream else "chat.completion"
 
+        messages = body["messages"]
+        images = extract_images(messages)
+
         return CompletionRequest(
             "chat",
             "",
-            body["messages"],
+            messages,
             body.get("tools") or None,
             body.get("role_mapping"),
+            images=images or None,
         )
 
     def handle_text_completions(self) -> CompletionRequest:
