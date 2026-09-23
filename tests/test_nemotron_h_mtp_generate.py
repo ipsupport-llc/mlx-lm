@@ -66,6 +66,35 @@ class TestNemotronHMTPGenerate(unittest.TestCase):
         ]
         self.assertEqual(spec, baseline)
 
+    def test_cache_matches_emitted_tokens_wherever_generation_stops(self):
+        """mlx_lm.server stores the prompt cache keyed by prompt + every
+        emitted token and continues the next turn from it, so when the
+        consumer stops (max_tokens / EOS: the generator is closed at that
+        yield) the cache must hold exactly those tokens -- as plain
+        generate_step leaves it -- whether generation stopped at an accepted
+        draft or at the backbone's own token."""
+        mx.random.seed(0)
+        model = Model(tiny_args())
+        prompt = mx.random.randint(0, 64, (6,))
+        ref = [
+            t for t, _, _ in nemotron_h_mtp_generate_step(prompt, model, max_tokens=14)
+        ]
+        for stop_after in range(1, 13):
+            cache = model.make_cache()
+            gen = nemotron_h_mtp_generate_step(
+                prompt, model, max_tokens=14, prompt_cache=cache
+            )
+            out = [next(gen)[0] for _ in range(stop_after)]
+            gen.close()
+            self.assertEqual(out, ref[:stop_after])
+            nxt = mx.array([[ref[stop_after]]])
+            got = model.lm_head(model.backbone(nxt, cache=cache))[0, -1]
+            full = mx.concatenate([prompt, mx.array(ref[: stop_after + 1])])
+            want = model.lm_head(model.backbone(full[None]))[0, -1]
+            self.assertTrue(
+                mx.allclose(got, want, atol=2e-2).item(), f"stop_after={stop_after}"
+            )
+
     def test_matches_greedy_decoding_with_quantized_kv_cache(self):
         """kv_bits must produce the exact same token stream as plain
         backbone-only decoding quantized the same way -- NOT vs a
