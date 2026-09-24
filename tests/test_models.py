@@ -1316,6 +1316,55 @@ class TestModels(unittest.TestCase):
         self.assertIn(mlx_norm_key, converted)
         self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
 
+    def test_gemma4_unified_loads_text_only(self):
+        # Encoder-free multimodal checkpoints (vision_embedder, no vision/
+        # audio towers) carry vision_config/audio_config for towers that
+        # don't exist in the weights -- building them failed every load.
+        from mlx_lm.models import gemma4
+
+        text_config = {
+            "model_type": "gemma4_unified_text",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "num_global_key_value_heads": 1,
+            "head_dim": 8,
+            "global_head_dim": 8,
+            "sliding_window": 8,
+            "sliding_window_pattern": 1,
+            "layer_types": ["full_attention"],
+            "hidden_size_per_layer_input": 0,
+            "num_kv_shared_layers": 0,
+            "tie_word_embeddings": True,
+        }
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4_unified",
+                "vocab_size": 32,
+                "text_config": text_config,
+                "vision_config": {"model_type": "gemma4_unified_vision", "hidden_size": 8},
+                "audio_config": {"model_type": "gemma4_unified_audio", "hidden_size": 8},
+            }
+        )
+        model = gemma4.Model(args)
+        self.assertIsNone(model.vision_tower)
+        self.assertIsNone(model.audio_tower)
+        self.assertIsNone(model.embed_vision)
+        self.assertIsNone(model.embed_audio)
+
+        base = mx.arange(8, dtype=mx.float32)
+        converted = model.sanitize(
+            {
+                "language_model.model.layers.0.input_layernorm.weight": base,
+                "vision_embedder.patch_dense.weight": base,
+                "embed_vision.embedding_projection.weight": base,
+                "embed_audio.embedding_projection.weight": base,
+            }
+        )
+        self.assertEqual(list(converted), ["language_model.model.layers.0.input_layernorm.weight"])
+
     def test_gemma4_raw_hf_moe_expert_weights_split_for_switch_glu(self):
         from mlx_lm.models import gemma4
 
