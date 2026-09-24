@@ -343,6 +343,76 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def _layer_quantization(path: str, params):
+    """A per-layer quantization entry as `nn.quantize` takes it. Some
+    exporters (JANG bundles) add `storage_bits`, the width the packed
+    weight uses; it only means something different from `bits` when bits
+    are padded into a wider container, which MLX's affine layout doesn't
+    do -- so an equal one is dropped and a different one refused rather
+    than silently misread."""
+    if not isinstance(params, dict) or "storage_bits" not in params:
+        return params
+    params = dict(params)
+    storage_bits = params.pop("storage_bits")
+    if storage_bits != params.get("bits"):
+        raise ValueError(
+            f"{path}: storage_bits={storage_bits} differs from bits={params.get('bits')}; "
+            "padded bit containers aren't supported."
+        )
+    return params
+
+
+def _adapt_prism_hadamard_repack(config: dict, model_path: Path) -> None:
+    """Route JANG repacks of prism-ml's Hadamard-rotated ternary Bonsai 2
+    checkpoints to `prism_hadamard_qwen35`.
+
+    The repacks (e.g. dealignai/Bonsai-2-27B-CRACK-Ternary-JANG) keep the
+    same rotated 2-bit weights and `.signs` tensors but declare plain
+    `qwen3_5` and describe the rotation as `config["hadamard"]` (contract
+    `prism.hadamard.v1`: `forward_modules` / `inverse_modules`) instead of
+    prism's own `modules` list; their per-module quantization entries also
+    carry a `storage_bits` key `nn.quantize` doesn't accept, and their
+    RMSNorm weights are stored zero-centered (jang_config.json
+    `layout.language_norms`: the runtime adds 1), where prism's MLX
+    checkpoint stores them with the 1 already added. Loaded as plain
+    qwen3_5 they failed on `storage_bits` -- and would otherwise have
+    produced silently wrong output, since the activations must be rotated.
+    """
+    hadamard = config.get("hadamard")
+    if not isinstance(hadamard, dict) or hadamard.get("contract") != "prism.hadamard.v1":
+        return
+    if config.get("model_type") != "qwen3_5" or not hadamard.get("gdn_v_grouped", True):
+        raise ValueError(
+            "Unsupported prism.hadamard.v1 checkpoint: only qwen3_5 with the grouped "
+            "GatedDeltaNet layout is implemented (prism_hadamard_qwen35)."
+        )
+    block = hadamard["block_size"]
+
+    def path(name):
+        return name.removeprefix("language_model.")
+
+    config["model_type"] = "prism_hadamard_qwen35"
+    config["modules"] = [
+        {"path": path(n), "block": block, "embedding": False} for n in hadamard.get("forward_modules", [])
+    ] + [
+        {"path": path(n), "block": block, "embedding": True} for n in hadamard.get("inverse_modules", [])
+    ]
+    # The rotated modules are built already quantized (2-bit, group 128) by
+    # prism_hadamard_qwen35; the only other quantized entries are the
+    # vision tower's, which that model drops.
+    quantization = config.get("quantization") or {}
+    config["quantization"] = {
+        "group_size": quantization.get("group_size", 128),
+        "bits": quantization.get("bits", 2),
+        "mode": quantization.get("mode", "affine"),
+    }
+    jang_config = model_path / "jang_config.json"
+    if jang_config.exists():
+        with open(jang_config) as f:
+            layout = json.load(f).get("layout", {})
+        config["zero_centered_norms"] = layout.get("language_norms") == "zero-centered-runtime-plus-one"
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -382,6 +452,7 @@ def load_model(
     config = load_config(model_path)
     if model_config is not None:
         config.update(model_config)
+    _adapt_prism_hadamard_repack(config, model_path)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
@@ -426,7 +497,7 @@ def load_model(
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
-                return config["quantization"][p]
+                return _layer_quantization(p, config["quantization"][p])
             if not hasattr(m, "to_quantized"):
                 return False
             return f"{p}.scales" in weights

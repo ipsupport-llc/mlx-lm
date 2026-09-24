@@ -104,6 +104,10 @@ class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict = field(default_factory=dict)
     modules: List[Dict[str, Any]] = field(default_factory=list)
+    # RMSNorm weights stored zero-centered (the runtime adds 1) -- JANG
+    # repacks, see utils._adapt_prism_hadamard_repack. prism's own MLX
+    # checkpoints store them with the 1 already added.
+    zero_centered_norms: bool = False
 
     @classmethod
     def from_dict(cls, params):
@@ -111,7 +115,19 @@ class ModelArgs(BaseModelArgs):
             model_type=params["model_type"],
             text_config=params.get("text_config", params),
             modules=params.get("modules", []),
+            zero_centered_norms=params.get("zero_centered_norms", False),
         )
+
+
+# The norms qwen3_5 stores with a +1 offset (its sanitize applies it to
+# HF-layout checkpoints); linear_attn.norm has none.
+_SHIFTED_NORMS = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
 
 
 def _resolve(root, path):
@@ -164,6 +180,8 @@ class Model(nn.Module):
                 pass
             else:
                 key = "language_model." + key
+            if self.args.zero_centered_norms and key.endswith(_SHIFTED_NORMS):
+                value = value + 1.0
             sanitized[key] = value
         return self.language_model.sanitize(sanitized)
 
