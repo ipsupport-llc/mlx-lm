@@ -200,10 +200,18 @@ class Model(nn.Module):
             gemma4_text.ModelArgs.from_dict(args.text_config)
         )
         text_hidden_size = self.language_model.args.hidden_size
+        # gemma4_unified (remapped here in utils.MODEL_REMAPPING) is an
+        # encoder-free multimodal variant: its checkpoints carry a
+        # `vision_embedder` and no vision/audio towers, a layout this file
+        # doesn't implement. Its vision_config/audio_config describe those
+        # missing towers, so building them made every load fail with
+        # "Missing N parameters: audio_tower..., vision_tower...". Loaded
+        # text-only; sanitize() drops the unified media weights.
+        text_only = args.model_type == "gemma4_unified"
 
         self.vision_tower = None
         self.embed_vision = None
-        if args.vision_config is not None:
+        if args.vision_config is not None and not text_only:
             vision_args = gemma4_vision.ModelArgs.from_dict(args.vision_config)
             self.vision_tower = gemma4_vision.VisionModel(vision_args)
             self.embed_vision = MultimodalEmbedder(
@@ -214,7 +222,7 @@ class Model(nn.Module):
 
         self.audio_tower = None
         self.embed_audio = None
-        if args.audio_config is not None:
+        if args.audio_config is not None and not text_only:
             audio_args = gemma4_audio.ModelArgs.from_dict(args.audio_config)
             self.audio_tower = gemma4_audio.AudioModel(audio_args)
             self.embed_audio = gemma4_audio.MultimodalEmbedder(
