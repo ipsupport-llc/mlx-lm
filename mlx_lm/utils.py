@@ -1086,9 +1086,13 @@ def save_config(
         config (dict): The model configuration.
         config_path (Union[str, Path]): Model configuration file path.
     """
-    # Clean unused keys
+    # Clean unused keys. vision_config too (text-only conversions of VLMs),
+    # except for models whose vision this package loads: dropping it made a
+    # converted Gemma 4 silently lose its vision (the tower isn't built
+    # without it, and its saved weights were then discarded on load).
     config.pop("_name_or_path", None)
-    config.pop("vision_config", None)
+    if config.get("model_type") not in ("gemma4",):
+        config.pop("vision_config", None)
     if "quantization" in config:
         config["quantization_config"] = config["quantization"]
 
