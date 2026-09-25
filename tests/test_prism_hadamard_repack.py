@@ -112,6 +112,45 @@ class TestPrismHadamardRepack(unittest.TestCase):
         self.assertEqual(run(False)["language_model.model.norm.weight"].tolist(), [0.0] * 4)
 
 
+class TestPrismRepackRoundTrip(unittest.TestCase):
+    """A loaded repack saved again (fuse / convert / dwq save the config
+    load returned) must load back the same: it used to fail on the kept
+    `hadamard` block, and to add the norms' 1 a second time."""
+
+    def test_adapted_config_is_stable(self):
+        config = TestPrismHadamardRepack.adapt(None, repack_config(), {"language_norms": "zero-centered-runtime-plus-one"})
+        self.assertNotIn("hadamard", config, "translated into modules")
+        again = json.loads(json.dumps(config))
+        TestPrismHadamardRepack.adapt(None, again)
+        self.assertEqual(again, config)
+        # Saved by an mlx-lm that kept the block: its norms already hold the 1.
+        old_save = dict(config, hadamard=repack_config()["hadamard"], zero_centered_norms=True)
+        TestPrismHadamardRepack.adapt(None, old_save)
+        self.assertEqual(old_save, dict(config, zero_centered_norms=False))
+
+    def test_hf_layout_conv1d_norms_shifted_once(self):
+        from mlx_lm.models import qwen3_5
+
+        weights = {
+            "language_model.model.norm.weight": mx.zeros((4,)),
+            "language_model.model.layers.0.input_layernorm.weight": mx.zeros((4,)),
+            # HF layout (C, 1, K): qwen3_5's sanitize adds the norms' 1 itself.
+            "language_model.model.layers.0.linear_attn.conv1d.weight": mx.zeros((8, 1, 4)),
+        }
+        text = SimpleNamespace(args=SimpleNamespace(tie_word_embeddings=False))
+        fake = SimpleNamespace(
+            args=SimpleNamespace(zero_centered_norms=True),
+            language_model=SimpleNamespace(sanitize=lambda w: qwen3_5.TextModel.sanitize(text, w)),
+        )
+        out = prism.Model.sanitize(fake, dict(weights))
+        self.assertEqual(out["language_model.model.norm.weight"].tolist(), [1.0] * 4)
+        self.assertEqual(out["language_model.model.layers.0.input_layernorm.weight"].tolist(), [1.0] * 4)
+        # MLX layout: prism's sanitize adds it (qwen3_5's doesn't).
+        weights["language_model.model.layers.0.linear_attn.conv1d.weight"] = mx.zeros((8, 4, 1))
+        out = prism.Model.sanitize(fake, dict(weights))
+        self.assertEqual(out["language_model.model.norm.weight"].tolist(), [1.0] * 4)
+
+
 class TestLayerQuantization(unittest.TestCase):
     def test_equal_storage_bits_dropped(self):
         self.assertEqual(

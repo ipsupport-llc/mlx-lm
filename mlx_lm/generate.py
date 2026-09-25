@@ -612,6 +612,31 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
+    def _offset(cache):
+        return next((c.offset for c in cache if hasattr(c, "offset")), None)
+
+    # On exit each cache holds exactly the prompt and the yielded tokens, as
+    # generate_step leaves it (a caller like the server stores it under that
+    # key): the last token yielded -- more for the draft cache -- was never
+    # fed, so feed it.
+    emitted = []
+    targets = [
+        (m, c, None if _offset(c) is None else _offset(c) + prompt.size)
+        for m, c in ((model, model_cache), (draft_model, draft_cache))
+    ]
+
+    def _sync_caches():
+        for m, cache, base in targets:
+            if base is None:
+                continue
+            missing = base + len(emitted) - _offset(cache)
+            if missing < 0:
+                trim_prompt_cache(cache, -missing)
+            elif 0 < missing <= len(emitted):
+                m(mx.array(emitted[-missing:], mx.uint32)[None], cache=cache)
+                quantize_cache_fn(cache)
+                mx.eval([c.state for c in cache])
+
     with mx.stream(stream):
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
@@ -620,6 +645,7 @@ def speculative_generate_step(
         # Set these so the finally block doesn't raise
         num_draft = 0
         n = 0
+        clean_exit = True
         try:
             while True:
                 num_draft = min(max_tokens - ntoks, num_draft_tokens)
@@ -640,11 +666,13 @@ def speculative_generate_step(
                         break
                     n += 1
                     ntoks += 1
+                    emitted.append(tn)
                     yield tn, lpn, True
                     if ntoks == max_tokens:
                         break
                 if ntoks < max_tokens:
                     ntoks += 1
+                    emitted.append(tokens[n])
                     yield tokens[n], logprobs[n], False
 
                 if ntoks == max_tokens:
@@ -664,8 +692,15 @@ def speculative_generate_step(
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
                 _rewind_cache(num_draft, n)
+        except GeneratorExit:
+            raise
+        except BaseException:
+            clean_exit = False
+            raise
         finally:
             _rewind_cache(num_draft, n)
+            if clean_exit:
+                _sync_caches()
 
 
 def _model_supports_nemotron_h_mtp(model: nn.Module) -> bool:
@@ -689,6 +724,7 @@ def nemotron_h_mtp_generate_step(
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prefill_step_size: int = 2048,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding using Nemotron-H's in-checkpoint MTP head.
 
@@ -745,7 +781,7 @@ def nemotron_h_mtp_generate_step(
     if prompt_progress_callback is None:
         prompt_progress_callback = lambda *_: None
     total = len(prompt)
-    with mx.stream(generation_stream):
+    with mx.stream(stream):
         done = 0
         prompt_progress_callback(done, total)
         while total - done > prefill_step_size:
@@ -770,12 +806,14 @@ def nemotron_h_mtp_generate_step(
     # is already in the cache.
     unfed = tok
     n = 1
+    # max_tokens < 0 means no limit, as for generate_step.
+    limit = max_tokens if max_tokens >= 0 else float("inf")
     try:
         yield tok.item(), logprobs, False
 
-        while n < max_tokens:
+        while n < limit:
             unfed = None  # mid-iteration: tok is being fed by the verify pass
-            with mx.stream(generation_stream):
+            with mx.stream(stream):
                 draft_logits, _ = model.mtp_step(
                     hidden_last, tok.reshape(1, 1), mtp_cache
                 )
@@ -804,9 +842,12 @@ def nemotron_h_mtp_generate_step(
                     hidden_last = hidden2[:, 0:1, :]
 
             if accepted:
-                yield draft_tok.item(), draft_logprobs, True
+                # The backbone's distribution at that position (the MTP
+                # head's is only the drafter's guess), like every other
+                # speculative path reports.
+                yield draft_tok.item(), verify_logprobs, True
                 n += 1
-                if n >= max_tokens:
+                if n >= limit:
                     break
                 unfed = bonus_tok
                 yield bonus_tok.item(), bonus_logprobs, False
@@ -819,7 +860,7 @@ def nemotron_h_mtp_generate_step(
                 tok = verify_tok
     finally:
         if unfed is not None:
-            with mx.stream(generation_stream):
+            with mx.stream(stream):
                 model.backbone(unfed.reshape(1, 1), cache=model_cache)
                 quantize_cache_fn(model_cache)
                 mx.eval([c.state for c in model_cache if c is not None])
@@ -1019,8 +1060,10 @@ def gemma4_mtp_generate_step(
     try:
         yield tok.item(), logprobs.squeeze(0), False
 
-        while n_out < max_tokens:
-            k = min(num_draft_tokens, max_tokens - n_out)
+        # max_tokens < 0 means no limit, as for generate_step.
+        limit = max_tokens if max_tokens >= 0 else float("inf")
+        while n_out < limit:
+            k = int(min(num_draft_tokens, limit - n_out))
             fixup = None  # mid-iteration: cache state not well defined
             with mx.stream(stream):
                 drafts = []
@@ -1058,7 +1101,7 @@ def gemma4_mtp_generate_step(
                 fixup = ("trim", n_acc - 1 - i)
                 yield toks_l[i], lps[i], True
                 n_out += 1
-                if n_out >= max_tokens:
+                if n_out >= limit:
                     return
             fixup = ("feed", tok)
             yield toks_l[n_acc], lps[n_acc], False
@@ -1157,6 +1200,7 @@ def stream_generate(
                 ),
                 prefill_step_size=kwargs.get("prefill_step_size", 2048),
                 prompt_progress_callback=kwargs.get("prompt_progress_callback"),
+                stream=stream,
             )
         else:
             token_generator = generate_step(prompt, model, stream, **kwargs)
@@ -1204,9 +1248,20 @@ def stream_generate(
                 (token, logprobs, False)
                 for token, logprobs in generate_step(prompt, model, stream, **kwargs)
             )
+    elif kwargs.get("input_embeddings") is not None:
+        # A classic draft model can't take embeddings (an image request):
+        # plain decoding without it -- same output, not faster.
+        kwargs.pop("num_draft_tokens", None)
+        token_generator = (
+            (token, logprobs, False)
+            for token, logprobs in generate_step(prompt, model, stream, **kwargs)
+        )
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        # The server always passes it (None for text): speculative_generate_step
+        # has no such parameter, and every request failed with a TypeError.
+        kwargs.pop("input_embeddings", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, stream, **kwargs
         )

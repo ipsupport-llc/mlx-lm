@@ -43,7 +43,7 @@ from .generate import (
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .multimodal import extract_images, load_image_inputs
 from .multimodal import vision_spans as multimodal_vision_spans
-from .sample_utils import make_logits_processors, make_sampler
+from .sample_utils import greedy_sampler, make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
     load,
@@ -299,6 +299,7 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self.supports_mtp = False
         self.image_inputs = None
 
         group = mx.distributed.init()
@@ -317,7 +318,9 @@ class ModelProvider:
         self._model_map["default_model"] = self.cli_args.model
         self._adapter_map["default_model"] = self.cli_args.adapter_path
         self._draft_model_map["default_model"] = self.cli_args.draft_model
-        for _alias in (self.cli_args.model_alias or []):
+        # getattr: a ModelProvider built from another parser's Namespace
+        # (tests, embedders) has no model_alias.
+        for _alias in (getattr(self.cli_args, "model_alias", None) or []):
             self._model_map[_alias] = self.cli_args.model
             self._adapter_map[_alias] = self.cli_args.adapter_path
             self._draft_model_map[_alias] = self.cli_args.draft_model
@@ -333,6 +336,7 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self.supports_mtp = False
         self.image_inputs = None
 
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
@@ -392,15 +396,13 @@ class ModelProvider:
         # unbatched sequence -- BatchGenerator (the batchable path) is
         # generic multi-sequence decoding with no knowledge of mtp_step at
         # all. Every cache type here (including Mamba's ArraysCache)
-        # supports merge(), so is_batchable would otherwise be True and
-        # _is_batchable() would route every request through BatchGenerator
-        # regardless of decode-concurrency's value -- silently disabling
-        # self-speculative decoding for any MTP-capable model with KV
-        # quantization off (the default), independent of whether MTP is
-        # actually wanted. Confirmed live: identical decode tok/s whether
-        # the MTP-enabled fork was installed or not, because neither
-        # request ever reached the MTP dispatch code path.
-        is_batchable = is_batchable and not _model_supports_nemotron_h_mtp(model)
+        # supports merge(), so without a check every request would go
+        # through BatchGenerator and never reach MTP (confirmed live:
+        # identical decode tok/s with and without the MTP fork). The check
+        # is per request (_is_batchable): only one MTP would serve -- greedy,
+        # no logits processors -- is kept out of batching; a sampled or
+        # penalized request never uses MTP and batches as before.
+        supports_mtp = _model_supports_nemotron_h_mtp(model)
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -408,6 +410,7 @@ class ModelProvider:
         self.tokenizer = tokenizer
         self.draft_model = draft_model
         self.is_batchable = is_batchable
+        self.supports_mtp = supports_mtp
 
         # Image preprocessing for vision-capable models (None otherwise).
         # Built at load time so a malformed processor config fails loudly
@@ -685,6 +688,14 @@ class ResponseGenerator:
 
         return stop_sequences, text_sm
 
+    def _uses_mtp(self, args):
+        """Whether stream_generate would serve this request with the
+        Nemotron-H MTP head (the same conditions it checks)."""
+        if not getattr(self.model_provider, "supports_mtp", False) or getattr(self.cli_args, "max_kv_size", None) is not None:
+            return False
+        sampler = _make_sampler(args, self.model_provider.tokenizer)
+        return sampler is greedy_sampler and not _make_logits_processors(args)
+
     def _is_batchable(self, args, request=None):
         # Image requests need their input embeddings built up front (see
         # _serve_single); BatchGenerator only takes token segments.
@@ -694,6 +705,7 @@ class ResponseGenerator:
             and args.seed is None
             and self.cli_args.kv_bits is None
             and not has_images
+            and not self._uses_mtp(args)
         )
 
     def _generate(self):
@@ -1011,6 +1023,14 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, cache_prompt
             )
+            # Image requests run without the draft model (it can't consume
+            # the fused image embeddings), so their caches have no draft
+            # slots: match the slots to this request.
+            use_draft = (
+                self.model_provider.draft_model is not None
+                and input_embeddings is None
+            )
+            cache, rest = self._match_draft_slots(cache, rest, cache_prompt, use_draft)
             ctx.prompt_cache_count = len(cache_prompt) - len(rest)
             cache_key = cache_prompt[:]
             if input_embeddings is not None:
@@ -1021,13 +1041,7 @@ class ResponseGenerator:
                 input_embeddings = input_embeddings[n_cached:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
-                # Speculative decoding is skipped for image requests (the
-                # draft model can't consume the fused image embeddings), so
-                # don't give it a cache slot there either.
-                if (
-                    self.model_provider.draft_model is not None
-                    and input_embeddings is None
-                ):
+                if use_draft:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
@@ -1049,7 +1063,7 @@ class ResponseGenerator:
                     sampler=sampler,
                     logits_processors=logits_processors,
                     prompt_cache=cache,
-                    draft_model=draft_model if input_embeddings is None else None,
+                    draft_model=draft_model if use_draft else None,
                     num_draft_tokens=args.num_draft_tokens,
                     input_embeddings=input_embeddings,
                     prompt_progress_callback=progress,
@@ -1097,6 +1111,20 @@ class ResponseGenerator:
 
         except Exception as e:
             rqueue.put(e)
+
+    def _match_draft_slots(self, cache, rest, cache_prompt, use_draft):
+        """A cached prompt's slots for this request: a cache without draft
+        slots can't serve a draft request (recomputed), and one with them
+        loses them for a request without the draft (it wouldn't advance
+        them)."""
+        if cache is None or self.model_provider.draft_model is None:
+            return cache, rest
+        n_main = len(self.model_provider.model.layers)
+        if use_draft and len(cache) == n_main:
+            return None, cache_prompt
+        if not use_draft and len(cache) > n_main:
+            return cache[:n_main], rest
+        return cache, rest
 
     def _await_response(self, response_queue):
         # Wherever the request was when the thread died, nothing more will be
@@ -1745,7 +1773,8 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models") or self.path.startswith("/api/v0/models"):
+        path = self.path.split("?", 1)[0]
+        if any(path == p or path.startswith(p + "/") for p in ("/v1/models", "/api/v0/models")):
             # /api/v0/models is LM Studio's own REST convention -- some
             # clients probe that shape by default. Same OpenAI-shaped
             # response as /v1/models, not LM Studio's richer schema, but
@@ -1781,10 +1810,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
-        parts = self.path.split("/")
-        filter_repo_id = None
-        if len(parts) > 3:
-            filter_repo_id = "/".join(parts[3:])
+        # /v1/models[/<id>] and LM Studio's /api/v0/models[/<id>]: the id is
+        # what follows the prefix (splitting on "/" took "models" itself as
+        # the id for /api/v0/models, so it always listed nothing).
+        path = self.path.split("?", 1)[0]
+        prefix = "/api/v0/models" if path.startswith("/api/v0/models") else "/v1/models"
+        filter_repo_id = path[len(prefix):].strip("/") or None
 
         def probably_mlx_lm(repo):
             if repo.repo_type != "model":
@@ -1812,17 +1843,25 @@ class APIHandler(BaseHTTPRequestHandler):
             for repo in downloaded_models
         ]
 
-        if self.response_generator.cli_args.model:
-            model_path = Path(self.response_generator.cli_args.model)
+        cli_args = self.response_generator.cli_args
+        if cli_args.model:
+            model_path = Path(cli_args.model)
             if model_path.exists():
                 model_id = str(model_path.resolve())
-                models.append(
-                    {
-                        "id": model_id,
-                        "object": "model",
-                        "created": self.created,
-                    }
-                )
+                # The id is an absolute path: its leading "/" was stripped
+                # from the filter with the separator.
+                if filter_repo_id in (None, model_id.strip("/")):
+                    models.append(
+                        {
+                            "id": model_id,
+                            "object": "model",
+                            "created": self.created,
+                        }
+                    )
+        # --model-alias names are models a client can ask for too.
+        for alias in getattr(cli_args, "model_alias", None) or []:
+            if filter_repo_id in (None, alias):
+                models.append({"id": alias, "object": "model", "created": self.created})
 
         response = {"object": "list", "data": models}
 
@@ -1926,6 +1965,13 @@ def main():
         "--trust-remote-code",
         action="store_true",
         help="Enable trusting remote code for tokenizer",
+    )
+    parser.add_argument(
+        "--allow-image-urls",
+        action="store_true",
+        help="Fetch http(s) image_url parts (off by default: the server would "
+        "request any URL a client names, loopback and LAN included). "
+        "data: URIs always work.",
     )
     parser.add_argument(
         "--model-alias",
@@ -2045,6 +2091,9 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+    from . import multimodal
+
+    multimodal.ALLOW_IMAGE_URLS = args.allow_image_urls
     _ = maybe_set_recommended_wired_limit()
 
     logging.basicConfig(

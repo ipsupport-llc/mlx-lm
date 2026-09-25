@@ -618,8 +618,20 @@ class AudioModel(nn.Module):
           `...depthwise_conv1d.conv.weight`.
         - Conv weight axis order: torch `Conv2d`/`Conv1d` store weights as
           `(out, in/groups, *kernel)`; mlx's `Conv2d`/`Conv1d` expect
-          `(out, *kernel, in/groups)`.
+          `(out, *kernel, in/groups)`. Only transposed when not already in
+          mlx's layout (this module's own parameter shape): a checkpoint
+          saved by mlx (a converted model, mlx-vlm's mlx-community E2B/E4B)
+          has it already, and transposing again broke loading.
         """
+        from mlx.utils import tree_flatten
+
+        expected = {k: v.shape for k, v in tree_flatten(self.parameters())}
+
+        def to_mlx(key, v, axes):
+            if v.shape == expected.get(key):
+                return v
+            return v.transpose(*axes)
+
         new_weights = {}
         for k, v in weights.items():
             nk = k
@@ -632,9 +644,11 @@ class AudioModel(nn.Module):
                 nk = nk.replace(
                     "depthwise_conv1d.weight", "depthwise_conv1d.conv.weight"
                 )
-                v = v.transpose(0, 2, 1)
+                v = to_mlx(nk, v, (0, 2, 1))
+            elif nk.endswith("depthwise_conv1d.conv.weight"):
+                v = to_mlx(nk, v, (0, 2, 1))
             elif nk.endswith(("layer0.conv.weight", "layer1.conv.weight")):
-                v = v.transpose(0, 2, 3, 1)
+                v = to_mlx(nk, v, (0, 2, 3, 1))
 
             new_weights[nk] = v
         return new_weights
