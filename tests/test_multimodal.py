@@ -179,7 +179,8 @@ class TestImageInputLimits(unittest.TestCase):
 
     def setUp(self):
         self.saved = {k: getattr(multimodal, k) for k in
-                      ("ALLOW_IMAGE_URLS", "MAX_IMAGES", "MAX_IMAGE_BYTES", "MAX_IMAGE_PIXELS", "URL_FETCH_SECONDS")}
+                      ("ALLOW_IMAGE_URLS", "MAX_IMAGES", "MAX_IMAGE_BYTES", "MAX_IMAGE_PIXELS",
+                       "MAX_REQUEST_PIXELS", "URL_FETCH_SECONDS")}
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -264,6 +265,44 @@ class TestImageInputLimits(unittest.TestCase):
         self.assertLess(len(buf.getvalue()), 100_000)
         with self.assertRaisesRegex(ValueError, "pixels"):
             extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))
+
+    def test_formats_whose_open_decodes_are_refused(self):
+        # ICO decodes its embedded PNG inside Image.open: refused by format,
+        # before any of that.
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64)).save(buf, format="ICO")
+        with self.assertRaisesRegex(ValueError, "accepted: BMP, GIF, JPEG, PNG, WEBP"):
+            extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64)).save(buf, format="TIFF")
+        with self.assertRaises(ValueError):
+            extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))
+        for fmt in ("PNG", "JPEG", "WEBP", "GIF", "BMP"):
+            buf = io.BytesIO()
+            Image.new("RGB", (16, 16)).save(buf, format=fmt)
+            self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))), 1, fmt)
+
+    def test_request_pixel_budget(self):
+        multimodal.MAX_REQUEST_PIXELS = 3000
+        uri = _data_uri(_png(40, 40, 0))   # 1600 px each
+        with self.assertRaisesRegex(ValueError, "add up"):
+            extract_images(_msg(_img_part(uri), _img_part(uri)))
+
+    def test_unhashable_part_type(self):
+        with self.assertRaises(ValueError):
+            extract_images(_msg({"type": ["text"], "text": "x"}))
+
+    def test_redirect_to_other_scheme_refused(self):
+        multimodal.ALLOW_IMAGE_URLS = True
+
+        def body(h):
+            h.send_response(302)
+            h.send_header("Location", "ftp://127.0.0.1/x")
+            h.end_headers()
+
+        base, _ = self._serve(body)
+        with self.assertRaisesRegex(ValueError, "scheme"):
+            extract_images(_msg(_img_part(base + "/r")))
 
     def test_not_an_image(self):
         uri = "data:image/png;base64," + base64.b64encode(b"hello, not an image").decode()

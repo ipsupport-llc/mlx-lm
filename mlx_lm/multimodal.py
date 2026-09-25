@@ -57,11 +57,23 @@ _IMAGE_KEY_BASE = 1 << 40
 ALLOW_IMAGE_URLS = False
 MAX_IMAGES = 8
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
-# 5000 x 5000. Checked from the header: a tiny PNG can declare a huge canvas
-# (a 20 KB file decoding to gigabytes). The processor resizes to at most
-# max_soft_tokens patches anyway, so nothing larger is ever needed.
-MAX_IMAGE_PIXELS = 25_000_000
+# 4000 x 4000 per image, 48 MP per request. Checked from the header: a tiny
+# PNG can declare a huge canvas (a 20 KB file decoding to gigabytes). The
+# processor resizes to at most max_soft_tokens patches anyway, so nothing
+# larger is ever needed; decoded, 48 MP is about 1 GB at the peak.
+MAX_IMAGE_PIXELS = 16_000_000
+MAX_REQUEST_PIXELS = 48_000_000
 URL_FETCH_SECONDS = 30
+# Formats whose Image.open reads only the header (ICO, for one, decodes its
+# embedded PNG right there -- the size check would come after the cost).
+IMAGE_FORMATS = {"PNG", "JPEG", "WEBP", "GIF", "BMP"}
+
+
+class _HTTPOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.startswith(("http://", "https://")):
+            raise ValueError(f"Image URL redirected to an unsupported scheme: {newurl[:32]}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _fetch(url: str) -> bytes:
@@ -69,7 +81,8 @@ def _fetch(url: str) -> bytes:
     overall (the socket timeout alone lets a slow drip go on forever)."""
     deadline = time.monotonic() + URL_FETCH_SECONDS
     request = urllib.request.Request(url, headers={"User-Agent": "mlx-lm-server"})
-    with urllib.request.urlopen(request, timeout=10) as resp:
+    opener = urllib.request.build_opener(_HTTPOnlyRedirects)
+    with opener.open(request, timeout=10) as resp:
         length = resp.headers.get("Content-Length")
         if length is not None and length.isdigit() and int(length) > MAX_IMAGE_BYTES:
             raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
@@ -111,9 +124,10 @@ def _image_bytes_from_url(url: str) -> bytes:
     raise ValueError(f"Unsupported image URL scheme: {url[:32]}...")
 
 
-def _check_image(blob: bytes) -> None:
-    """Refuses what isn't an image, or declares more than MAX_IMAGE_PIXELS
-    -- from the header only, nothing decoded."""
+def _check_image(blob: bytes) -> int:
+    """Refuses what isn't an image in IMAGE_FORMATS, or declares more than
+    MAX_IMAGE_PIXELS -- from the header only, nothing decoded. Returns its
+    pixel count."""
     from PIL import Image
 
     import warnings
@@ -122,16 +136,19 @@ def _check_image(blob: bytes) -> None:
         # Pillow warns above its own limit; ours is lower and checked below.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(blob)) as im:
+            with Image.open(io.BytesIO(blob), formats=sorted(IMAGE_FORMATS)) as im:
                 width, height = im.size
     except Image.DecompressionBombError:
         raise ValueError(f"Image is larger than {MAX_IMAGE_PIXELS} pixels.")
     except Exception:
-        raise ValueError("Unsupported or corrupt image data.")
+        raise ValueError(
+            f"Unsupported or corrupt image data (accepted: {', '.join(sorted(IMAGE_FORMATS))})."
+        )
     if width * height > MAX_IMAGE_PIXELS:
         raise ValueError(
             f"Image is {width}x{height} pixels; at most {MAX_IMAGE_PIXELS} are accepted."
         )
+    return width * height
 
 
 def extract_images(messages: List[Any]) -> List[bytes]:
@@ -141,14 +158,15 @@ def extract_images(messages: List[Any]) -> List[bytes]:
     if not isinstance(messages, list):
         raise ValueError("messages must be a list.")
     images = []
+    pixels = 0
     for message in messages:
         if not isinstance(message, dict):
             raise ValueError("Each message must be an object.")
         content = message.get("content")
         if not isinstance(content, list):
             continue
-        if not all(isinstance(part, dict) for part in content):
-            raise ValueError("Each content part must be an object.")
+        if not all(isinstance(part, dict) and isinstance(part.get("type"), str) for part in content):
+            raise ValueError("Each content part must be an object with a string type.")
         types = {part.get("type") for part in content}
         if "image" in types:
             # Only this function makes those: a client's would render an
@@ -172,7 +190,9 @@ def extract_images(messages: List[Any]) -> List[bytes]:
                 raise
             except Exception as e:  # network errors, bad base64, ...
                 raise ValueError(f"Could not load image_url: {e}") from e
-            _check_image(blob)
+            pixels += _check_image(blob)
+            if pixels > MAX_REQUEST_PIXELS:
+                raise ValueError(f"The images add up to more than {MAX_REQUEST_PIXELS} pixels.")
             images.append(blob)
             content[i] = {"type": "image"}
     return images
@@ -183,7 +203,8 @@ def _decode(blob: bytes):
     HF's load_image does (its size was checked by extract_images)."""
     from PIL import Image, ImageOps
 
-    return ImageOps.exif_transpose(Image.open(io.BytesIO(blob))).convert("RGB")
+    image = Image.open(io.BytesIO(blob), formats=sorted(IMAGE_FORMATS))
+    return ImageOps.exif_transpose(image).convert("RGB")
 
 
 class ImageInputs:
