@@ -132,8 +132,9 @@ def _fetch(url: str) -> bytes:
             left = deadline - time.monotonic()
             if left <= 0 or expired.is_set():
                 break
-            sock = register(socket.socket(family, kind, proto))
+            sock = None
             try:
+                sock = register(socket.socket(family, kind, proto))
                 sock.settimeout(min(timeout, left) if isinstance(timeout, (int, float)) else left)
                 if source_address:
                     sock.bind(source_address)
@@ -142,7 +143,8 @@ def _fetch(url: str) -> bytes:
                 return sock
             except OSError as e:
                 error = e
-                sock.close()
+                if sock is not None:
+                    sock.close()
         raise error or TimeoutError(f"Connecting to {address[0]} took too long.")
 
     def tracked(base):

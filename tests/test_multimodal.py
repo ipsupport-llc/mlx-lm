@@ -347,6 +347,32 @@ class TestImageInputLimits(unittest.TestCase):
                 extract_images(_msg(_img_part("http://many.invalid/x.png")))
             self.assertLess(_t.monotonic() - start, 2)
 
+    def test_connect_falls_back_past_an_unusable_address_family(self):
+        import socket
+        from unittest import mock
+
+        png = _png(8, 8, 0)
+
+        def body(h):
+            h.send_response(200)
+            h.end_headers()
+            h.wfile.write(png)
+
+        base, _ = self._serve(body)
+        port = int(base.rsplit(":", 1)[1])
+        real_socket = socket.socket
+
+        def make(family=socket.AF_INET, *a, **kw):
+            if family == socket.AF_INET6:
+                raise OSError(47, "Address family not supported")
+            return real_socket(family, *a, **kw)
+
+        addrs = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+                 (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        multimodal.ALLOW_IMAGE_URLS = True
+        with mock.patch("socket.getaddrinfo", return_value=addrs), mock.patch("socket.socket", make):
+            self.assertEqual(extract_images(_msg(_img_part(f"http://dual.invalid:{port}/x"))), [png])
+
     def test_url_deadline_holds_through_a_proxy_connect(self):
         # An HTTPS fetch through a proxy that drips its CONNECT response:
         # read inside connect(), before the socket used to be registered.
