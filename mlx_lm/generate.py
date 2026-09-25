@@ -427,9 +427,20 @@ def generate_step(
         )
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        # A model can keep a chunk from splitting a span that must be
+        # processed in one pass (Gemma 4: an image's tokens attend to each
+        # other in both directions). Positions count what the cache holds.
+        chunk_size = getattr(model, "prefill_chunk_size", None)
+        cached = next(
+            (c.offset for c in prompt_cache if getattr(c, "offset", None) is not None), 0
+        )
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
+            if chunk_size is not None:
+                n_to_process = max(
+                    1, min(chunk_size(cached + prompt_processed_tokens, n_to_process), remaining)
+                )
             processed = prompt[:n_to_process]
             _model_call(
                 input_tokens=processed[None],

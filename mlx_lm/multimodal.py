@@ -292,6 +292,20 @@ class ImageInputs:
         return gen_ids, embeddings, cache_key
 
 
+def vision_spans(cache_key: List[int]) -> List[Tuple[int, int]]:
+    """[start, end) of each image's soft tokens, from a cache key built by
+    ImageInputs.build (its image positions hold pseudo ids >= _IMAGE_KEY_BASE;
+    images are always separated by their begin / end tokens)."""
+    spans, start = [], None
+    for i, t in enumerate(list(cache_key) + [0]):
+        if t >= _IMAGE_KEY_BASE and start is None:
+            start = i
+        elif t < _IMAGE_KEY_BASE and start is not None:
+            spans.append((start, i))
+            start = None
+    return spans
+
+
 def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
     """ImageInputs for a vision-capable Gemma 4 model, else None."""
     if getattr(model, "model_type", None) != "gemma4":

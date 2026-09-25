@@ -315,6 +315,51 @@ class Model(nn.Module):
 
         return fused, per_layer_inputs
 
+    # -- Bidirectional attention within an image (26B-A4B, 12B) ----------
+
+    def _text_model(self):
+        return self.language_model.model
+
+    def uses_vision_bidirectional_attention(self) -> bool:
+        return self._text_model().config.use_bidirectional_attention == "vision"
+
+    def set_vision_spans(self, spans):
+        """[start, end) prompt positions of each image's soft tokens, for
+        the prefill that follows (None to clear): their tokens then attend
+        to each other in both directions, as HF does. The caller clears it
+        once the prompt is processed; decoding is causal either way.
+
+        What an image needs: its tokens all go through one forward pass.
+        So a cached prefix must not end inside an image (that part was
+        computed causally), and the prompt's last token must not be an image
+        token (generate_step runs it on its own). A chat-templated prompt
+        meets both: every image ends with its end-of-image token, and all of
+        an image's soft tokens share one prompt-cache key."""
+        self._text_model().vision_spans = (
+            list(spans) if spans and self.uses_vision_bidirectional_attention() else None
+        )
+
+    @staticmethod
+    def image_spans(ids, image_token_id):
+        """[start, end) runs of `image_token_id` in a list of token ids."""
+        spans, start = [], None
+        for i, t in enumerate(list(ids) + [None]):
+            if t == image_token_id and start is None:
+                start = i
+            elif t != image_token_id and start is not None:
+                spans.append((start, i))
+                start = None
+        return spans
+
+    def prefill_chunk_size(self, start: int, n: int) -> int:
+        """How much of a prefill chunk of `n` tokens from prompt position
+        `start` to take so it doesn't end inside an image (its first tokens
+        would miss the rest): up to the image, or through it."""
+        for s, e in self._text_model().vision_spans or ():
+            if s < start + n < e:
+                return s - start if s > start else e - start
+        return n
+
     def __call__(
         self,
         inputs: mx.array,
@@ -350,12 +395,25 @@ class Model(nn.Module):
             input_features,
             input_features_mask,
         )
-        return self.language_model(
-            inputs,
-            cache=cache,
-            input_embeddings=fused_embeddings,
-            per_layer_inputs=fused_per_layer_inputs,
-        )
+        # A direct call with the images: their spans come from `inputs`
+        # (offset by what the cache already holds), for this call only --
+        # batch size 1, each image whole within the call; otherwise causal.
+        text_model = self._text_model()
+        saved = text_model.vision_spans
+        if pixel_values is not None and saved is None and inputs.shape[0] == 1:
+            base = next((c.offset for c in (cache or []) if c is not None), 0)
+            self.set_vision_spans(
+                [(base + s, base + e) for s, e in self.image_spans(inputs[0].tolist(), self.args.image_token_id)]
+            )
+        try:
+            return self.language_model(
+                inputs,
+                cache=cache,
+                input_embeddings=fused_embeddings,
+                per_layer_inputs=fused_per_layer_inputs,
+            )
+        finally:
+            text_model.vision_spans = saved
 
     def sanitize(self, weights):
         text_weights = {}
