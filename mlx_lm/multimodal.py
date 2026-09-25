@@ -94,7 +94,11 @@ class _RegisteringContext:
     def wrap_socket(self, sock, **kwargs):
         wrapped = self._context.wrap_socket(sock, do_handshake_on_connect=False, **kwargs)
         self._register(wrapped)
-        wrapped.do_handshake()
+        try:
+            wrapped.do_handshake()
+        except BaseException:
+            wrapped.close()  # as the handshake inside wrap_socket would
+            raise
         return wrapped
 
     def __getattr__(self, name):

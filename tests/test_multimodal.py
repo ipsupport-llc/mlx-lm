@@ -385,6 +385,32 @@ class TestImageInputLimits(unittest.TestCase):
         with mock.patch("socket.getaddrinfo", return_value=addrs), mock.patch("socket.socket", make):
             self.assertEqual(extract_images(_msg(_img_part(f"http://dual.invalid:{port}/x"))), [png])
 
+    def test_failed_tls_handshake_closes_its_socket(self):
+        import gc
+        import os
+        import warnings
+
+        def plain(h):   # plain HTTP on a port fetched as https://
+            h.send_response(200)
+            h.end_headers()
+
+        base, _ = self._serve(plain)
+        multimodal.ALLOW_IMAGE_URLS = True
+        url = base.replace("http://", "https://") + "/x"
+        gc.disable()
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                before = len(os.listdir("/dev/fd"))
+                for _ in range(20):
+                    with self.assertRaises(ValueError):
+                        extract_images(_msg(_img_part(url)))
+                after = len(os.listdir("/dev/fd"))
+        finally:
+            gc.enable()
+        self.assertLess(after - before, 5, "sockets left open")
+        self.assertFalse([w for w in caught if "SSLSocket" in str(w.message)])
+
     def test_url_deadline_holds_through_a_proxy_connect(self):
         # An HTTPS fetch through a proxy that drips its CONNECT response:
         # read inside connect(), before the socket used to be registered.
