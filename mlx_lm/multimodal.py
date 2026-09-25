@@ -40,9 +40,11 @@ anything is decoded, and a request carries at most MAX_IMAGES images.
 
 import base64
 import hashlib
+import http.client
 import io
 import json
-import time
+import socket
+import threading
 import urllib.request
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -82,28 +84,101 @@ class _HTTPOnlyRedirects(urllib.request.HTTPRedirectHandler):
 
 def _fetch(url: str) -> bytes:
     """An http(s) image, at most MAX_IMAGE_BYTES, within URL_FETCH_SECONDS
-    overall (the socket timeout alone lets a slow drip go on forever)."""
-    deadline = time.monotonic() + URL_FETCH_SECONDS
+    overall. A deadline checked between reads can't stop a read already
+    blocked (a header or chunk line dripped a byte at a time keeps each
+    one inside the socket timeout): at the deadline the connections'
+    sockets are shut down, which wakes it."""
+    sockets, expired = [], threading.Event()
+
+    def tracked(base):
+        class Connection(base):
+            def connect(self):
+                super().connect()
+                sockets.append(self.sock)
+                if expired.is_set():
+                    self.sock.shutdown(socket.SHUT_RDWR)
+
+        return Connection
+
+    class HTTP(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(tracked(http.client.HTTPConnection), req)
+
+    class HTTPS(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(tracked(http.client.HTTPSConnection), req, context=self._context)
+
+    def expire():
+        expired.set()
+        for sock in list(sockets):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    timer = threading.Timer(URL_FETCH_SECONDS, expire)
+    timer.daemon = True
+    timer.start()
     request = urllib.request.Request(url, headers={"User-Agent": "mlx-lm-server"})
-    opener = urllib.request.build_opener(_HTTPOnlyRedirects)
-    with opener.open(request, timeout=10) as resp:
-        length = resp.headers.get("Content-Length")
-        if length is not None and length.isdigit() and int(length) > MAX_IMAGE_BYTES:
-            raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
-        chunks, total = [], 0
-        while True:
-            if time.monotonic() > deadline:
-                raise ValueError(f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s.")
-            # read1: what has arrived (read(n) would wait for all n bytes,
-            # so a slow drip never reached the deadline check).
-            chunk = resp.read1(64 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_IMAGE_BYTES:
+    opener = urllib.request.build_opener(_HTTPOnlyRedirects, HTTP, HTTPS)
+    try:
+        with opener.open(request, timeout=10) as resp:
+            length = resp.headers.get("Content-Length")
+            if length is not None and length.isdigit() and int(length) > MAX_IMAGE_BYTES:
                 raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
-            chunks.append(chunk)
+            chunks, total = [], 0
+            while True:
+                chunk = resp.read1(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_IMAGE_BYTES:
+                    raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
+                chunks.append(chunk)
+    except Exception:
+        if expired.is_set():
+            raise ValueError(f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s.")
+        raise
+    finally:
+        timer.cancel()
+    if expired.is_set():
+        # Shut down between reads: what arrived may be cut short.
+        raise ValueError(f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s.")
     return b"".join(chunks)
+
+
+def _jpeg_scans(blob: bytes) -> int:
+    """SOS markers of a JPEG, found by walking its segments (a byte count
+    also counted FF DA inside comments and other metadata)."""
+    scans, i, n = 0, 2, len(blob)
+    while i + 4 <= n:
+        if blob[i] != 0xFF:
+            return scans  # not at a marker: corrupt, the decoder will say so
+        marker = blob[i + 1]
+        if marker == 0xFF:  # fill byte
+            i += 1
+            continue
+        if marker == 0xD9:  # EOI
+            return scans
+        if 0xD0 <= marker <= 0xD7 or marker == 0x01:  # no length
+            i += 2
+            continue
+        i += 2 + int.from_bytes(blob[i + 2 : i + 4], "big")
+        if marker != 0xDA:
+            continue
+        scans += 1
+        if scans > MAX_JPEG_SCANS:
+            return scans
+        # Entropy-coded data: FF is stuffed (FF 00) or a restart marker.
+        while True:
+            i = blob.find(b"\xff", i)
+            if i < 0 or i + 1 >= n:
+                return scans
+            if blob[i + 1] == 0x00 or 0xD0 <= blob[i + 1] <= 0xD7:
+                i += 2
+                continue
+            break
+    return scans
 
 
 def _image_bytes_from_url(url: str) -> bytes:
@@ -117,7 +192,10 @@ def _image_bytes_from_url(url: str) -> bytes:
         # validate=True: the default silently drops non-alphabet characters,
         # turning garbage into b"" that only fails later, deep in the
         # generation thread.
-        return base64.b64decode("".join(b64.split()), validate=True)
+        blob = base64.b64decode("".join(b64.split()), validate=True)
+        if len(blob) > MAX_IMAGE_BYTES:
+            raise ValueError(f"Image is larger than {MAX_IMAGE_BYTES} bytes.")
+        return blob
     if url.startswith(("http://", "https://")):
         if not ALLOW_IMAGE_URLS:
             raise ValueError(
@@ -152,10 +230,7 @@ def _check_image(blob: bytes) -> int:
         raise ValueError(
             f"Image is {width}x{height} pixels; at most {MAX_IMAGE_PIXELS} are accepted."
         )
-    # Every scan starts with an SOS marker (FF DA); inside entropy-coded
-    # data an FF byte is always stuffed (FF 00) or a restart marker, so a
-    # plain count doesn't overcount (an EXIF thumbnail adds its own few).
-    if blob[:2] == b"\xff\xd8" and blob.count(b"\xff\xda") > MAX_JPEG_SCANS:
+    if blob[:2] == b"\xff\xd8" and _jpeg_scans(blob) > MAX_JPEG_SCANS:
         raise ValueError(f"JPEG has more than {MAX_JPEG_SCANS} scans.")
     return width * height
 

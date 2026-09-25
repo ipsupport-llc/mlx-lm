@@ -254,10 +254,50 @@ class TestImageInputLimits(unittest.TestCase):
             extract_images(_msg(_img_part(base + "/drip")))
         self.assertLess(_t.monotonic() - start, 3)
 
+    def test_url_deadline_holds_against_a_dripped_head_or_chunk_line(self):
+        # Each byte comes inside the socket timeout, and a blocked read
+        # never got back to a deadline check between reads.
+        import time as _t
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+
+        def dripped(prefix, endless):
+            def body(h):
+                try:
+                    h.wfile.write(prefix)
+                    h.wfile.flush()
+                    for _ in range(40):
+                        h.wfile.write(endless)
+                        h.wfile.flush()
+                        _t.sleep(0.2)
+                except OSError:
+                    pass
+            return body
+
+        cases = {
+            "head": dripped(b"HTTP/1.1 200 OK\r\nX-Slow: ", b"a"),
+            "chunk line": dripped(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", b"0"),
+        }
+        for name, body in cases.items():
+            with self.subTest(name):
+                base, _ = self._serve(body)
+                start = _t.monotonic()
+                with self.assertRaisesRegex(ValueError, "longer than"):
+                    extract_images(_msg(_img_part(base + "/slow")))
+                self.assertLess(_t.monotonic() - start, 3)
+
     def test_data_uri_size_and_pixel_caps(self):
         multimodal.MAX_IMAGE_BYTES = 100
         with self.assertRaisesRegex(ValueError, "larger than"):
             extract_images(_msg(_img_part(_data_uri(_png(64, 64, 0)))))
+        # Checked decoded too: the encoded length's allowance let a padded
+        # image a little over the cap through.
+        png = _png(8, 8, 0)
+        multimodal.MAX_IMAGE_BYTES = 1000
+        padded = png + b"\0" * (1001 - len(png))
+        with self.assertRaisesRegex(ValueError, "larger than"):
+            extract_images(_msg(_img_part(_data_uri(padded))))
+        self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(padded[:1000]))))), 1)
         multimodal.MAX_IMAGE_BYTES = 20 * 1024 * 1024
         # A decompression bomb: a small file declaring a huge canvas.
         buf = io.BytesIO()
@@ -319,6 +359,15 @@ class TestImageInputLimits(unittest.TestCase):
         bomb = jpg[:-2] + sos * 200 + b"\xff\xd9"
         with self.assertRaisesRegex(ValueError, "scans"):
             extract_images(_msg(_img_part(_data_uri(bomb))))
+        # FF DA bytes in a comment aren't scans (a byte count took them).
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 32)).save(buf, format="JPEG")
+        comment = b"\xff\xda" * 150
+        com = b"\xff\xfe" + struct.pack(">H", len(comment) + 2) + comment
+        jpg = buf.getvalue()
+        with_comment = jpg[:2] + com + jpg[2:]
+        Image.open(io.BytesIO(with_comment)).load()
+        self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(with_comment))))), 1)
 
     def test_not_an_image(self):
         uri = "data:image/png;base64," + base64.b64encode(b"hello, not an image").decode()
