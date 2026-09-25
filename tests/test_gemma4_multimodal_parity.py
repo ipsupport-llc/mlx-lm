@@ -268,6 +268,49 @@ def test_text_image_parity():
     print(f"text+image max abs diff: {max_abs}")
 
 
+def test_text_image_parity_bidirectional_vision():
+    """(b), `use_bidirectional_attention="vision"` (26B-A4B, 12B): HF's
+    sliding-window layers let one image's soft tokens attend to each other
+    in both directions (driven by `mm_token_type_ids`, which its processor
+    returns by default); full-attention layers stay causal. Two images, so
+    the blocks must stay separate."""
+    saved = TEXT_CONFIG.get("use_bidirectional_attention")
+    TEXT_CONFIG["use_bidirectional_attention"] = "vision"
+    try:
+        hf_model, mlx_model = _build_models(seed=5)
+    finally:
+        TEXT_CONFIG["use_bidirectional_attention"] = saved
+    rng = np.random.default_rng(4)
+    grid = 4
+    n_patches = grid * grid
+    patch_dim = 3 * VISION_CONFIG["patch_size"] ** 2
+    pixel_values_np = rng.uniform(0, 1, size=(2, n_patches, patch_dim)).astype(np.float32)
+    xs, ys = np.meshgrid(np.arange(grid), np.arange(grid), indexing="xy")
+    pos1 = np.stack([xs.reshape(-1), ys.reshape(-1)], axis=-1).astype(np.int64)
+    pos_np = np.stack([pos1, pos1])
+    n_soft = n_patches // (VISION_CONFIG["pooling_kernel_size"] ** 2)
+    image = [BOI_TOKEN_ID] + [IMAGE_TOKEN_ID] * n_soft + [EOI_TOKEN_ID]
+    input_ids_np = np.array([[5, 6] + image + [7] + image + [8, 9, 10]], dtype=np.int64)
+    mm_token_type_ids = (input_ids_np == IMAGE_TOKEN_ID).astype(np.int64)
+
+    max_abs = _compare_logits(
+        hf_model,
+        mlx_model,
+        dict(
+            input_ids=torch.tensor(input_ids_np),
+            pixel_values=torch.tensor(pixel_values_np),
+            image_position_ids=torch.tensor(pos_np),
+            mm_token_type_ids=torch.tensor(mm_token_type_ids),
+        ),
+        dict(
+            inputs=mx.array(input_ids_np),
+            pixel_values=mx.array(pixel_values_np),
+            pixel_position_ids=mx.array(pos_np),
+        ),
+    )
+    print(f"text+2 images, bidirectional vision: max abs diff {max_abs}")
+
+
 def test_text_image_parity_with_padding():
     """(b), padding variant: pads a 4x4 real patch grid up to a 6x6 grid
     with (-1,-1) padding patches, so the pooler's `valid_mask` compaction

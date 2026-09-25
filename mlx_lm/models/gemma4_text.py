@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import BaseModelArgs, create_attention_mask, create_causal_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -46,6 +46,10 @@ class ModelArgs(BaseModelArgs):
     moe_intermediate_size: Optional[int] = None
     layer_types: Optional[List[str]] = None
     tie_word_embeddings: bool = True
+    # "vision" (26B-A4B, 12B): tokens of one image attend to each other in
+    # both directions on sliding-window layers (see Gemma4TextModel.
+    # _vision_overlay); None (E2B/E4B): causal throughout.
+    use_bidirectional_attention: Optional[str] = None
 
     def __post_init__(self):
         if self.rope_parameters is None:
@@ -407,6 +411,10 @@ class Gemma4TextModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.window_size = config.sliding_window
+        # [start, end) absolute positions of each image's soft tokens in the
+        # prompt being prefilled, set around a multimodal prefill (see
+        # gemma4.Model.set_vision_spans); None otherwise.
+        self.vision_spans = None
         self.sliding_window_pattern = config.sliding_window_pattern
         self.num_hidden_layers = config.num_hidden_layers
 
@@ -512,6 +520,38 @@ class Gemma4TextModel(nn.Module):
 
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
+    def _vision_overlay(self, N, cache):
+        """The sliding-window mask with each image's tokens also attending
+        forward within that image, as HF Gemma4Model does when
+        use_bidirectional_attention == "vision": AND(window, OR(causal,
+        same image)); full-attention layers stay causal. None when there's
+        nothing to add (no image in this chunk's queries, or one token)."""
+        spans = self.vision_spans
+        if not spans or N < 2 or self.config.use_bidirectional_attention != "vision":
+            return None
+        offset = cache.offset if cache is not None else 0
+        if not any(s < offset + N and e > offset for s, e in spans):
+            return None
+        # Keys as this pass sees them: a rotating cache hands a multi-token
+        # update its last max_size - 1 keys in temporal order, then the new
+        # ones -- the same coordinates create_causal_mask uses below.
+        max_size = getattr(cache, "max_size", None)
+        key_offset = min(max_size - 1, offset) if max_size else offset
+        q = offset + mx.arange(N)
+        k = (offset - key_offset) + mx.arange(key_offset + N)
+
+        def block(pos):
+            ids = mx.full(pos.shape, -1)
+            for i, (s, e) in enumerate(spans):
+                ids = mx.where((pos >= s) & (pos < e), i, ids)
+            return ids
+
+        qb, kb = block(q)[:, None], block(k)[None]
+        same_image = (qb == kb) & (qb >= 0)
+        in_window = (q[:, None] - k[None]) < self.window_size
+        causal = create_causal_mask(N, key_offset, window_size=self.window_size)
+        return causal | (same_image & in_window)
+
     def _make_masks(self, h, cache):
         mask = {}
         masks = []
@@ -520,8 +560,11 @@ class Gemma4TextModel(nn.Module):
                 if l.layer_type == "full_attention":
                     mask["full_attention"] = create_attention_mask(h, c)
                 elif l.layer_type == "sliding_attention":
-                    mask["sliding_attention"] = create_attention_mask(
-                        h, c, window_size=self.window_size
+                    overlay = self._vision_overlay(h.shape[1], c)
+                    mask["sliding_attention"] = (
+                        overlay
+                        if overlay is not None
+                        else create_attention_mask(h, c, window_size=self.window_size)
                     )
             masks.append(mask[l.layer_type])
         return masks

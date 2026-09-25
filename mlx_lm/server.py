@@ -42,6 +42,7 @@ from .generate import (
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .multimodal import extract_images, load_image_inputs
+from .multimodal import vision_spans as multimodal_vision_spans
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
@@ -1032,50 +1033,60 @@ class ResponseGenerator:
             # Process the prompt and generate tokens
             # Own matcher: the automaton is cached across requests.
             stop_matcher = stop_sequences.matcher()
-            for gen in stream_generate(
-                model=model,
-                stream=stream,
-                tokenizer=tokenizer,
-                prompt=rest,
-                max_tokens=args.max_tokens,
-                sampler=sampler,
-                logits_processors=logits_processors,
-                prompt_cache=cache,
-                draft_model=draft_model if input_embeddings is None else None,
-                num_draft_tokens=args.num_draft_tokens,
-                input_embeddings=input_embeddings,
-                prompt_progress_callback=progress,
-                prefill_step_size=self.cli_args.prefill_step_size,
-                kv_bits=self.cli_args.kv_bits,
-                kv_group_size=self.cli_args.kv_group_size,
-                quantized_kv_start=self.cli_args.quantized_kv_start,
-            ):
-                finish_reason = gen.finish_reason
+            # An image's tokens attend to each other in both directions on
+            # models that want it (Gemma 4 26B/12B): the model is told where
+            # they are for this prefill, and nothing else sees it.
+            set_vision_spans = getattr(model, "set_vision_spans", None)
+            if input_embeddings is not None and set_vision_spans is not None:
+                set_vision_spans(multimodal_vision_spans(cache_prompt))
+            try:
+                for gen in stream_generate(
+                    model=model,
+                    stream=stream,
+                    tokenizer=tokenizer,
+                    prompt=rest,
+                    max_tokens=args.max_tokens,
+                    sampler=sampler,
+                    logits_processors=logits_processors,
+                    prompt_cache=cache,
+                    draft_model=draft_model if input_embeddings is None else None,
+                    num_draft_tokens=args.num_draft_tokens,
+                    input_embeddings=input_embeddings,
+                    prompt_progress_callback=progress,
+                    prefill_step_size=self.cli_args.prefill_step_size,
+                    kv_bits=self.cli_args.kv_bits,
+                    kv_group_size=self.cli_args.kv_group_size,
+                    quantized_kv_start=self.cli_args.quantized_kv_start,
+                ):
+                    finish_reason = gen.finish_reason
 
-                # Token-level stop word detection
-                if stop_matcher.advance(gen.token):
-                    finish_reason = "stop"
+                    # Token-level stop word detection
+                    if stop_matcher.advance(gen.token):
+                        finish_reason = "stop"
 
-                rqueue.put(
-                    Response(
-                        gen.text,
-                        gen.token,
-                        gen.logprobs[gen.token].item(),
-                        finish_reason,
-                        _format_top_logprobs(
-                            gen.logprobs, args.top_logprobs, tokenizer
-                        ),
+                    rqueue.put(
+                        Response(
+                            gen.text,
+                            gen.token,
+                            gen.logprobs[gen.token].item(),
+                            finish_reason,
+                            _format_top_logprobs(
+                                gen.logprobs, args.top_logprobs, tokenizer
+                            ),
+                        )
                     )
-                )
-                cache_key.append(gen.token)
+                    cache_key.append(gen.token)
 
-                if ctx._should_stop:
-                    if self._is_distributed:
-                        raise NotImplementedError()
-                    break
+                    if ctx._should_stop:
+                        if self._is_distributed:
+                            raise NotImplementedError()
+                        break
 
-                if finish_reason is not None:
-                    break
+                    if finish_reason is not None:
+                        break
+            finally:
+                if set_vision_spans is not None:
+                    set_vision_spans(None)
 
             rqueue.put(None)
 
