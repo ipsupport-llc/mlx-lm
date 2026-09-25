@@ -382,7 +382,10 @@ def _adapt_prism_hadamard_repack(config: dict, model_path: Path) -> None:
     if not isinstance(hadamard, dict) or hadamard.get("contract") != "prism.hadamard.v1":
         return
     if config.get("model_type") == "prism_hadamard_qwen35":
-        # Already in prism's own form (a config saved after loading one).
+        # Saved after loading a repack by an mlx-lm that kept this block: the
+        # weights saved with it already hold the norms' 1.
+        config.pop("hadamard")
+        config["zero_centered_norms"] = False
         return
     if config.get("model_type") != "qwen3_5" or not hadamard.get("gdn_v_grouped", True):
         raise ValueError(

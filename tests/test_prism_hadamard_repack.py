@@ -123,9 +123,10 @@ class TestPrismRepackRoundTrip(unittest.TestCase):
         again = json.loads(json.dumps(config))
         TestPrismHadamardRepack.adapt(None, again)
         self.assertEqual(again, config)
-        # prism's own form carrying a hadamard block is left alone too.
-        native = dict(config, hadamard=repack_config()["hadamard"])
-        self.assertEqual(TestPrismHadamardRepack.adapt(None, dict(native)), native)
+        # Saved by an mlx-lm that kept the block: its norms already hold the 1.
+        old_save = dict(config, hadamard=repack_config()["hadamard"], zero_centered_norms=True)
+        TestPrismHadamardRepack.adapt(None, old_save)
+        self.assertEqual(old_save, dict(config, zero_centered_norms=False))
 
     def test_hf_layout_conv1d_norms_shifted_once(self):
         from mlx_lm.models import qwen3_5
