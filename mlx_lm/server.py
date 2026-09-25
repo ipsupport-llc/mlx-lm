@@ -1917,6 +1917,13 @@ def main():
         help="Enable trusting remote code for tokenizer",
     )
     parser.add_argument(
+        "--allow-image-urls",
+        action="store_true",
+        help="Fetch http(s) image_url parts (off by default: the server would "
+        "request any URL a client names, loopback and LAN included). "
+        "data: URIs always work.",
+    )
+    parser.add_argument(
         "--model-alias",
         action="append",
         default=None,
@@ -2034,6 +2041,9 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+    from . import multimodal
+
+    multimodal.ALLOW_IMAGE_URLS = args.allow_image_urls
     _ = maybe_set_recommended_wired_limit()
 
     logging.basicConfig(

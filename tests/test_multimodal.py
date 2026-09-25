@@ -23,6 +23,7 @@ import numpy as np
 try:
     from PIL import Image
 
+    from mlx_lm import multimodal
     from mlx_lm.multimodal import _IMAGE_KEY_BASE, ImageInputs, extract_images
     from mlx_lm.server import process_message_content
 
@@ -162,3 +163,195 @@ class TestMultimodal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _msg(*parts):
+    return [{"role": "user", "content": list(parts)}]
+
+
+def _img_part(url):
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+@unittest.skipUnless(HAVE_DEPS, "needs pillow + transformers")
+class TestImageInputLimits(unittest.TestCase):
+    """Requests are untrusted: what extract_images refuses (-> HTTP 400)."""
+
+    def setUp(self):
+        self.saved = {k: getattr(multimodal, k) for k in
+                      ("ALLOW_IMAGE_URLS", "MAX_IMAGES", "MAX_IMAGE_BYTES", "MAX_IMAGE_PIXELS",
+                       "MAX_REQUEST_PIXELS", "URL_FETCH_SECONDS")}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(multimodal, k, v)
+
+    def _serve(self, handler_body):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            hits = []
+
+            def do_GET(self):
+                Handler.hits.append(self.path)
+                handler_body(self)
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}", Handler.hits
+
+    def test_urls_not_fetched_unless_allowed(self):
+        png = _png(8, 8, 0)
+
+        def body(h):
+            h.send_response(200)
+            h.end_headers()
+            h.wfile.write(png)
+
+        base, hits = self._serve(body)
+        with self.assertRaisesRegex(ValueError, "allow-image-urls"):
+            extract_images(_msg(_img_part(base + "/x")))
+        self.assertEqual(hits, [], "the server must not even request it")
+        multimodal.ALLOW_IMAGE_URLS = True
+        self.assertEqual(extract_images(_msg(_img_part(base + "/x"))), [png])
+
+    def test_url_size_and_time_bounded(self):
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.MAX_IMAGE_BYTES = 1000
+
+        def big(h):
+            h.send_response(200)
+            h.end_headers()   # no Content-Length: only the read cap stops it
+            h.wfile.write(b"x" * 5000)
+
+        base, _ = self._serve(big)
+        with self.assertRaisesRegex(ValueError, "larger than"):
+            extract_images(_msg(_img_part(base + "/big")))
+
+        import time as _t
+        multimodal.MAX_IMAGE_BYTES = 10**6
+        multimodal.URL_FETCH_SECONDS = 1
+
+        def drip(h):
+            h.send_response(200)
+            h.end_headers()
+            try:
+                for _ in range(20):
+                    h.wfile.write(b"x")
+                    h.wfile.flush()
+                    _t.sleep(0.3)
+            except OSError:
+                pass
+
+        base, _ = self._serve(drip)
+        start = _t.monotonic()
+        with self.assertRaisesRegex(ValueError, "longer than"):
+            extract_images(_msg(_img_part(base + "/drip")))
+        self.assertLess(_t.monotonic() - start, 3)
+
+    def test_data_uri_size_and_pixel_caps(self):
+        multimodal.MAX_IMAGE_BYTES = 100
+        with self.assertRaisesRegex(ValueError, "larger than"):
+            extract_images(_msg(_img_part(_data_uri(_png(64, 64, 0)))))
+        multimodal.MAX_IMAGE_BYTES = 20 * 1024 * 1024
+        # A decompression bomb: a small file declaring a huge canvas.
+        buf = io.BytesIO()
+        Image.new("1", (13000, 13000)).save(buf, format="PNG")
+        self.assertLess(len(buf.getvalue()), 100_000)
+        with self.assertRaisesRegex(ValueError, "pixels"):
+            extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))
+
+    def test_formats_whose_open_decodes_are_refused(self):
+        # ICO decodes its embedded PNG inside Image.open: refused by format,
+        # before any of that.
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64)).save(buf, format="ICO")
+        with self.assertRaisesRegex(ValueError, "accepted: BMP, GIF, JPEG, PNG, WEBP"):
+            extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64)).save(buf, format="TIFF")
+        with self.assertRaises(ValueError):
+            extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))
+        for fmt in ("PNG", "JPEG", "WEBP", "GIF", "BMP"):
+            buf = io.BytesIO()
+            Image.new("RGB", (16, 16)).save(buf, format=fmt)
+            self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))), 1, fmt)
+
+    def test_request_pixel_budget(self):
+        multimodal.MAX_REQUEST_PIXELS = 3000
+        uri = _data_uri(_png(40, 40, 0))   # 1600 px each
+        with self.assertRaisesRegex(ValueError, "add up"):
+            extract_images(_msg(_img_part(uri), _img_part(uri)))
+
+    def test_unhashable_part_type(self):
+        with self.assertRaises(ValueError):
+            extract_images(_msg({"type": ["text"], "text": "x"}))
+
+    def test_redirect_to_other_scheme_refused(self):
+        multimodal.ALLOW_IMAGE_URLS = True
+
+        def body(h):
+            h.send_response(302)
+            h.send_header("Location", "ftp://127.0.0.1/x")
+            h.end_headers()
+
+        base, _ = self._serve(body)
+        with self.assertRaisesRegex(ValueError, "scheme"):
+            extract_images(_msg(_img_part(base + "/r")))
+
+    def test_jpeg_scan_count_capped(self):
+        import struct
+
+        # A valid progressive-style JPEG with extra (empty) scans spliced in
+        # before EOI: decoding time grows with the scan count.
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 32)).save(buf, format="JPEG", progressive=True)
+        jpg = buf.getvalue()
+        normal_scans = jpg.count(b"\xff\xda")
+        self.assertLess(normal_scans, 20)
+        self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(jpg))))), 1)
+        sos = b"\xff\xda" + struct.pack(">H", 8) + b"\x01\x01\x00\x00\x3f\x00"
+        bomb = jpg[:-2] + sos * 200 + b"\xff\xd9"
+        with self.assertRaisesRegex(ValueError, "scans"):
+            extract_images(_msg(_img_part(_data_uri(bomb))))
+
+    def test_not_an_image(self):
+        uri = "data:image/png;base64," + base64.b64encode(b"hello, not an image").decode()
+        with self.assertRaisesRegex(ValueError, "image data"):
+            extract_images(_msg(_img_part(uri)))
+
+    def test_image_count_cap(self):
+        multimodal.MAX_IMAGES = 2
+        uri = _data_uri(_png(8, 8, 0))
+        with self.assertRaisesRegex(ValueError, "At most 2"):
+            extract_images(_msg(_img_part(uri), _img_part(uri), _img_part(uri)))
+
+    def test_malformed_structure(self):
+        uri = _data_uri(_png(8, 8, 0))
+        for messages in (
+            _msg("hi", _img_part(uri)),                       # a bare string part
+            ["hello"],                                        # a bare string message
+            _msg({"type": "image"}),                          # a placeholder without an image
+            _msg(_img_part(uri), {"type": "input_audio", "input_audio": {}}),
+            _msg(_img_part(uri), {"type": "video"}),
+            "not a list",
+        ):
+            with self.assertRaises(ValueError, msg=repr(messages)[:80]):
+                extract_images(messages)
+        # Text next to images is fine.
+        self.assertEqual(len(extract_images(_msg({"type": "text", "text": "a"}, _img_part(uri)))), 1)
+
+    def test_exif_orientation_applied(self):
+        # Stored 40 wide x 20 high, EXIF says "rotate 90" (Orientation=6):
+        # upright it's 20 x 40.
+        im = Image.new("RGB", (40, 20))
+        exif = im.getexif()
+        exif[0x0112] = 6
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", exif=exif.tobytes())
+        self.assertEqual(multimodal._decode(buf.getvalue()).size, (20, 40))

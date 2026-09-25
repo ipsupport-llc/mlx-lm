@@ -29,12 +29,20 @@ the cache, a different image only matches the text before it.
 
 Only Gemma 4 is wired up so far (its image preprocessing is HF's
 `Gemma4ImageProcessorPil`, which needs Pillow but not torch).
+
+Limits (requests are untrusted input): images come as `data:` URIs; http(s)
+URLs are fetched only when the server runs with `--allow-image-urls` (else a
+client could make the server request any address it can reach, loopback and
+LAN included), then with a size cap and an overall deadline. Every image is
+checked from its header -- format, pixel count -- in the HTTP thread, before
+anything is decoded, and a request carries at most MAX_IMAGES images.
 """
 
 import base64
 import hashlib
 import io
 import json
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -45,6 +53,58 @@ import mlx.core as mx
 # any real vocabulary so they can never collide with a real token.
 _IMAGE_KEY_BASE = 1 << 40
 
+# Set by the server from --allow-image-urls.
+ALLOW_IMAGE_URLS = False
+MAX_IMAGES = 8
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+# 4000 x 4000 per image, 48 MP per request. Checked from the header: a tiny
+# PNG can declare a huge canvas (a 20 KB file decoding to gigabytes). The
+# processor resizes to at most max_soft_tokens patches anyway, so nothing
+# larger is ever needed; decoded, 48 MP is about 1 GB at the peak.
+MAX_IMAGE_PIXELS = 16_000_000
+MAX_REQUEST_PIXELS = 48_000_000
+URL_FETCH_SECONDS = 30
+# Formats whose Image.open reads only the header (ICO, for one, decodes its
+# embedded PNG right there -- the size check would come after the cost).
+IMAGE_FORMATS = {"PNG", "JPEG", "WEBP", "GIF", "BMP"}
+# Progressive JPEG decode time grows with its number of scans, not its size
+# or pixels: 50 000 tiny scans in 1.6 MB took 30 s of the generation thread.
+# Real encoders write about 10.
+MAX_JPEG_SCANS = 100
+
+
+class _HTTPOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.startswith(("http://", "https://")):
+            raise ValueError(f"Image URL redirected to an unsupported scheme: {newurl[:32]}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch(url: str) -> bytes:
+    """An http(s) image, at most MAX_IMAGE_BYTES, within URL_FETCH_SECONDS
+    overall (the socket timeout alone lets a slow drip go on forever)."""
+    deadline = time.monotonic() + URL_FETCH_SECONDS
+    request = urllib.request.Request(url, headers={"User-Agent": "mlx-lm-server"})
+    opener = urllib.request.build_opener(_HTTPOnlyRedirects)
+    with opener.open(request, timeout=10) as resp:
+        length = resp.headers.get("Content-Length")
+        if length is not None and length.isdigit() and int(length) > MAX_IMAGE_BYTES:
+            raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
+        chunks, total = [], 0
+        while True:
+            if time.monotonic() > deadline:
+                raise ValueError(f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s.")
+            # read1: what has arrived (read(n) would wait for all n bytes,
+            # so a slow drip never reached the deadline check).
+            chunk = resp.read1(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_IMAGE_BYTES:
+                raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
 
 def _image_bytes_from_url(url: str) -> bytes:
     if url.startswith("data:"):
@@ -52,39 +112,108 @@ def _image_bytes_from_url(url: str) -> bytes:
             _, b64 = url.split(",", 1)
         except ValueError:
             raise ValueError("Malformed image data URI.")
+        if len(b64) > MAX_IMAGE_BYTES * 4 // 3 + 4096:
+            raise ValueError(f"Image is larger than {MAX_IMAGE_BYTES} bytes.")
         # validate=True: the default silently drops non-alphabet characters,
         # turning garbage into b"" that only fails later, deep in the
         # generation thread.
         return base64.b64decode("".join(b64.split()), validate=True)
     if url.startswith(("http://", "https://")):
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return resp.read()
+        if not ALLOW_IMAGE_URLS:
+            raise ValueError(
+                "Image URLs aren't fetched by this server: send the image as a "
+                "data: URI (base64), or start the server with --allow-image-urls."
+            )
+        return _fetch(url)
     raise ValueError(f"Unsupported image URL scheme: {url[:32]}...")
+
+
+def _check_image(blob: bytes) -> int:
+    """Refuses what isn't an image in IMAGE_FORMATS, or declares more than
+    MAX_IMAGE_PIXELS -- from the header only, nothing decoded. Returns its
+    pixel count."""
+    from PIL import Image
+
+    import warnings
+
+    try:
+        # Pillow warns above its own limit; ours is lower and checked below.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(blob), formats=sorted(IMAGE_FORMATS)) as im:
+                width, height = im.size
+    except Image.DecompressionBombError:
+        raise ValueError(f"Image is larger than {MAX_IMAGE_PIXELS} pixels.")
+    except Exception:
+        raise ValueError(
+            f"Unsupported or corrupt image data (accepted: {', '.join(sorted(IMAGE_FORMATS))})."
+        )
+    if width * height > MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"Image is {width}x{height} pixels; at most {MAX_IMAGE_PIXELS} are accepted."
+        )
+    # Every scan starts with an SOS marker (FF DA); inside entropy-coded
+    # data an FF byte is always stuffed (FF 00) or a restart marker, so a
+    # plain count doesn't overcount (an EXIF thumbnail adds its own few).
+    if blob[:2] == b"\xff\xd8" and blob.count(b"\xff\xda") > MAX_JPEG_SCANS:
+        raise ValueError(f"JPEG has more than {MAX_JPEG_SCANS} scans.")
+    return width * height
 
 
 def extract_images(messages: List[Any]) -> List[bytes]:
     """Collect image bytes from OpenAI-style `image_url` content parts (in
-    order) and rewrite those parts in place to `{"type": "image"}`."""
+    order) and rewrite those parts in place to `{"type": "image"}`. Raises
+    ValueError (the server answers 400) for anything malformed."""
+    if not isinstance(messages, list):
+        raise ValueError("messages must be a list.")
     images = []
+    pixels = 0
     for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("Each message must be an object.")
         content = message.get("content")
         if not isinstance(content, list):
             continue
+        if not all(isinstance(part, dict) and isinstance(part.get("type"), str) for part in content):
+            raise ValueError("Each content part must be an object with a string type.")
+        types = {part.get("type") for part in content}
+        if "image" in types:
+            # Only this function makes those: a client's would render an
+            # image placeholder with no image behind it.
+            raise ValueError("Send images as image_url parts.")
+        if "image_url" in types and not types <= {"text", "image_url"}:
+            # They'd reach the chat template as raw special tokens.
+            raise ValueError("Only text and image_url parts are supported together with images.")
         for i, part in enumerate(content):
             if part.get("type") != "image_url":
                 continue
+            if len(images) >= MAX_IMAGES:
+                raise ValueError(f"At most {MAX_IMAGES} images per request.")
             ref = part.get("image_url")
             url = ref.get("url") if isinstance(ref, dict) else ref
             if not isinstance(url, str):
                 raise ValueError("image_url part is missing its url.")
             try:
-                images.append(_image_bytes_from_url(url))
+                blob = _image_bytes_from_url(url)
             except ValueError:
                 raise
             except Exception as e:  # network errors, bad base64, ...
                 raise ValueError(f"Could not load image_url: {e}") from e
+            pixels += _check_image(blob)
+            if pixels > MAX_REQUEST_PIXELS:
+                raise ValueError(f"The images add up to more than {MAX_REQUEST_PIXELS} pixels.")
+            images.append(blob)
             content[i] = {"type": "image"}
     return images
+
+
+def _decode(blob: bytes):
+    """The RGB image, upright -- a phone photo's EXIF orientation applied, as
+    HF's load_image does (its size was checked by extract_images)."""
+    from PIL import Image, ImageOps
+
+    image = Image.open(io.BytesIO(blob), formats=sorted(IMAGE_FORMATS))
+    return ImageOps.exif_transpose(image).convert("RGB")
 
 
 class ImageInputs:
@@ -112,8 +241,6 @@ class ImageInputs:
         self, prompt: List[int], images: List[bytes]
     ) -> Tuple[List[int], mx.array, List[int]]:
         """Returns (expanded token ids, input embeddings [L, H], cache key)."""
-        from PIL import Image
-
         n_placeholders = sum(1 for t in prompt if t == self.image_token_id)
         if n_placeholders != len(images):
             raise ValueError(
@@ -121,7 +248,7 @@ class ImageInputs:
                 f"for {len(images)} image(s)."
             )
 
-        pil_images = [Image.open(io.BytesIO(b)).convert("RGB") for b in images]
+        pil_images = [_decode(b) for b in images]
         feats = self.processor(images=pil_images, return_tensors="np")
         n_soft = [int(n) for n in feats["num_soft_tokens_per_image"]]
         keys = [
