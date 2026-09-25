@@ -9,6 +9,7 @@ modality; see the fork review."""
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import mlx.core as mx
@@ -71,6 +72,20 @@ class TestGemma4CheckpointLayouts(unittest.TestCase):
         self.assertIsNone(target.audio_tower)
         self.assertIsNotNone(target.vision_tower)
 
+    def test_weights_without_a_config_warn(self):
+        weights = _checkpoint(_model(), False)
+        no_vision = dict(CONFIG)
+        no_vision.pop("vision_config")
+        target = gemma4.Model(gemma4.ModelArgs.from_dict(no_vision))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            target.sanitize(weights)
+        self.assertEqual([str(w.message).split(":")[0] for w in caught],
+                         ["The checkpoint has vision weights but its config has no vision_config"])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _model().sanitize(weights)
+
     def test_save_config_keeps_gemma4_vision_config(self):
         with tempfile.TemporaryDirectory() as d:
             import json
@@ -80,16 +95,18 @@ class TestGemma4CheckpointLayouts(unittest.TestCase):
             self.assertNotIn("vision_config", json.loads((Path(d) / "c2.json").read_text()))
 
     def test_quantized_patch_projection_keeps_the_image(self):
-        model = _model()
-        pe = model.vision_tower.patch_embedder
-        nn.quantize(pe, group_size=64, bits=8, class_predicate=lambda p, m: isinstance(m, nn.Linear))
-        self.assertEqual(pe.input_proj.weight.dtype, mx.uint32)
         dim = CONFIG["vision_config"]["patch_size"] ** 2 * 3
         pos = mx.array([[[0, 0], [0, 1], [1, 0], [1, 1]]])
         pad = mx.zeros((1, 4), dtype=mx.bool_)
-        a = pe(mx.random.uniform(0, 1, (1, 4, dim)), pos, pad)   # pixels in [0, 1]
-        b = pe(mx.random.uniform(0, 1, (1, 4, dim)), pos, pad)
-        self.assertGreater(mx.abs(a - b).max().item(), 0.1, "different images, different embeddings")
+        for mode, group_size, bits in [("affine", 64, 8), ("affine", 64, 4), ("mxfp4", 32, 4), ("nvfp4", 16, 4), ("mxfp8", 32, 8)]:
+            with self.subTest(mode=mode, bits=bits):
+                pe = _model().vision_tower.patch_embedder
+                nn.quantize(pe, group_size=group_size, bits=bits, mode=mode,
+                            class_predicate=lambda p, m: isinstance(m, nn.Linear))
+                self.assertEqual(pe.input_proj.weight.dtype, mx.uint32)
+                a = pe(mx.random.uniform(0, 1, (1, 4, dim)), pos, pad)   # pixels in [0, 1]
+                b = pe(mx.random.uniform(0, 1, (1, 4, dim)), pos, pad)
+                self.assertGreater(mx.abs(a - b).max().item(), 0.1, "different images, different embeddings")
 
 
 if __name__ == "__main__":

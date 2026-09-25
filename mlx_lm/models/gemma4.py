@@ -90,6 +90,7 @@ the vision tower via a near-identical code path in HF that would be
 straightforward to add later following the same pattern as images.
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -417,6 +418,15 @@ class Model(nn.Module):
             self.vision_tower = self.embed_vision = None
         if self.audio_tower is not None and not audio_weights:
             self.audio_tower = self.embed_audio = None
+        # The other way round -- weights for a tower the config doesn't
+        # describe -- is what a conversion by an older mlx-lm left (it dropped
+        # vision_config on save): they can only be ignored, so say so.
+        for name, tower, found in (("vision", self.vision_tower, vision_weights), ("audio", self.audio_tower, audio_weights)):
+            if tower is None and found:
+                warnings.warn(
+                    f"The checkpoint has {name} weights but its config has no {name}_config: "
+                    f"loading without {name}. Re-convert it, or restore {name}_config."
+                )
 
         if self.vision_tower is not None:
             for k, v in self.vision_tower.sanitize(vision_weights).items():
