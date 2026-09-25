@@ -381,6 +381,12 @@ def _adapt_prism_hadamard_repack(config: dict, model_path: Path) -> None:
     hadamard = config.get("hadamard")
     if not isinstance(hadamard, dict) or hadamard.get("contract") != "prism.hadamard.v1":
         return
+    if config.get("model_type") == "prism_hadamard_qwen35":
+        # Saved after loading a repack by an mlx-lm that kept this block: the
+        # weights saved with it already hold the norms' 1.
+        config.pop("hadamard")
+        config["zero_centered_norms"] = False
+        return
     if config.get("model_type") != "qwen3_5" or not hadamard.get("gdn_v_grouped", True):
         raise ValueError(
             "Unsupported prism.hadamard.v1 checkpoint: only qwen3_5 with the grouped "
@@ -392,6 +398,9 @@ def _adapt_prism_hadamard_repack(config: dict, model_path: Path) -> None:
         return name.removeprefix("language_model.")
 
     config["model_type"] = "prism_hadamard_qwen35"
+    # Translated into `modules` below: a saved config then loads as prism's
+    # own format (with it kept, loading a fused / converted repack failed).
+    config.pop("hadamard")
     config["modules"] = [
         {"path": path(n), "block": block, "embedding": False} for n in hadamard.get("forward_modules", [])
     ] + [
@@ -492,6 +501,11 @@ def load_model(
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
+    # Zero-centered norms got their 1 added by sanitize: the weights a caller
+    # saves from this model hold it, so the config saved with them must not
+    # say zero-centered (a reload added 1 again).
+    if config.get("zero_centered_norms"):
+        config["zero_centered_norms"] = False
 
     def _quantize(quantization):
         def class_predicate(p, m):

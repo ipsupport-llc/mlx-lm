@@ -170,6 +170,10 @@ class Model(nn.Module):
         return self.language_model.model
 
     def sanitize(self, weights):
+        # qwen3_5's own sanitize adds the 1 to an HF-layout checkpoint's norms
+        # (conv1d not yet in mlx layout): only one of the two may.
+        hf_layout = any("conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items())
+        shift = self.args.zero_centered_norms and not hf_layout
         sanitized = {}
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):
@@ -180,7 +184,7 @@ class Model(nn.Module):
                 pass
             else:
                 key = "language_model." + key
-            if self.args.zero_centered_norms and key.endswith(_SHIFTED_NORMS):
+            if shift and key.endswith(_SHIFTED_NORMS):
                 value = value + 1.0
             sanitized[key] = value
         return self.language_model.sanitize(sanitized)
