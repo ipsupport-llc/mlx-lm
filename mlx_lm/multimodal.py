@@ -92,11 +92,20 @@ def _fetch(url: str) -> bytes:
 
     def tracked(base):
         class Connection(base):
-            def connect(self):
-                super().connect()
-                sockets.append(self.sock)
-                if expired.is_set():
-                    self.sock.shutdown(socket.SHUT_RDWR)
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                create = self._create_connection
+
+                # Registered as soon as it exists: a proxy's CONNECT
+                # response is read inside connect(), before TLS.
+                def create_connection(*a, **kw):
+                    sock = create(*a, **kw)
+                    sockets.append(sock)
+                    if expired.is_set():
+                        sock.shutdown(socket.SHUT_RDWR)
+                    return sock
+
+                self._create_connection = create_connection
 
         return Connection
 
@@ -149,11 +158,13 @@ def _fetch(url: str) -> bytes:
 
 def _jpeg_scans(blob: bytes) -> int:
     """SOS markers of a JPEG, found by walking its segments (a byte count
-    also counted FF DA inside comments and other metadata)."""
+    also counted FF DA inside comments and other metadata). Where the
+    structure breaks, the decoder resyncs past junk: the plain byte count
+    then, which can only count more."""
     scans, i, n = 0, 2, len(blob)
     while i + 4 <= n:
         if blob[i] != 0xFF:
-            return scans  # not at a marker: corrupt, the decoder will say so
+            return max(scans, blob.count(b"\xff\xda"))
         marker = blob[i + 1]
         if marker == 0xFF:  # fill byte
             i += 1

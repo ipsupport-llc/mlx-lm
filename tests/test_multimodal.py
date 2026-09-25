@@ -286,6 +286,48 @@ class TestImageInputLimits(unittest.TestCase):
                     extract_images(_msg(_img_part(base + "/slow")))
                 self.assertLess(_t.monotonic() - start, 3)
 
+    def test_url_deadline_holds_through_a_proxy_connect(self):
+        # An HTTPS fetch through a proxy that drips its CONNECT response:
+        # read inside connect(), before the socket used to be registered.
+        import os
+        import socket
+        import threading
+        import time as _t
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        self.addCleanup(listener.close)
+
+        def proxy():
+            conn, _ = listener.accept()
+            with conn:
+                conn.recv(4096)
+                try:
+                    for byte in b"HTTP/1.1 200 Connection established" * 10:
+                        conn.sendall(bytes([byte]))
+                        _t.sleep(0.2)
+                except OSError:
+                    pass
+
+        threading.Thread(target=proxy, daemon=True).start()
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+        env = {"https_proxy": f"http://127.0.0.1:{listener.getsockname()[1]}", "no_proxy": ""}
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            start = _t.monotonic()
+            with self.assertRaisesRegex(ValueError, "longer than"):
+                extract_images(_msg(_img_part("https://example.invalid/x.png")))
+            self.assertLess(_t.monotonic() - start, 3)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
     def test_data_uri_size_and_pixel_caps(self):
         multimodal.MAX_IMAGE_BYTES = 100
         with self.assertRaisesRegex(ValueError, "larger than"):
@@ -368,6 +410,12 @@ class TestImageInputLimits(unittest.TestCase):
         with_comment = jpg[:2] + com + jpg[2:]
         Image.open(io.BytesIO(with_comment)).load()
         self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(with_comment))))), 1)
+        # A junk byte between segments: the decoder skips it, so the scans
+        # after it still count.
+        app0_end = 4 + int.from_bytes(bomb[4:6], "big")
+        junk = bomb[:app0_end] + b"x" + bomb[app0_end:]
+        with self.assertRaisesRegex(ValueError, "scans"):
+            extract_images(_msg(_img_part(_data_uri(junk))))
 
     def test_not_an_image(self):
         uri = "data:image/png;base64," + base64.b64encode(b"hello, not an image").decode()
