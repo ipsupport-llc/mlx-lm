@@ -264,6 +264,59 @@ class TestNemotronHMTPGenerate(unittest.TestCase):
                     "a draft accept must be followed by a bonus (non-draft) token",
                 )
 
+    def test_logprobs_are_the_backbones_also_for_accepted_drafts(self):
+        """An accepted draft's logprobs are the backbone's at that position
+        (what plain decoding reports), not the MTP head's guess. The head is
+        replaced by an oracle that drafts the backbone's own next token (so
+        drafts get accepted) with deliberately different logits."""
+        mx.random.seed(3)
+        model = Model(tiny_args())
+        prompt = mx.random.randint(0, 64, (6,))
+        n_tokens = 16
+
+        # Plain greedy decoding: tokens and their logprobs.
+        cache = model.make_cache()
+        logits = model.lm_head(model.backbone(prompt[None], cache=cache)[:, -1, :])
+        plain = []
+        for _ in range(n_tokens):
+            lp = (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).squeeze(0)
+            tok = mx.argmax(lp).item()
+            plain.append((tok, lp))
+            logits = model.lm_head(model.backbone(mx.array([[tok]]), cache=cache)[:, -1, :])
+
+        emitted = []
+
+        def oracle(hidden_last, tok, mtp_cache):
+            # `tok` is the last emitted token (already in `emitted`).
+            seq = mx.concatenate([prompt, mx.array(emitted)])
+            nxt = mx.argmax(model.lm_head(model.backbone(seq[None], cache=model.make_cache())[:, -1, :]), axis=-1)
+            fake = mx.full((1, 1, 64), -5.0)
+            fake[..., nxt.item()] = 5.0
+            return fake, None
+
+        model.mtp_step = oracle
+        accepted = 0
+        for i, (tok, lp, from_draft) in enumerate(
+            nemotron_h_mtp_generate_step(prompt, model, max_tokens=n_tokens)
+        ):
+            emitted.append(tok)
+            accepted += from_draft
+            self.assertEqual(tok, plain[i][0])
+            # A 2-token verify pass vs 1-token steps: ~3e-3 of float noise.
+            self.assertTrue(mx.allclose(lp, plain[i][1], atol=1e-2).item(), f"token {i} (from_draft={from_draft})")
+            # Not the head's: its fake logits put ~0 on the drafted token.
+            self.assertLess(lp[tok].item(), -0.5)
+        self.assertGreater(accepted, 3, "the oracle should get drafts accepted")
+
+    def test_negative_max_tokens_means_no_limit(self):
+        mx.random.seed(4)
+        model = Model(tiny_args())
+        prompt = mx.random.randint(0, 64, (5,))
+        gen = nemotron_h_mtp_generate_step(prompt, model, max_tokens=-1)
+        tokens = [next(gen)[0] for _ in range(30)]
+        gen.close()
+        self.assertEqual(len(tokens), 30)
+
 
 if __name__ == "__main__":
     unittest.main()

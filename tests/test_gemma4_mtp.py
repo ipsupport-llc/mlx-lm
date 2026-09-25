@@ -154,6 +154,15 @@ class TestGemma4MTP(unittest.TestCase):
                 self.assertGreater(n_draft, 0)
                 self.assertLess(n_draft, len(out))
 
+    def test_negative_max_tokens_means_no_limit(self):
+        oracle = OracleDrafter(self.ref, len(self.prompt), 3)
+        gen = gemma4_mtp_generate_step(
+            self.prompt, self.model, oracle, num_draft_tokens=3, max_tokens=-1
+        )
+        tokens = [next(gen)[0] for _ in range(40)]
+        gen.close()
+        self.assertEqual(tokens, self.ref[:40])
+
     def test_prompt_cache_already_holding_a_prefix(self):
         # The server passes only the uncached tail of the prompt together
         # with a cache that already holds the prefix. The drafter's query
