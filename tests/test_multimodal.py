@@ -315,6 +315,38 @@ class TestImageInputLimits(unittest.TestCase):
             extract_images(_msg(_img_part(f"https://127.0.0.1:{listener.getsockname()[1]}/x.png")))
         self.assertLess(_t.monotonic() - start, 3)
 
+    def test_url_deadline_holds_across_addresses_that_time_out(self):
+        # Each address could take the whole socket timeout to fail.
+        import socket
+        import time as _t
+        from unittest import mock
+
+        class Blackhole:
+            def __init__(self, *a):
+                self.timeout = None
+
+            def settimeout(self, t):
+                self.timeout = t
+
+            def connect(self, addr):
+                _t.sleep(self.timeout)
+                raise TimeoutError("timed out")
+
+            def shutdown(self, how):
+                pass
+
+            def close(self):
+                pass
+
+        addrs = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"10.0.0.{i}", 80)) for i in range(4)]
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+        with mock.patch("socket.getaddrinfo", return_value=addrs), mock.patch("socket.socket", Blackhole):
+            start = _t.monotonic()
+            with self.assertRaisesRegex(ValueError, "longer than|Could not load"):
+                extract_images(_msg(_img_part("http://many.invalid/x.png")))
+            self.assertLess(_t.monotonic() - start, 2)
+
     def test_url_deadline_holds_through_a_proxy_connect(self):
         # An HTTPS fetch through a proxy that drips its CONNECT response:
         # read inside connect(), before the socket used to be registered.

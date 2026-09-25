@@ -45,6 +45,7 @@ import io
 import json
 import socket
 import threading
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -107,25 +108,48 @@ def _fetch(url: str) -> bytes:
     one inside the socket timeout): at the deadline the connections'
     sockets are shut down, which wakes it."""
     sockets, expired = [], threading.Event()
+    deadline = time.monotonic() + URL_FETCH_SECONDS
+
+    def shut(sock):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def register(sock):
         sockets.append(sock)
         if expired.is_set():
-            sock.shutdown(socket.SHUT_RDWR)
+            shut(sock)
         return sock
+
+    def connect(address, timeout=None, source_address=None, **_):
+        """socket.create_connection, each attempt within what's left of
+        the deadline (each address could take the whole socket timeout),
+        registered as soon as it exists: a proxy's CONNECT response is
+        read inside connect(), before TLS."""
+        error = None
+        for family, kind, proto, _, addr in socket.getaddrinfo(*address, 0, socket.SOCK_STREAM):
+            left = deadline - time.monotonic()
+            if left <= 0 or expired.is_set():
+                break
+            sock = register(socket.socket(family, kind, proto))
+            try:
+                sock.settimeout(min(timeout, left) if isinstance(timeout, (int, float)) else left)
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(addr)
+                sock.settimeout(timeout if isinstance(timeout, (int, float)) else None)
+                return sock
+            except OSError as e:
+                error = e
+                sock.close()
+        raise error or TimeoutError(f"Connecting to {address[0]} took too long.")
 
     def tracked(base):
         class Connection(base):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                create = self._create_connection
-
-                # Registered as soon as it exists: a proxy's CONNECT
-                # response is read inside connect(), before TLS.
-                def create_connection(*a, **kw):
-                    return register(create(*a, **kw))
-
-                self._create_connection = create_connection
+                self._create_connection = connect
                 if getattr(self, "_context", None) is not None:
                     self._context = _RegisteringContext(self._context, register)
 
@@ -142,10 +166,7 @@ def _fetch(url: str) -> bytes:
     def expire():
         expired.set()
         for sock in list(sockets):
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+            shut(sock)
 
     timer = threading.Timer(URL_FETCH_SECONDS, expire)
     timer.daemon = True
