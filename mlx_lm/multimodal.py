@@ -82,6 +82,24 @@ class _HTTPOnlyRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+class _RegisteringContext:
+    """An SSL context whose sockets are registered before their handshake:
+    wrapping moves the connection's descriptor into a new SSLSocket (the
+    raw socket's shutdown then fails), and the handshake itself reads."""
+
+    def __init__(self, context, register):
+        self._context, self._register = context, register
+
+    def wrap_socket(self, sock, **kwargs):
+        wrapped = self._context.wrap_socket(sock, do_handshake_on_connect=False, **kwargs)
+        self._register(wrapped)
+        wrapped.do_handshake()
+        return wrapped
+
+    def __getattr__(self, name):
+        return getattr(self._context, name)
+
+
 def _fetch(url: str) -> bytes:
     """An http(s) image, at most MAX_IMAGE_BYTES, within URL_FETCH_SECONDS
     overall. A deadline checked between reads can't stop a read already
@@ -89,6 +107,12 @@ def _fetch(url: str) -> bytes:
     one inside the socket timeout): at the deadline the connections'
     sockets are shut down, which wakes it."""
     sockets, expired = [], threading.Event()
+
+    def register(sock):
+        sockets.append(sock)
+        if expired.is_set():
+            sock.shutdown(socket.SHUT_RDWR)
+        return sock
 
     def tracked(base):
         class Connection(base):
@@ -99,13 +123,11 @@ def _fetch(url: str) -> bytes:
                 # Registered as soon as it exists: a proxy's CONNECT
                 # response is read inside connect(), before TLS.
                 def create_connection(*a, **kw):
-                    sock = create(*a, **kw)
-                    sockets.append(sock)
-                    if expired.is_set():
-                        sock.shutdown(socket.SHUT_RDWR)
-                    return sock
+                    return register(create(*a, **kw))
 
                 self._create_connection = create_connection
+                if getattr(self, "_context", None) is not None:
+                    self._context = _RegisteringContext(self._context, register)
 
         return Connection
 
@@ -157,39 +179,19 @@ def _fetch(url: str) -> bytes:
 
 
 def _jpeg_scans(blob: bytes) -> int:
-    """SOS markers of a JPEG, found by walking its segments (a byte count
-    also counted FF DA inside comments and other metadata). Where the
-    structure breaks, the decoder resyncs past junk: the plain byte count
-    then, which can only count more."""
-    scans, i, n = 0, 2, len(blob)
-    while i + 4 <= n:
-        if blob[i] != 0xFF:
-            return max(scans, blob.count(b"\xff\xda"))
-        marker = blob[i + 1]
-        if marker == 0xFF:  # fill byte
-            i += 1
-            continue
-        if marker == 0xD9:  # EOI
-            return scans
-        if 0xD0 <= marker <= 0xD7 or marker == 0x01:  # no length
-            i += 2
-            continue
-        i += 2 + int.from_bytes(blob[i + 2 : i + 4], "big")
-        if marker != 0xDA:
-            continue
-        scans += 1
-        if scans > MAX_JPEG_SCANS:
-            return scans
-        # Entropy-coded data: FF is stuffed (FF 00) or a restart marker.
-        while True:
-            i = blob.find(b"\xff", i)
-            if i < 0 or i + 1 >= n:
-                return scans
-            if blob[i + 1] == 0x00 or 0xD0 <= blob[i + 1] <= 0xD7:
-                i += 2
-                continue
+    """An upper bound on a JPEG's scans: every SOS marker (FF DA) counts,
+    except those inside the metadata segments (APPn, COM) right after SOI,
+    which every decoder skips by their length -- a comment full of FF DA
+    rejected a valid image. Mirroring a decoder's resync over junk isn't
+    attempted: past the metadata, every FF DA counts."""
+    total, i, n = blob.count(b"\xff\xda"), 2, len(blob)
+    while i + 4 <= n and blob[i] == 0xFF and (0xE0 <= blob[i + 1] <= 0xEF or blob[i + 1] == 0xFE):
+        end = i + 2 + int.from_bytes(blob[i + 2 : i + 4], "big")
+        if end > n or end < i + 4:
             break
-    return scans
+        total -= blob.count(b"\xff\xda", i + 4, end)
+        i = end
+    return total
 
 
 def _image_bytes_from_url(url: str) -> bytes:

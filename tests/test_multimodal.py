@@ -286,6 +286,35 @@ class TestImageInputLimits(unittest.TestCase):
                     extract_images(_msg(_img_part(base + "/slow")))
                 self.assertLess(_t.monotonic() - start, 3)
 
+    def test_url_deadline_holds_against_a_dripped_tls_handshake(self):
+        import socket
+        import threading
+        import time as _t
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        self.addCleanup(listener.close)
+
+        def server():
+            conn, _ = listener.accept()
+            with conn:
+                try:
+                    conn.sendall(b"\x16\x03\x03\x40\x00")   # a 16 KB handshake record...
+                    for _ in range(40):                        # ...that never arrives
+                        conn.sendall(b"\x02")
+                        _t.sleep(0.2)
+                except OSError:
+                    pass
+
+        threading.Thread(target=server, daemon=True).start()
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+        start = _t.monotonic()
+        with self.assertRaisesRegex(ValueError, "longer than"):
+            extract_images(_msg(_img_part(f"https://127.0.0.1:{listener.getsockname()[1]}/x.png")))
+        self.assertLess(_t.monotonic() - start, 3)
+
     def test_url_deadline_holds_through_a_proxy_connect(self):
         # An HTTPS fetch through a proxy that drips its CONNECT response:
         # read inside connect(), before the socket used to be registered.
@@ -416,6 +445,10 @@ class TestImageInputLimits(unittest.TestCase):
         junk = bomb[:app0_end] + b"x" + bomb[app0_end:]
         with self.assertRaisesRegex(ValueError, "scans"):
             extract_images(_msg(_img_part(_data_uri(junk))))
+        # A padded marker a walker would misread as a segment's length.
+        padded = jpg[:-2] + b"\xff\xff\x00\x7f\x7f" + sos * 200 + b"\xff\xd9"
+        with self.assertRaisesRegex(ValueError, "scans"):
+            extract_images(_msg(_img_part(_data_uri(padded))))
 
     def test_not_an_image(self):
         uri = "data:image/png;base64," + base64.b64encode(b"hello, not an image").decode()
