@@ -414,6 +414,15 @@ class TestServer(unittest.TestCase):
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
 
+        base = f"http://localhost:{self.port}"
+        ids = [m["id"] for m in response_body["data"]]
+        self.assertEqual([m["id"] for m in requests.get(f"{base}/api/v0/models").json()["data"]], ids)
+        self.assertEqual([m["id"] for m in requests.get(f"{base}/v1/models/?x=1").json()["data"]], ids)
+        for model_id in ids:   # a local model's id is an absolute path
+            listed = requests.get(f"{base}/v1/models/{model_id.lstrip('/')}").json()["data"]
+            self.assertEqual([m["id"] for m in listed], [model_id])
+        self.assertEqual(requests.get(f"{base}/v1/modelsX").status_code, 404)
+
     def test_health_endpoint(self):
         url = f"http://localhost:{self.port}/health"
 

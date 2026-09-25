@@ -601,6 +601,31 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
+    def _offset(cache):
+        return next((c.offset for c in cache if hasattr(c, "offset")), None)
+
+    # On exit each cache holds exactly the prompt and the yielded tokens, as
+    # generate_step leaves it (a caller like the server stores it under that
+    # key): the last token yielded -- more for the draft cache -- was never
+    # fed, so feed it.
+    emitted = []
+    targets = [
+        (m, c, None if _offset(c) is None else _offset(c) + prompt.size)
+        for m, c in ((model, model_cache), (draft_model, draft_cache))
+    ]
+
+    def _sync_caches():
+        for m, cache, base in targets:
+            if base is None:
+                continue
+            missing = base + len(emitted) - _offset(cache)
+            if missing < 0:
+                trim_prompt_cache(cache, -missing)
+            elif 0 < missing <= len(emitted):
+                m(mx.array(emitted[-missing:], mx.uint32)[None], cache=cache)
+                quantize_cache_fn(cache)
+                mx.eval([c.state for c in cache])
+
     with mx.stream(stream):
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
@@ -609,6 +634,7 @@ def speculative_generate_step(
         # Set these so the finally block doesn't raise
         num_draft = 0
         n = 0
+        clean_exit = True
         try:
             while True:
                 num_draft = min(max_tokens - ntoks, num_draft_tokens)
@@ -629,11 +655,13 @@ def speculative_generate_step(
                         break
                     n += 1
                     ntoks += 1
+                    emitted.append(tn)
                     yield tn, lpn, True
                     if ntoks == max_tokens:
                         break
                 if ntoks < max_tokens:
                     ntoks += 1
+                    emitted.append(tokens[n])
                     yield tokens[n], logprobs[n], False
 
                 if ntoks == max_tokens:
@@ -653,8 +681,15 @@ def speculative_generate_step(
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
                 _rewind_cache(num_draft, n)
+        except GeneratorExit:
+            raise
+        except BaseException:
+            clean_exit = False
+            raise
         finally:
             _rewind_cache(num_draft, n)
+            if clean_exit:
+                _sync_caches()
 
 
 def _model_supports_nemotron_h_mtp(model: nn.Module) -> bool:

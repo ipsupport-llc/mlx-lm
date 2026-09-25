@@ -1022,6 +1022,14 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, cache_prompt
             )
+            # Image requests run without the draft model (it can't consume
+            # the fused image embeddings), so their caches have no draft
+            # slots: match the slots to this request.
+            use_draft = (
+                self.model_provider.draft_model is not None
+                and input_embeddings is None
+            )
+            cache, rest = self._match_draft_slots(cache, rest, cache_prompt, use_draft)
             ctx.prompt_cache_count = len(cache_prompt) - len(rest)
             cache_key = cache_prompt[:]
             if input_embeddings is not None:
@@ -1032,13 +1040,7 @@ class ResponseGenerator:
                 input_embeddings = input_embeddings[n_cached:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
-                # Speculative decoding is skipped for image requests (the
-                # draft model can't consume the fused image embeddings), so
-                # don't give it a cache slot there either.
-                if (
-                    self.model_provider.draft_model is not None
-                    and input_embeddings is None
-                ):
+                if use_draft:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
@@ -1053,7 +1055,7 @@ class ResponseGenerator:
                 sampler=sampler,
                 logits_processors=logits_processors,
                 prompt_cache=cache,
-                draft_model=draft_model if input_embeddings is None else None,
+                draft_model=draft_model if use_draft else None,
                 num_draft_tokens=args.num_draft_tokens,
                 input_embeddings=input_embeddings,
                 prompt_progress_callback=progress,
@@ -1098,6 +1100,20 @@ class ResponseGenerator:
 
         except Exception as e:
             rqueue.put(e)
+
+    def _match_draft_slots(self, cache, rest, cache_prompt, use_draft):
+        """A cached prompt's slots for this request: a cache without draft
+        slots can't serve a draft request (recomputed), and one with them
+        loses them for a request without the draft (it wouldn't advance
+        them)."""
+        if cache is None or self.model_provider.draft_model is None:
+            return cache, rest
+        n_main = len(self.model_provider.model.layers)
+        if use_draft and len(cache) == n_main:
+            return None, cache_prompt
+        if not use_draft and len(cache) > n_main:
+            return cache[:n_main], rest
+        return cache, rest
 
     def _await_response(self, response_queue):
         # Wherever the request was when the thread died, nothing more will be
@@ -1746,7 +1762,8 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models") or self.path.startswith("/api/v0/models"):
+        path = self.path.split("?", 1)[0]
+        if any(path == p or path.startswith(p + "/") for p in ("/v1/models", "/api/v0/models")):
             # /api/v0/models is LM Studio's own REST convention -- some
             # clients probe that shape by default. Same OpenAI-shaped
             # response as /v1/models, not LM Studio's richer schema, but
@@ -1820,7 +1837,9 @@ class APIHandler(BaseHTTPRequestHandler):
             model_path = Path(cli_args.model)
             if model_path.exists():
                 model_id = str(model_path.resolve())
-                if filter_repo_id in (None, model_id):
+                # The id is an absolute path: its leading "/" was stripped
+                # from the filter with the separator.
+                if filter_repo_id in (None, model_id.strip("/")):
                     models.append(
                         {
                             "id": model_id,

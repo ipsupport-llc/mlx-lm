@@ -24,7 +24,7 @@ def tiny_args(**overrides):
         mamba_num_heads=4,
         mamba_head_dim=16,
         mamba_proj_bias=False,
-        ssm_state_size=16,
+        ssm_state_size=64,  # the fused SSM step kernel needs >= 32
         conv_kernel=3,
         n_groups=2,
         time_step_limit=(0.0, float("inf")),
