@@ -365,7 +365,11 @@ class PatchEmbedder(nn.Module):
     ) -> mx.array:
         # Verified: no mean/std normalization here, just a fixed rescale.
         pixel_values = 2.0 * (pixel_values.astype(mx.float32) - 0.5)
-        hidden_states = self.input_proj(pixel_values.astype(self.input_proj.weight.dtype))
+        # The activation dtype: a quantized input_proj's weight is packed
+        # uint32 -- casting pixel values (in [-1, 1]) to it zeroed them, and
+        # every image came out the same.
+        dtype = getattr(self.input_proj, "scales", self.input_proj.weight).dtype
+        hidden_states = self.input_proj(pixel_values.astype(dtype))
 
         clamped = mx.maximum(pixel_position_ids, 0)
         x_emb = mx.take(self.position_embedding_table[0], clamped[..., 0], axis=0)

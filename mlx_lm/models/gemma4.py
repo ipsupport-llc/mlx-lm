@@ -409,6 +409,15 @@ class Model(nn.Module):
 
         sanitized = dict(self.language_model.sanitize(text_weights))
 
+        # A config can describe towers its checkpoint doesn't have (upstream
+        # mlx-lm's text-only conversion keeps audio_config but drops the audio
+        # weights): the model loads without them instead of failing on the
+        # missing parameters -- text-only for that modality.
+        if self.vision_tower is not None and not vision_weights:
+            self.vision_tower = self.embed_vision = None
+        if self.audio_tower is not None and not audio_weights:
+            self.audio_tower = self.embed_audio = None
+
         if self.vision_tower is not None:
             for k, v in self.vision_tower.sanitize(vision_weights).items():
                 sanitized[f"vision_tower.{k}"] = v
