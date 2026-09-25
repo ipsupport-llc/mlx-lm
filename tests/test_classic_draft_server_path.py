@@ -15,10 +15,10 @@ from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 
-def _tiny_llama(seed):
+def _tiny_llama(seed, hidden_size=32):
     mx.random.seed(seed)
     args = llama.ModelArgs(
-        model_type="llama", hidden_size=32, num_hidden_layers=2, intermediate_size=64,
+        model_type="llama", hidden_size=hidden_size, num_hidden_layers=2, intermediate_size=64,
         num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=64,
         rope_theta=10000.0, tie_word_embeddings=True,
     )
@@ -92,12 +92,13 @@ class TestClassicDraftServerPath(unittest.TestCase):
         model, draft = _tiny_llama(0), _tiny_llama(1)
         prompt = mx.array([1, 5, 9, 3])
         follow = mx.array([7, 2, 11])
-        for max_tokens, stop_after in [(1, None), (2, None), (5, None), (9, None), (20, 3), (20, 6)]:
-            with self.subTest(max_tokens=max_tokens, stop_after=stop_after):
+        cases = [(3, 1, None), (3, 2, None), (3, 5, None), (3, 9, None), (3, 20, 3), (3, 20, 6), (0, 4, None), (1, 20, 2)]
+        for num_draft, max_tokens, stop_after in cases:
+            with self.subTest(num_draft=num_draft, max_tokens=max_tokens, stop_after=stop_after):
                 cache = make_prompt_cache(model) + make_prompt_cache(draft)
                 gen = stream_generate(
                     model, _Tokenizer(), prompt, max_tokens=max_tokens, draft_model=draft,
-                    num_draft_tokens=3, prompt_cache=cache, input_embeddings=None,
+                    num_draft_tokens=num_draft, prompt_cache=cache, input_embeddings=None,
                 )
                 out = []
                 for r in gen:
@@ -114,6 +115,34 @@ class TestClassicDraftServerPath(unittest.TestCase):
                     fresh = [t for t, _ in generate_step(seen, m, max_tokens=4)]
                     self.assertEqual(reused, fresh)
 
+    def test_quantized_cache_reaches_the_callers_list(self):
+        # kv_bits swaps in quantized caches: the caller's list kept the old
+        # unquantized ones, frozen where the swap happened.
+        from mlx_lm.models.cache import QuantizedKVCache
+
+        model, draft = _tiny_llama(0, 128), _tiny_llama(1, 128)   # head_dim 32: quantizable
+        prompt = mx.array([1, 5, 9, 3, 8, 2])
+        cache = make_prompt_cache(model) + make_prompt_cache(draft)
+        out = [
+            r.token
+            for r in stream_generate(
+                model, _Tokenizer(), prompt, max_tokens=6, draft_model=draft, prompt_cache=cache,
+                input_embeddings=None, kv_bits=8, kv_group_size=32, quantized_kv_start=0,
+            )
+        ]
+        self.assertTrue(all(isinstance(c, QuantizedKVCache) for c in cache))
+        self.assertEqual({c.offset for c in cache}, {prompt.size + len(out)})
+
+
+class _Cached:
+    """A model with `n` cache entries (make_prompt_cache uses make_cache)."""
+
+    def __init__(self, n):
+        self.n = n
+
+    def make_cache(self):
+        return [object()] * self.n
+
 
 class TestServerDraftSlots(unittest.TestCase):
     """An image request runs without the draft model and caches no draft
@@ -123,13 +152,11 @@ class TestServerDraftSlots(unittest.TestCase):
         from mlx_lm.server import ResponseGenerator
 
         gen = object.__new__(ResponseGenerator)
-        gen.model_provider = types.SimpleNamespace(
-            model=types.SimpleNamespace(layers=[0, 0]), draft_model=draft,
-        )
+        gen.model_provider = types.SimpleNamespace(model=_Cached(2), draft_model=draft)
         return gen
 
     def test_slots_match_the_request(self):
-        gen = self._generator(object())
+        gen = self._generator(_Cached(2))
         main, both = ["m1", "m2"], ["m1", "m2", "d1", "d2"]
         key, rest = [1, 2, 3, 4], [4]
         self.assertEqual(gen._match_draft_slots(main, rest, key, True), (None, key))
@@ -137,6 +164,12 @@ class TestServerDraftSlots(unittest.TestCase):
         self.assertEqual(gen._match_draft_slots(both, rest, key, False), (main, rest))
         self.assertEqual(gen._match_draft_slots(main, rest, key, False), (main, rest))
         self.assertEqual(gen._match_draft_slots(None, key, key, True), (None, key))
+
+    def test_drafter_without_a_cache_keeps_the_prompt_cache(self):
+        # The Gemma 4 assistant drafter has no cache: nothing to match (every
+        # text request recomputed its whole prompt).
+        gen = self._generator(_Cached(0))
+        self.assertEqual(gen._match_draft_slots(["m1", "m2"], [4], [1, 4], True), (["m1", "m2"], [4]))
 
     def test_no_draft_model_unchanged(self):
         gen = self._generator(None)

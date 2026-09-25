@@ -26,6 +26,7 @@ from typing import (
     Tuple,
     Union,
 )
+from urllib.parse import unquote
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
@@ -1117,9 +1118,12 @@ class ResponseGenerator:
         slots can't serve a draft request (recomputed), and one with them
         loses them for a request without the draft (it wouldn't advance
         them)."""
-        if cache is None or self.model_provider.draft_model is None:
+        draft = self.model_provider.draft_model
+        # A drafter without a cache of its own (the Gemma 4 assistant) has no
+        # slots to match.
+        if cache is None or draft is None or not make_prompt_cache(draft):
             return cache, rest
-        n_main = len(self.model_provider.model.layers)
+        n_main = len(make_prompt_cache(self.model_provider.model))
         if use_draft and len(cache) == n_main:
             return None, cache_prompt
         if not use_draft and len(cache) > n_main:
@@ -1813,7 +1817,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # /v1/models[/<id>] and LM Studio's /api/v0/models[/<id>]: the id is
         # what follows the prefix (splitting on "/" took "models" itself as
         # the id for /api/v0/models, so it always listed nothing).
-        path = self.path.split("?", 1)[0]
+        path = unquote(self.path.split("?", 1)[0])
         prefix = "/api/v0/models" if path.startswith("/api/v0/models") else "/v1/models"
         filter_repo_id = path[len(prefix):].strip("/") or None
 

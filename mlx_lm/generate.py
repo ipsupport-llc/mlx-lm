@@ -540,8 +540,11 @@ def speculative_generate_step(
         model_cache = make_prompt_cache(model)
         draft_cache = make_prompt_cache(draft_model)
     else:
-        model_cache = prompt_cache[: len(model.layers)]
-        draft_cache = prompt_cache[len(model.layers) :]
+        # Split by the model's own cache length (KV-shared layers have no
+        # cache of their own: fewer entries than layers).
+        n_main = len(make_prompt_cache(model))
+        model_cache = prompt_cache[:n_main]
+        draft_cache = prompt_cache[n_main:]
 
     if not can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
@@ -617,9 +620,10 @@ def speculative_generate_step(
 
     # On exit each cache holds exactly the prompt and the yielded tokens, as
     # generate_step leaves it (a caller like the server stores it under that
-    # key): the last token yielded -- more for the draft cache -- was never
-    # fed, so feed it.
+    # key): the last token yielded -- more for the draft cache, and with no
+    # drafting the prompt's last token too -- was never fed, so feed it.
     emitted = []
+    last_prompt_token = prompt[-1:].tolist()
     targets = [
         (m, c, None if _offset(c) is None else _offset(c) + prompt.size)
         for m, c in ((model, model_cache), (draft_model, draft_cache))
@@ -630,12 +634,17 @@ def speculative_generate_step(
             if base is None:
                 continue
             missing = base + len(emitted) - _offset(cache)
+            history = last_prompt_token + emitted
             if missing < 0:
                 trim_prompt_cache(cache, -missing)
-            elif 0 < missing <= len(emitted):
-                m(mx.array(emitted[-missing:], mx.uint32)[None], cache=cache)
+            elif 0 < missing <= len(history):
+                m(mx.array(history[-missing:], mx.uint32)[None], cache=cache)
                 quantize_cache_fn(cache)
                 mx.eval([c.state for c in cache])
+        if prompt_cache is not None:
+            # Quantizing replaced entries in the split lists: the caller's
+            # own list must get them (it kept the stale unquantized ones).
+            prompt_cache[:] = model_cache + draft_cache
 
     with mx.stream(stream):
         draft_y = _prefill(draft_model, draft_cache, y)
