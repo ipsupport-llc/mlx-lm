@@ -254,10 +254,217 @@ class TestImageInputLimits(unittest.TestCase):
             extract_images(_msg(_img_part(base + "/drip")))
         self.assertLess(_t.monotonic() - start, 3)
 
+    def test_url_deadline_holds_against_a_dripped_head_or_chunk_line(self):
+        # Each byte comes inside the socket timeout, and a blocked read
+        # never got back to a deadline check between reads.
+        import time as _t
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+
+        def dripped(prefix, endless):
+            def body(h):
+                try:
+                    h.wfile.write(prefix)
+                    h.wfile.flush()
+                    for _ in range(40):
+                        h.wfile.write(endless)
+                        h.wfile.flush()
+                        _t.sleep(0.2)
+                except OSError:
+                    pass
+            return body
+
+        cases = {
+            "head": dripped(b"HTTP/1.1 200 OK\r\nX-Slow: ", b"a"),
+            "chunk line": dripped(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", b"0"),
+        }
+        for name, body in cases.items():
+            with self.subTest(name):
+                base, _ = self._serve(body)
+                start = _t.monotonic()
+                with self.assertRaisesRegex(ValueError, "longer than"):
+                    extract_images(_msg(_img_part(base + "/slow")))
+                self.assertLess(_t.monotonic() - start, 3)
+
+    def test_url_deadline_holds_against_a_dripped_tls_handshake(self):
+        import socket
+        import threading
+        import time as _t
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        self.addCleanup(listener.close)
+
+        def server():
+            conn, _ = listener.accept()
+            with conn:
+                try:
+                    conn.sendall(b"\x16\x03\x03\x40\x00")   # a 16 KB handshake record...
+                    for _ in range(40):                        # ...that never arrives
+                        conn.sendall(b"\x02")
+                        _t.sleep(0.2)
+                except OSError:
+                    pass
+
+        threading.Thread(target=server, daemon=True).start()
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+        start = _t.monotonic()
+        with self.assertRaisesRegex(ValueError, "longer than"):
+            extract_images(_msg(_img_part(f"https://127.0.0.1:{listener.getsockname()[1]}/x.png")))
+        self.assertLess(_t.monotonic() - start, 3)
+
+    def test_url_deadline_holds_across_addresses_that_time_out(self):
+        # Each address could take the whole socket timeout to fail.
+        import socket
+        import time as _t
+        from unittest import mock
+
+        class Blackhole:
+            def __init__(self, *a):
+                self.timeout = None
+
+            def settimeout(self, t):
+                self.timeout = t
+
+            def connect(self, addr):
+                _t.sleep(self.timeout)
+                raise TimeoutError("timed out")
+
+            def shutdown(self, how):
+                pass
+
+            def close(self):
+                pass
+
+        addrs = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"10.0.0.{i}", 80)) for i in range(4)]
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+        with mock.patch("socket.getaddrinfo", return_value=addrs), mock.patch("socket.socket", Blackhole):
+            start = _t.monotonic()
+            with self.assertRaisesRegex(ValueError, "longer than|Could not load"):
+                extract_images(_msg(_img_part("http://many.invalid/x.png")))
+            self.assertLess(_t.monotonic() - start, 2)
+
+    def test_url_deadline_holds_against_a_stalled_resolver(self):
+        import time as _t
+        from unittest import mock
+
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+        with mock.patch("socket.getaddrinfo", side_effect=lambda *a, **k: _t.sleep(5)):
+            start = _t.monotonic()
+            with self.assertRaisesRegex(ValueError, "longer than"):
+                extract_images(_msg(_img_part("http://slow-dns.invalid/x.png")))
+            self.assertLess(_t.monotonic() - start, 2)
+
+    def test_connect_falls_back_past_an_unusable_address_family(self):
+        import socket
+        from unittest import mock
+
+        png = _png(8, 8, 0)
+
+        def body(h):
+            h.send_response(200)
+            h.end_headers()
+            h.wfile.write(png)
+
+        base, _ = self._serve(body)
+        port = int(base.rsplit(":", 1)[1])
+        real_socket = socket.socket
+
+        def make(family=socket.AF_INET, *a, **kw):
+            if family == socket.AF_INET6:
+                raise OSError(47, "Address family not supported")
+            return real_socket(family, *a, **kw)
+
+        addrs = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+                 (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        multimodal.ALLOW_IMAGE_URLS = True
+        with mock.patch("socket.getaddrinfo", return_value=addrs), mock.patch("socket.socket", make):
+            self.assertEqual(extract_images(_msg(_img_part(f"http://dual.invalid:{port}/x"))), [png])
+
+    def test_failed_tls_handshake_closes_its_socket(self):
+        import gc
+        import os
+        import warnings
+
+        def plain(h):   # plain HTTP on a port fetched as https://
+            h.send_response(200)
+            h.end_headers()
+
+        base, _ = self._serve(plain)
+        multimodal.ALLOW_IMAGE_URLS = True
+        url = base.replace("http://", "https://") + "/x"
+        gc.disable()
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                before = len(os.listdir("/dev/fd"))
+                for _ in range(20):
+                    with self.assertRaises(ValueError):
+                        extract_images(_msg(_img_part(url)))
+                after = len(os.listdir("/dev/fd"))
+        finally:
+            gc.enable()
+        self.assertLess(after - before, 5, "sockets left open")
+        self.assertFalse([w for w in caught if "SSLSocket" in str(w.message)])
+
+    def test_url_deadline_holds_through_a_proxy_connect(self):
+        # An HTTPS fetch through a proxy that drips its CONNECT response:
+        # read inside connect(), before the socket used to be registered.
+        import os
+        import socket
+        import threading
+        import time as _t
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        self.addCleanup(listener.close)
+
+        def proxy():
+            conn, _ = listener.accept()
+            with conn:
+                conn.recv(4096)
+                try:
+                    for byte in b"HTTP/1.1 200 Connection established" * 10:
+                        conn.sendall(bytes([byte]))
+                        _t.sleep(0.2)
+                except OSError:
+                    pass
+
+        threading.Thread(target=proxy, daemon=True).start()
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+        env = {"https_proxy": f"http://127.0.0.1:{listener.getsockname()[1]}", "no_proxy": ""}
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            start = _t.monotonic()
+            with self.assertRaisesRegex(ValueError, "longer than"):
+                extract_images(_msg(_img_part("https://example.invalid/x.png")))
+            self.assertLess(_t.monotonic() - start, 3)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
     def test_data_uri_size_and_pixel_caps(self):
         multimodal.MAX_IMAGE_BYTES = 100
         with self.assertRaisesRegex(ValueError, "larger than"):
             extract_images(_msg(_img_part(_data_uri(_png(64, 64, 0)))))
+        # Checked decoded too: the encoded length's allowance let a padded
+        # image a little over the cap through.
+        png = _png(8, 8, 0)
+        multimodal.MAX_IMAGE_BYTES = 1000
+        padded = png + b"\0" * (1001 - len(png))
+        with self.assertRaisesRegex(ValueError, "larger than"):
+            extract_images(_msg(_img_part(_data_uri(padded))))
+        self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(padded[:1000]))))), 1)
         multimodal.MAX_IMAGE_BYTES = 20 * 1024 * 1024
         # A decompression bomb: a small file declaring a huge canvas.
         buf = io.BytesIO()
@@ -319,6 +526,25 @@ class TestImageInputLimits(unittest.TestCase):
         bomb = jpg[:-2] + sos * 200 + b"\xff\xd9"
         with self.assertRaisesRegex(ValueError, "scans"):
             extract_images(_msg(_img_part(_data_uri(bomb))))
+        # FF DA bytes in a comment aren't scans (a byte count took them).
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 32)).save(buf, format="JPEG")
+        comment = b"\xff\xda" * 150
+        com = b"\xff\xfe" + struct.pack(">H", len(comment) + 2) + comment
+        jpg = buf.getvalue()
+        with_comment = jpg[:2] + com + jpg[2:]
+        Image.open(io.BytesIO(with_comment)).load()
+        self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(with_comment))))), 1)
+        # A junk byte between segments: the decoder skips it, so the scans
+        # after it still count.
+        app0_end = 4 + int.from_bytes(bomb[4:6], "big")
+        junk = bomb[:app0_end] + b"x" + bomb[app0_end:]
+        with self.assertRaisesRegex(ValueError, "scans"):
+            extract_images(_msg(_img_part(_data_uri(junk))))
+        # A padded marker a walker would misread as a segment's length.
+        padded = jpg[:-2] + b"\xff\xff\x00\x7f\x7f" + sos * 200 + b"\xff\xd9"
+        with self.assertRaisesRegex(ValueError, "scans"):
+            extract_images(_msg(_img_part(_data_uri(padded))))
 
     def test_not_an_image(self):
         uri = "data:image/png;base64," + base64.b64encode(b"hello, not an image").decode()

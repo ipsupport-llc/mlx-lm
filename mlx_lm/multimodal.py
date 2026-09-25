@@ -40,8 +40,11 @@ anything is decoded, and a request carries at most MAX_IMAGES images.
 
 import base64
 import hashlib
+import http.client
 import io
 import json
+import socket
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -80,30 +83,159 @@ class _HTTPOnlyRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+class _RegisteringContext:
+    """An SSL context whose sockets are registered before their handshake:
+    wrapping moves the connection's descriptor into a new SSLSocket (the
+    raw socket's shutdown then fails), and the handshake itself reads."""
+
+    def __init__(self, context, register):
+        self._context, self._register = context, register
+
+    def wrap_socket(self, sock, **kwargs):
+        wrapped = self._context.wrap_socket(sock, do_handshake_on_connect=False, **kwargs)
+        self._register(wrapped)
+        try:
+            wrapped.do_handshake()
+        except BaseException:
+            wrapped.close()  # as the handshake inside wrap_socket would
+            raise
+        return wrapped
+
+    def __getattr__(self, name):
+        return getattr(self._context, name)
+
+
 def _fetch(url: str) -> bytes:
     """An http(s) image, at most MAX_IMAGE_BYTES, within URL_FETCH_SECONDS
-    overall (the socket timeout alone lets a slow drip go on forever)."""
+    overall. A deadline checked between reads can't stop a read already
+    blocked (a header or chunk line dripped a byte at a time keeps each
+    one inside the socket timeout): at the deadline the connections'
+    sockets are shut down, which wakes it."""
+    sockets, expired = [], threading.Event()
     deadline = time.monotonic() + URL_FETCH_SECONDS
-    request = urllib.request.Request(url, headers={"User-Agent": "mlx-lm-server"})
-    opener = urllib.request.build_opener(_HTTPOnlyRedirects)
-    with opener.open(request, timeout=10) as resp:
-        length = resp.headers.get("Content-Length")
-        if length is not None and length.isdigit() and int(length) > MAX_IMAGE_BYTES:
-            raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
-        chunks, total = [], 0
-        while True:
-            if time.monotonic() > deadline:
-                raise ValueError(f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s.")
-            # read1: what has arrived (read(n) would wait for all n bytes,
-            # so a slow drip never reached the deadline check).
-            chunk = resp.read1(64 * 1024)
-            if not chunk:
+
+    def shut(sock):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def register(sock):
+        sockets.append(sock)
+        if expired.is_set():
+            shut(sock)
+        return sock
+
+    def connect(address, timeout=None, source_address=None, **_):
+        """socket.create_connection, each attempt within what's left of
+        the deadline (each address could take the whole socket timeout),
+        registered as soon as it exists: a proxy's CONNECT response is
+        read inside connect(), before TLS."""
+        # Resolved aside: getaddrinfo can't be interrupted, only waited for
+        # up to the deadline (the resolver's own timeouts end it).
+        resolved = {}
+
+        def resolve():
+            try:
+                resolved["infos"] = socket.getaddrinfo(*address, 0, socket.SOCK_STREAM)
+            except OSError as e:
+                resolved["error"] = e
+
+        resolver = threading.Thread(target=resolve, daemon=True)
+        resolver.start()
+        resolver.join(max(0.0, deadline - time.monotonic()))
+        if "error" in resolved:
+            raise resolved["error"]
+        if "infos" not in resolved:
+            raise TimeoutError(f"Resolving {address[0]} took too long.")
+        error = None
+        for family, kind, proto, _, addr in resolved["infos"]:
+            left = deadline - time.monotonic()
+            if left <= 0 or expired.is_set():
                 break
-            total += len(chunk)
-            if total > MAX_IMAGE_BYTES:
+            sock = None
+            try:
+                sock = register(socket.socket(family, kind, proto))
+                sock.settimeout(min(timeout, left) if isinstance(timeout, (int, float)) else left)
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(addr)
+                sock.settimeout(timeout if isinstance(timeout, (int, float)) else None)
+                return sock
+            except OSError as e:
+                error = e
+                if sock is not None:
+                    sock.close()
+        raise error or TimeoutError(f"Connecting to {address[0]} took too long.")
+
+    def tracked(base):
+        class Connection(base):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._create_connection = connect
+                if getattr(self, "_context", None) is not None:
+                    self._context = _RegisteringContext(self._context, register)
+
+        return Connection
+
+    class HTTP(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(tracked(http.client.HTTPConnection), req)
+
+    class HTTPS(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(tracked(http.client.HTTPSConnection), req, context=self._context)
+
+    def expire():
+        expired.set()
+        for sock in list(sockets):
+            shut(sock)
+
+    timer = threading.Timer(URL_FETCH_SECONDS, expire)
+    timer.daemon = True
+    timer.start()
+    request = urllib.request.Request(url, headers={"User-Agent": "mlx-lm-server"})
+    opener = urllib.request.build_opener(_HTTPOnlyRedirects, HTTP, HTTPS)
+    try:
+        with opener.open(request, timeout=10) as resp:
+            length = resp.headers.get("Content-Length")
+            if length is not None and length.isdigit() and int(length) > MAX_IMAGE_BYTES:
                 raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
-            chunks.append(chunk)
+            chunks, total = [], 0
+            while True:
+                chunk = resp.read1(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_IMAGE_BYTES:
+                    raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
+                chunks.append(chunk)
+    except Exception:
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise ValueError(f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s.")
+        raise
+    finally:
+        timer.cancel()
+    if expired.is_set():
+        # Shut down between reads: what arrived may be cut short.
+        raise ValueError(f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s.")
     return b"".join(chunks)
+
+
+def _jpeg_scans(blob: bytes) -> int:
+    """An upper bound on a JPEG's scans: every SOS marker (FF DA) counts,
+    except those inside the metadata segments (APPn, COM) right after SOI,
+    which every decoder skips by their length -- a comment full of FF DA
+    rejected a valid image. Mirroring a decoder's resync over junk isn't
+    attempted: past the metadata, every FF DA counts."""
+    total, i, n = blob.count(b"\xff\xda"), 2, len(blob)
+    while i + 4 <= n and blob[i] == 0xFF and (0xE0 <= blob[i + 1] <= 0xEF or blob[i + 1] == 0xFE):
+        end = i + 2 + int.from_bytes(blob[i + 2 : i + 4], "big")
+        if end > n or end < i + 4:
+            break
+        total -= blob.count(b"\xff\xda", i + 4, end)
+        i = end
+    return total
 
 
 def _image_bytes_from_url(url: str) -> bytes:
@@ -117,7 +249,10 @@ def _image_bytes_from_url(url: str) -> bytes:
         # validate=True: the default silently drops non-alphabet characters,
         # turning garbage into b"" that only fails later, deep in the
         # generation thread.
-        return base64.b64decode("".join(b64.split()), validate=True)
+        blob = base64.b64decode("".join(b64.split()), validate=True)
+        if len(blob) > MAX_IMAGE_BYTES:
+            raise ValueError(f"Image is larger than {MAX_IMAGE_BYTES} bytes.")
+        return blob
     if url.startswith(("http://", "https://")):
         if not ALLOW_IMAGE_URLS:
             raise ValueError(
@@ -152,10 +287,7 @@ def _check_image(blob: bytes) -> int:
         raise ValueError(
             f"Image is {width}x{height} pixels; at most {MAX_IMAGE_PIXELS} are accepted."
         )
-    # Every scan starts with an SOS marker (FF DA); inside entropy-coded
-    # data an FF byte is always stuffed (FF 00) or a restart marker, so a
-    # plain count doesn't overcount (an EXIF thumbnail adds its own few).
-    if blob[:2] == b"\xff\xd8" and blob.count(b"\xff\xda") > MAX_JPEG_SCANS:
+    if blob[:2] == b"\xff\xd8" and _jpeg_scans(blob) > MAX_JPEG_SCANS:
         raise ValueError(f"JPEG has more than {MAX_JPEG_SCANS} scans.")
     return width * height
 
