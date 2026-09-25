@@ -347,6 +347,18 @@ class TestImageInputLimits(unittest.TestCase):
                 extract_images(_msg(_img_part("http://many.invalid/x.png")))
             self.assertLess(_t.monotonic() - start, 2)
 
+    def test_url_deadline_holds_against_a_stalled_resolver(self):
+        import time as _t
+        from unittest import mock
+
+        multimodal.ALLOW_IMAGE_URLS = True
+        multimodal.URL_FETCH_SECONDS = 1
+        with mock.patch("socket.getaddrinfo", side_effect=lambda *a, **k: _t.sleep(5)):
+            start = _t.monotonic()
+            with self.assertRaisesRegex(ValueError, "longer than"):
+                extract_images(_msg(_img_part("http://slow-dns.invalid/x.png")))
+            self.assertLess(_t.monotonic() - start, 2)
+
     def test_connect_falls_back_past_an_unusable_address_family(self):
         import socket
         from unittest import mock

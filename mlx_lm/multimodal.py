@@ -127,8 +127,25 @@ def _fetch(url: str) -> bytes:
         the deadline (each address could take the whole socket timeout),
         registered as soon as it exists: a proxy's CONNECT response is
         read inside connect(), before TLS."""
+        # Resolved aside: getaddrinfo can't be interrupted, only waited for
+        # up to the deadline (the resolver's own timeouts end it).
+        resolved = {}
+
+        def resolve():
+            try:
+                resolved["infos"] = socket.getaddrinfo(*address, 0, socket.SOCK_STREAM)
+            except OSError as e:
+                resolved["error"] = e
+
+        resolver = threading.Thread(target=resolve, daemon=True)
+        resolver.start()
+        resolver.join(max(0.0, deadline - time.monotonic()))
+        if "error" in resolved:
+            raise resolved["error"]
+        if "infos" not in resolved:
+            raise TimeoutError(f"Resolving {address[0]} took too long.")
         error = None
-        for family, kind, proto, _, addr in socket.getaddrinfo(*address, 0, socket.SOCK_STREAM):
+        for family, kind, proto, _, addr in resolved["infos"]:
             left = deadline - time.monotonic()
             if left <= 0 or expired.is_set():
                 break
@@ -190,7 +207,7 @@ def _fetch(url: str) -> bytes:
                     raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
                 chunks.append(chunk)
     except Exception:
-        if expired.is_set():
+        if expired.is_set() or time.monotonic() >= deadline:
             raise ValueError(f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s.")
         raise
     finally:
