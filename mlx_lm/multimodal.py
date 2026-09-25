@@ -67,6 +67,10 @@ URL_FETCH_SECONDS = 30
 # Formats whose Image.open reads only the header (ICO, for one, decodes its
 # embedded PNG right there -- the size check would come after the cost).
 IMAGE_FORMATS = {"PNG", "JPEG", "WEBP", "GIF", "BMP"}
+# Progressive JPEG decode time grows with its number of scans, not its size
+# or pixels: 50 000 tiny scans in 1.6 MB took 30 s of the generation thread.
+# Real encoders write about 10.
+MAX_JPEG_SCANS = 100
 
 
 class _HTTPOnlyRedirects(urllib.request.HTTPRedirectHandler):
@@ -148,6 +152,11 @@ def _check_image(blob: bytes) -> int:
         raise ValueError(
             f"Image is {width}x{height} pixels; at most {MAX_IMAGE_PIXELS} are accepted."
         )
+    # Every scan starts with an SOS marker (FF DA); inside entropy-coded
+    # data an FF byte is always stuffed (FF 00) or a restart marker, so a
+    # plain count doesn't overcount (an EXIF thumbnail adds its own few).
+    if blob[:2] == b"\xff\xd8" and blob.count(b"\xff\xda") > MAX_JPEG_SCANS:
+        raise ValueError(f"JPEG has more than {MAX_JPEG_SCANS} scans.")
     return width * height
 
 

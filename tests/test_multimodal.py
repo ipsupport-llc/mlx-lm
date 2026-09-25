@@ -304,6 +304,22 @@ class TestImageInputLimits(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "scheme"):
             extract_images(_msg(_img_part(base + "/r")))
 
+    def test_jpeg_scan_count_capped(self):
+        import struct
+
+        # A valid progressive-style JPEG with extra (empty) scans spliced in
+        # before EOI: decoding time grows with the scan count.
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 32)).save(buf, format="JPEG", progressive=True)
+        jpg = buf.getvalue()
+        normal_scans = jpg.count(b"\xff\xda")
+        self.assertLess(normal_scans, 20)
+        self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(jpg))))), 1)
+        sos = b"\xff\xda" + struct.pack(">H", 8) + b"\x01\x01\x00\x00\x3f\x00"
+        bomb = jpg[:-2] + sos * 200 + b"\xff\xd9"
+        with self.assertRaisesRegex(ValueError, "scans"):
+            extract_images(_msg(_img_part(_data_uri(bomb))))
+
     def test_not_an_image(self):
         uri = "data:image/png;base64," + base64.b64encode(b"hello, not an image").decode()
         with self.assertRaisesRegex(ValueError, "image data"):
