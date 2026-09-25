@@ -326,7 +326,14 @@ class Model(nn.Module):
         """[start, end) prompt positions of each image's soft tokens, for
         the prefill that follows (None to clear): their tokens then attend
         to each other in both directions, as HF does. The caller clears it
-        once the prompt is processed; decoding is causal either way."""
+        once the prompt is processed; decoding is causal either way.
+
+        What an image needs: its tokens all go through one forward pass.
+        So a cached prefix must not end inside an image (that part was
+        computed causally), and the prompt's last token must not be an image
+        token (generate_step runs it on its own). A chat-templated prompt
+        meets both: every image ends with its end-of-image token, and all of
+        an image's soft tokens share one prompt-cache key."""
         self._text_model().vision_spans = (
             list(spans) if spans and self.uses_vision_bidirectional_attention() else None
         )
@@ -388,7 +395,8 @@ class Model(nn.Module):
             input_features_mask,
         )
         # A direct call with the images: their spans come from `inputs`
-        # (offset by what the cache already holds), for this call only.
+        # (offset by what the cache already holds), for this call only --
+        # batch size 1, each image whole within the call; otherwise causal.
         text_model = self._text_model()
         saved = text_model.vision_spans
         if pixel_values is not None and saved is None and inputs.shape[0] == 1:
