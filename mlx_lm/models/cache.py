@@ -1902,6 +1902,7 @@ class LRUPromptCache:
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+        self.last_divergence = None
 
     def __len__(self):
         return len(self._lru)
@@ -1912,6 +1913,12 @@ class LRUPromptCache:
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
+        # Where the nearest longer entry diverges from `tokens` (diagnostics).
+        self.last_divergence = (
+            (result.common_prefix, len(result.longer))
+            if result.longer is not None and result.common_prefix < len(tokens)
+            else None
+        )
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
             return copy.deepcopy(cache_entry.prompt_cache), []

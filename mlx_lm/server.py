@@ -519,6 +519,16 @@ class ResponseGenerator:
     def is_healthy(self):
         return self.generation_available()
 
+    def _log_cache_reuse(self, n_reused, n_prompt):
+        logging.info(f"Prompt cache: reused {n_reused} of {n_prompt} tokens")
+        # A client that changes an earlier part of the prompt shows here.
+        div = self.prompt_cache.last_divergence
+        if div is not None:
+            logging.info(
+                f"Prompt cache: diverged from a cached prompt at token {div[0]} "
+                f"(of {div[1]})"
+            )
+
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
         n_bytes = self.prompt_cache.nbytes
@@ -633,10 +643,6 @@ class ResponseGenerator:
             think_end = tokenizer.rfind_think_end(prompt)
             if think_start > think_end:
                 initial_state = "reasoning"
-
-        # It is not a user message so no segmentation needed.
-        if messages[-1]["role"] != "user":
-            return prompt, [prompt], ["assistant"], initial_state
 
         segments = []
         segment_types = []
@@ -787,6 +793,7 @@ class ResponseGenerator:
                         current_model_key, prompt
                     )
                     prompt_cache_count = len(prompt) - len(rest)
+                    self._log_cache_reuse(prompt_cache_count, len(prompt))
                     N = prompt_cache_count
                     while N > 0:
                         if N >= len(segments[0]):
@@ -1046,6 +1053,7 @@ class ResponseGenerator:
             )
             cache, rest = self._match_draft_slots(cache, rest, cache_prompt, use_draft)
             ctx.prompt_cache_count = len(cache_prompt) - len(rest)
+            self._log_cache_reuse(ctx.prompt_cache_count, len(cache_prompt))
             cache_key = cache_prompt[:]
             if input_embeddings is not None:
                 # `rest` is a slice of the cache key (pseudo ids at image

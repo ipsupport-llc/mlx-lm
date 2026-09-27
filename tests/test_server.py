@@ -294,6 +294,21 @@ class TestServer(unittest.TestCase):
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
 
+    def test_batched_chat_ending_with_a_tool_message(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "List the files."},
+            {"role": "assistant", "content": "Calling list_files."},
+            {"role": "tool", "content": "a.py b.py"},
+        ]
+        body = {"model": "chat_model", "max_tokens": 4, "messages": messages}
+        for _ in range(2):
+            response = requests.post(url, json=body)
+            self.assertEqual(response.status_code, 200)
+        usage = response.json()["usage"]
+        self.assertGreater(usage["prompt_tokens_details"]["cached_tokens"], 0)
+
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {
@@ -730,6 +745,33 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         other = [first[0], {"role": "user", "content": "Different question?"}]
         self.assertGreaterEqual(self._chat(url, other), n_system)
         return prompt_cache, provider
+
+    def test_agent_loop_with_tool_messages(self):
+        # Agent requests end with a tool result, not a user message. The
+        # stored answer is rendered differently next time, so only a
+        # checkpoint at the end of the prompt can serve the next request.
+        provider, prompt_cache, url = self._serve()
+        tokenizer = provider.tokenizer
+        messages = [
+            {"role": "system", "content": self.SYSTEM},
+            {"role": "user", "content": "List the files."},
+            {"role": "assistant", "content": "Calling list_files."},
+            {"role": "tool", "content": "a.py b.py c.py"},
+        ]
+        prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        with self.assertLogs(level="INFO") as logs:
+            self.assertEqual(self._chat(url, messages), 0)
+            messages += [
+                {"role": "assistant", "content": "Calling read_file a.py."},
+                {"role": "tool", "content": "print('hi')"},
+            ]
+            cached = self._chat(url, messages)
+        self.assertGreaterEqual(cached, len(prompt) - 1)
+        self.assertEqual(prompt_cache.stats_by_type()["system"]["n_sequences"], 1)
+        text = "\n".join(logs.output)
+        self.assertIn(f"Prompt cache: reused 0 of {len(prompt)} tokens", text)
+        self.assertIn(f"Prompt cache: reused {cached} of", text)
+        self.assertIn("Prompt cache: diverged from a cached prompt at token", text)
 
     def test_checkpoints_are_reused(self):
         self._check_reuse()
