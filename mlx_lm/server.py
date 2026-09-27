@@ -1,6 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
+import copy
 import gc
 import json
 import logging
@@ -39,7 +40,9 @@ from .generate import (
     _model_supports_nemotron_h_mtp,
     make_stop_sequences,
     make_text_state_machine,
+    maybe_quantize_kv_cache,
     stream_generate,
+    wired_limit,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .multimodal import extract_images, load_image_inputs
@@ -981,7 +984,9 @@ class ResponseGenerator:
                     )
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, segments, segment_types, initial_state = self._tokenize(
+                tokenizer, request, args
+            )
 
             # Image requests: expand each image placeholder into its real
             # soft-token span and fuse the image features into the prompt
@@ -1045,6 +1050,30 @@ class ResponseGenerator:
                 if use_draft:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
+            # Prefill up to the end of the system and user segments and save a
+            # checkpoint at each, as the batched path does. A non-trimmable
+            # cache (e.g. a sliding window) can't be cut back from the whole
+            # sequence when the next turn diverges in the last answer.
+            n_prefilled = 0
+            if input_embeddings is None:
+                n_main = len(make_prompt_cache(model))
+                n_prefilled = self._prefill_checkpoints(
+                    model,
+                    draft_model if use_draft else None,
+                    cache,
+                    n_main,
+                    prompt,
+                    ctx.prompt_cache_count,
+                    segments,
+                    segment_types,
+                    stream,
+                    progress,
+                )
+                rest = rest[n_prefilled:]
+
+            def generate_progress(processed, total):
+                progress(n_prefilled + processed, n_prefilled + total)
+
             # Process the prompt and generate tokens
             # Own matcher: the automaton is cached across requests.
             stop_matcher = stop_sequences.matcher()
@@ -1067,7 +1096,7 @@ class ResponseGenerator:
                     draft_model=draft_model if use_draft else None,
                     num_draft_tokens=args.num_draft_tokens,
                     input_embeddings=input_embeddings,
-                    prompt_progress_callback=progress,
+                    prompt_progress_callback=generate_progress,
                     prefill_step_size=self.cli_args.prefill_step_size,
                     kv_bits=self.cli_args.kv_bits,
                     kv_group_size=self.cli_args.kv_group_size,
@@ -1112,6 +1141,62 @@ class ResponseGenerator:
 
         except Exception as e:
             rqueue.put(e)
+
+    def _prefill_checkpoints(
+        self,
+        model,
+        draft_model,
+        cache,
+        n_main,
+        prompt,
+        n_cached,
+        segments,
+        segment_types,
+        stream,
+        progress,
+    ):
+        """Prefill `prompt[n_cached:]` up to the end of each system / user
+        segment and insert a copy of the cache there. The last prompt token
+        is left for generation. Return the number of tokens prefilled."""
+        ends = []
+        end = 0
+        for seg, seg_type in zip(segments, segment_types):
+            end += len(seg)
+            if seg_type in ("system", "user"):
+                ends.append((min(end, len(prompt) - 1), seg_type))
+        ends = [(e, t) for e, t in ends if e > n_cached]
+        if not ends:
+            return 0
+
+        cli_args = self.cli_args
+        quantize = lambda: maybe_quantize_kv_cache(
+            cache, cli_args.quantized_kv_start, cli_args.kv_group_size, cli_args.kv_bits
+        )
+        step = cli_args.prefill_step_size
+        total = len(prompt) - n_cached
+        done = n_cached
+        with wired_limit(model, [stream]), mx.stream(stream):
+            progress(0, total)
+            for end, seg_type in ends:
+                while done < end:
+                    n = min(step, end - done)
+                    tokens = mx.array(prompt[done : done + n])[None]
+                    model(tokens, cache=cache[:n_main])
+                    if draft_model is not None and len(cache) > n_main:
+                        draft_model(tokens, cache=cache[n_main:])
+                    # Same state generate_step would have at this offset.
+                    quantize()
+                    mx.eval([c.state for c in cache if c is not None])
+                    done += n
+                    progress(done - n_cached, total)
+                    mx.clear_cache()
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key,
+                    prompt[:end],
+                    copy.deepcopy(cache),
+                    cache_type=seg_type,
+                )
+        return done - n_cached
 
     def _match_draft_slots(self, cache, rest, cache_prompt, use_draft):
         """A cached prompt's slots for this request: a cache without draft
