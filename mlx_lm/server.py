@@ -1127,6 +1127,7 @@ class ResponseGenerator:
                     num_draft_tokens=args.num_draft_tokens,
                     input_embeddings=input_embeddings,
                     prompt_progress_callback=generate_progress,
+                    token_history=prompt[: ctx.prompt_cache_count + n_prefilled],
                     prefill_step_size=self.cli_args.prefill_step_size,
                     prefill_memory_budget=self._prefill_memory_budget(),
                     kv_bits=self.cli_args.kv_bits,
@@ -1169,6 +1170,9 @@ class ResponseGenerator:
             self.prompt_cache.insert_cache(
                 self.model_provider.model_key, cache_key, cache
             )
+            cap = getattr(self.cli_args, "prompt_cache_bytes", None)
+            if cap is not None:
+                self.prompt_cache.trim_to(n_bytes=cap)
 
         except Exception as e:
             rqueue.put(e)
@@ -1187,7 +1191,12 @@ class ResponseGenerator:
         start = self.cli_args.quantized_kv_start
         first = step(n_cached, kv_bits is not None and n_cached >= start)
         last = step(n_prompt, kv_bits is not None and n_prompt >= start)
-        if last < max_step:
+        if last < 128:
+            logging.warning(
+                f"Prefill step down to {last} at {n_prompt} tokens: prefill "
+                "is slow. A larger --prefill-memory-mb gives larger steps."
+            )
+        elif last < max_step:
             logging.info(
                 f"Prefill step {first} at {n_cached} tokens, {last} at "
                 f"{n_prompt} tokens (--prefill-memory-mb {budget >> 20})"
@@ -1252,12 +1261,20 @@ class ResponseGenerator:
                     done += n
                     progress(done - n_cached, total)
                     mx.clear_cache()
+                # The live cache counts against --prompt-cache-bytes too, as
+                # in the batched path.
+                nbytes = sum(c.nbytes for c in cache if c is not None)
+                cap = getattr(cli_args, "prompt_cache_bytes", None)
+                if cap is not None and 2 * nbytes > cap:
+                    continue
                 self.prompt_cache.insert_cache(
                     self.model_provider.model_key,
                     prompt[:end],
                     copy.deepcopy(cache),
                     cache_type=seg_type,
                 )
+                if cap is not None:
+                    self.prompt_cache.trim_to(n_bytes=cap - nbytes)
         return done - n_cached
 
     def _match_draft_slots(self, cache, rest, cache_prompt, use_draft):
@@ -2211,8 +2228,9 @@ def main():
         help="Memory for the attention scores of one prefill step, in MB, "
         "where they are materialized (head dims without a fused kernel, or "
         "a quantized KV cache). The step shrinks as the prompt grows (not "
-        "below 128). 0 keeps --prefill-step-size "
-        f"(default: {DEFAULT_PREFILL_MEMORY_MB})",
+        "below 16). Single-request path only (draft model, MTP, --kv-bits, "
+        "seed, images): batched prefill keeps --prefill-step-size. 0 keeps "
+        f"--prefill-step-size (default: {DEFAULT_PREFILL_MEMORY_MB})",
     )
     parser.add_argument(
         "--prompt-cache-size",

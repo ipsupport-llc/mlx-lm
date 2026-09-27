@@ -37,6 +37,12 @@ class TestAdaptivePrefillStep(unittest.TestCase):
                 # The largest such step.
                 self.assertGreater(16 * 4 * (step + 1) * (offset + step + 1), 512 * MB)
 
+    def test_budget_holds_at_a_long_offset(self):
+        # 200K tokens, 16 heads: the old 128 floor needed about 1.6 GB.
+        step = adaptive_prefill_step(2048, 200_000, 16, 512 * MB)
+        self.assertGreater(step, MIN_PREFILL_STEP)
+        self.assertLessEqual(16 * 4 * step * (200_000 + step), 512 * MB)
+
     def test_step_shrinks_as_the_cache_grows(self):
         steps = [
             adaptive_prefill_step(2048, o, 16, 512 * MB)
@@ -47,7 +53,7 @@ class TestAdaptivePrefillStep(unittest.TestCase):
     def test_bounds(self):
         self.assertEqual(adaptive_prefill_step(2048, 10**7, 64, MB), MIN_PREFILL_STEP)
         # Never above the configured step, even when that is below the minimum.
-        self.assertEqual(adaptive_prefill_step(64, 10**7, 64, MB), 64)
+        self.assertEqual(adaptive_prefill_step(8, 10**7, 64, MB), 8)
         self.assertEqual(adaptive_prefill_step(512, 0, 1, 1 << 40), 512)
 
 

@@ -296,7 +296,7 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
-MIN_PREFILL_STEP = 128
+MIN_PREFILL_STEP = 16
 
 # Head dims mx.fast.scaled_dot_product_attention runs fused (no scores array)
 # for a prefill chunk (query length > 8), MLX 0.32. 192 and 256 are sent to
@@ -415,6 +415,7 @@ def generate_step(
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
     prefill_memory_budget: Optional[int] = None,
+    token_history: Optional[List[int]] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -446,6 +447,8 @@ def generate_step(
         prefill_memory_budget (int, optional): Bytes for the attention scores
           of one prefill chunk: the step shrinks as the cache grows (see
           :func:`adaptive_prefill_step`). Default: ``None`` (fixed step).
+        token_history (List[int], optional): Tokens before ``prompt`` that
+          ``prompt_cache`` already holds. The logits processors see them.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -464,7 +467,7 @@ def generate_step(
             "Either input_embeddings or prompt (or both) must be provided."
         )
 
-    tokens = None
+    tokens = mx.array(token_history, prompt.dtype) if token_history else None
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -1393,6 +1396,8 @@ def stream_generate(
         # The server always passes it (None for text): speculative_generate_step
         # has no such parameter, and every request failed with a TypeError.
         kwargs.pop("input_embeddings", None)
+        # Its logits processors never see the prompt, cached or not.
+        kwargs.pop("token_history", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, stream, **kwargs
         )

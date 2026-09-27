@@ -22,6 +22,7 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
     make_prompt_cache,
 )
+from mlx_lm.sample_utils import make_logits_processors
 from mlx_lm.server import (
     APIHandler,
     GenerationContext,
@@ -657,9 +658,10 @@ class TestServerSingleCheckpoints(unittest.TestCase):
 
     SYSTEM = "You are a helpful assistant. " * 8
 
-    def _serve(self, kv_bits=None):
+    def _serve(self, kv_bits=None, prompt_cache_bytes=None):
         provider = DummyModelProvider(kv_bits=kv_bits, quantized_kv_start=0)
         provider.is_batchable = False
+        provider.cli_args.prompt_cache_bytes = prompt_cache_bytes
         n_layers = len(provider.model.layers)
         provider.model.make_cache = lambda: [
             RotatingKVCache(max_size=16) for _ in range(n_layers)
@@ -682,7 +684,7 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         self.addCleanup(stop)
         return provider, prompt_cache, f"http://localhost:{httpd.server_port}"
 
-    def _chat(self, url, messages, max_tokens=4, content=False):
+    def _chat(self, url, messages, max_tokens=4, content=False, **extra):
         response = requests.post(
             f"{url}/v1/chat/completions",
             json={
@@ -690,6 +692,7 @@ class TestServerSingleCheckpoints(unittest.TestCase):
                 "max_tokens": max_tokens,
                 "temperature": 0.0,
                 "messages": messages,
+                **extra,
             },
         )
         self.assertEqual(response.status_code, 200)
@@ -794,6 +797,56 @@ class TestServerSingleCheckpoints(unittest.TestCase):
                         break
                     tokens.append(t)
                 self.assertEqual(text, tokenizer.decode(tokens))
+
+    def test_penalties_see_the_cached_prompt(self):
+        # A repetition penalty counts the prompt tokens held by the cache
+        # (checkpoint or cache hit) as in a cold run.
+        provider, _, url = self._serve()
+        tokenizer, model = provider.tokenizer, provider.model
+        first = [
+            {"role": "system", "content": self.SYSTEM},
+            {"role": "user", "content": "Say hello hello hello."},
+        ]
+        second = first + [
+            {"role": "assistant", "content": "hello hello hello"},
+            {"role": "user", "content": "Again, hello hello hello."},
+        ]
+        extra = dict(repetition_penalty=1.5, repetition_context_size=200)
+        self._chat(url, first, **extra)
+        cached, text = self._chat(url, second, 16, True, **extra)
+        self.assertGreater(cached, 0)
+
+        prompt = tokenizer.apply_chat_template(second, add_generation_prompt=True)
+        tokens = []
+        for t, _ in generate_step(
+            mx.array(prompt),
+            model,
+            max_tokens=16,
+            logits_processors=make_logits_processors(
+                repetition_penalty=1.5, repetition_context_size=200
+            ),
+        ):
+            if t in tokenizer.eos_token_ids:
+                break
+            tokens.append(t)
+        self.assertEqual(text, tokenizer.decode(tokens))
+
+    def test_prompt_cache_bytes(self):
+        # --prompt-cache-bytes holds in the single path. A checkpoint that
+        # can't fit next to the live cache is not copied.
+        for cap in (1, 1 << 30):
+            with self.subTest(cap=cap):
+                provider, prompt_cache, url = self._serve(prompt_cache_bytes=cap)
+                first = [
+                    {"role": "system", "content": self.SYSTEM},
+                    {"role": "user", "content": "Hello!"},
+                ]
+                self._chat(url, first)
+                self.assertLessEqual(prompt_cache.nbytes, cap)
+                stats = prompt_cache.stats_by_type()
+                n = 0 if cap == 1 else 1
+                self.assertEqual(stats["system"]["n_sequences"], n)
+                self.assertEqual(stats["assistant"]["n_sequences"], n)
 
     def test_trimmable_cache_skips_checkpoints(self):
         self.assertTrue(_stays_trimmable([KVCache(), CacheList(KVCache())]))
