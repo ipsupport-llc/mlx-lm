@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import time
+import types
 import unittest
 from queue import Queue
 from unittest import mock
@@ -12,20 +13,24 @@ from unittest import mock
 import mlx.core as mx
 import requests
 
-from mlx_lm.generate import TextStateMachine
+from mlx_lm.generate import TextStateMachine, generate_step, maybe_quantize_kv_cache
 from mlx_lm.models.cache import (
+    CacheList,
     KVCache,
     QuantizedKVCache,
     QuantizedRotatingKVCache,
     RotatingKVCache,
+    make_prompt_cache,
 )
 from mlx_lm.server import (
     APIHandler,
+    GenerationContext,
     LRUPromptCache,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
     _make_sampler,
+    _stays_trimmable,
 )
 from mlx_lm.tool_parsers import pythonic
 from mlx_lm.utils import load
@@ -677,19 +682,22 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         self.addCleanup(stop)
         return provider, prompt_cache, f"http://localhost:{httpd.server_port}"
 
-    def _chat(self, url, messages):
+    def _chat(self, url, messages, max_tokens=4, content=False):
         response = requests.post(
             f"{url}/v1/chat/completions",
             json={
                 "model": "chat_model",
-                "max_tokens": 4,
+                "max_tokens": max_tokens,
                 "temperature": 0.0,
                 "messages": messages,
             },
         )
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        return body["usage"]["prompt_tokens_details"]["cached_tokens"]
+        cached = body["usage"]["prompt_tokens_details"]["cached_tokens"]
+        if content:
+            return cached, body["choices"][0]["message"]["content"]
+        return cached
 
     def _check_reuse(self, kv_bits=None):
         provider, prompt_cache, url = self._serve(kv_bits)
@@ -737,6 +745,141 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         self.assertLess(len(rest), len(tokens))
         for c in cache:
             self.assertIsInstance(c, QuantizedRotatingKVCache)
+
+    def test_checkpoint_hit_matches_cold_run(self):
+        # The second turn resumes from the user checkpoint. A cold run with
+        # the prefill split at the same points gives the same tokens.
+        for kv_bits in (None, 4):
+            with self.subTest(kv_bits=kv_bits):
+                provider, _, url = self._serve(kv_bits)
+                tokenizer, model = provider.tokenizer, provider.model
+                first = [
+                    {"role": "system", "content": self.SYSTEM},
+                    {"role": "user", "content": "Hello!"},
+                ]
+                second = first + [
+                    {"role": "assistant", "content": "Something else entirely."},
+                    {"role": "user", "content": "Again."},
+                ]
+                self._chat(url, first)
+                cached, text = self._chat(url, second, max_tokens=12, content=True)
+                self.assertGreater(cached, 0)
+
+                prompt = tokenizer.apply_chat_template(
+                    second, add_generation_prompt=True
+                )
+                sys_tokens = tokenizer.apply_chat_template(
+                    first[:1] + [{"role": "user", "content": ""}]
+                )
+                n_system = next(
+                    i for i, (a, b) in enumerate(zip(sys_tokens, prompt)) if a != b
+                )
+                cache = make_prompt_cache(model)
+                done = 0
+                for end in (n_system, cached):
+                    model(mx.array(prompt[done:end])[None], cache=cache)
+                    maybe_quantize_kv_cache(cache, 0, 64, kv_bits)
+                    done = end
+                tokens = []
+                for t, _ in generate_step(
+                    mx.array(prompt[cached:]),
+                    model,
+                    max_tokens=12,
+                    prompt_cache=cache,
+                    kv_bits=kv_bits,
+                    kv_group_size=64,
+                    quantized_kv_start=0,
+                ):
+                    if t in tokenizer.eos_token_ids:
+                        break
+                    tokens.append(t)
+                self.assertEqual(text, tokenizer.decode(tokens))
+
+    def test_trimmable_cache_skips_checkpoints(self):
+        self.assertTrue(_stays_trimmable([KVCache(), CacheList(KVCache())]))
+        self.assertFalse(_stays_trimmable([KVCache(), RotatingKVCache(max_size=16)]))
+        self.assertFalse(_stays_trimmable([CacheList(RotatingKVCache(max_size=16))]))
+
+        gen = self._generator(prefill_step_size=4)
+        n = gen._prefill_checkpoints(
+            _tiny_llama(),
+            None,
+            [KVCache(), KVCache()],
+            2,
+            list(range(40)),
+            0,
+            [list(range(20)), list(range(20, 40))],
+            ["system", "user"],
+            mx.default_stream(mx.default_device()),
+            lambda *_: None,
+            GenerationContext(None, None, None, None, None, None),
+        )
+        self.assertEqual(n, 0)
+        self.assertEqual(len(gen.prompt_cache), 0)
+
+    def test_stop_during_checkpoint_prefill(self):
+        gen = self._generator(prefill_step_size=4)
+        ctx = GenerationContext(None, None, None, None, None, None)
+
+        def progress(done, total):
+            if done > 0:
+                ctx.stop()
+
+        cache = [RotatingKVCache(max_size=16) for _ in range(2)]
+        n = gen._prefill_checkpoints(
+            _tiny_llama(),
+            None,
+            cache,
+            2,
+            list(range(40)),
+            0,
+            [list(range(20)), list(range(20, 40))],
+            ["system", "user"],
+            mx.default_stream(mx.default_device()),
+            progress,
+            ctx,
+        )
+        self.assertIsNone(n)
+        self.assertEqual(len(gen.prompt_cache), 0)
+        self.assertEqual(cache[0].offset, 4)
+
+    def _generator(self, prefill_step_size):
+        gen = object.__new__(ResponseGenerator)
+        gen.model_provider = types.SimpleNamespace(
+            model_key="tiny",
+            cli_args=types.SimpleNamespace(
+                prefill_step_size=prefill_step_size,
+                prefill_memory_mb=512,
+                kv_bits=None,
+                kv_group_size=64,
+                quantized_kv_start=0,
+            ),
+        )
+        gen.prompt_cache = LRUPromptCache()
+        gen._is_distributed = False
+        return gen
+
+
+def _tiny_llama():
+    from mlx_lm.models import llama
+
+    mx.random.seed(0)
+    model = llama.Model(
+        llama.ModelArgs(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            rope_theta=10000.0,
+            tie_word_embeddings=True,
+        )
+    )
+    mx.eval(model.parameters())
+    return model
 
 
 class TestKeepalive(unittest.TestCase):

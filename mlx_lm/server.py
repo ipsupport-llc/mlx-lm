@@ -38,15 +38,21 @@ from .generate import (
     BatchGenerator,
     TextStateMachine,
     _model_supports_nemotron_h_mtp,
-    adaptive_prefill_step,
-    attention_heads,
+    kv_cache_quantized,
+    make_prefill_step,
     make_stop_sequences,
     make_text_state_machine,
     maybe_quantize_kv_cache,
     stream_generate,
     wired_limit,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import (
+    CacheList,
+    LRUPromptCache,
+    QuantizedRotatingKVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 
 DEFAULT_PREFILL_MEMORY_MB = 512
 from .multimodal import extract_images, load_image_inputs
@@ -58,6 +64,20 @@ from .utils import (
     maybe_set_recommended_wired_limit,
     sharded_load,
 )
+
+
+def _stays_trimmable(cache):
+    """Trimmable now and for any length (a sliding window stops being
+    trimmable once it is full)."""
+
+    def ok(c):
+        if isinstance(c, CacheList):
+            return all(ok(x) for x in c.caches)
+        return c.is_trimmable() and not isinstance(
+            c, (RotatingKVCache, QuantizedRotatingKVCache)
+        )
+
+    return all(ok(c) for c in cache if c is not None)
 
 
 def get_system_fingerprint():
@@ -1074,7 +1094,11 @@ class ResponseGenerator:
                     segment_types,
                     stream,
                     progress,
+                    ctx,
                 )
+                if n_prefilled is None:
+                    rqueue.put(None)
+                    return
                 rest = rest[n_prefilled:]
 
             def generate_progress(processed, total):
@@ -1158,9 +1182,11 @@ class ResponseGenerator:
         max_step = self.cli_args.prefill_step_size
         if budget is None or n_prompt - n_cached <= 1:
             return
-        n_heads = attention_heads(model)
-        first = adaptive_prefill_step(max_step, n_cached, n_heads, budget)
-        last = adaptive_prefill_step(max_step, n_prompt, n_heads, budget)
+        step = make_prefill_step(model, max_step, budget)
+        kv_bits = self.cli_args.kv_bits
+        start = self.cli_args.quantized_kv_start
+        first = step(n_cached, kv_bits is not None and n_cached >= start)
+        last = step(n_prompt, kv_bits is not None and n_prompt >= start)
         if last < max_step:
             logging.info(
                 f"Prefill step {first} at {n_cached} tokens, {last} at "
@@ -1179,10 +1205,16 @@ class ResponseGenerator:
         segment_types,
         stream,
         progress,
+        ctx,
     ):
         """Prefill `prompt[n_cached:]` up to the end of each system / user
         segment and insert a copy of the cache there. The last prompt token
-        is left for generation. Return the number of tokens prefilled."""
+        is left for generation. Return the number of tokens prefilled, or
+        None if the request was stopped."""
+        # Such a cache is trimmed back from the full sequence on the next
+        # turn, and insert_cache drops its prefixes anyway.
+        if _stays_trimmable(cache):
+            return 0
         ends = []
         end = 0
         for seg, seg_type in zip(segments, segment_types):
@@ -1197,17 +1229,18 @@ class ResponseGenerator:
         quantize = lambda: maybe_quantize_kv_cache(
             cache, cli_args.quantized_kv_start, cli_args.kv_group_size, cli_args.kv_bits
         )
-        budget = self._prefill_memory_budget()
-        n_heads = attention_heads(model)
+        prefill_step = make_prefill_step(
+            model, cli_args.prefill_step_size, self._prefill_memory_budget()
+        )
         total = len(prompt) - n_cached
         done = n_cached
         with wired_limit(model, [stream]), mx.stream(stream):
             progress(0, total)
             for end, seg_type in ends:
                 while done < end:
-                    step = adaptive_prefill_step(
-                        cli_args.prefill_step_size, done, n_heads, budget
-                    )
+                    if ctx._should_stop and not self._is_distributed:
+                        return None
+                    step = prefill_step(done, kv_cache_quantized(cache))
                     n = min(step, end - done)
                     tokens = mx.array(prompt[done : done + n])[None]
                     model(tokens, cache=cache[:n_main])
@@ -2175,9 +2208,11 @@ def main():
         "--prefill-memory-mb",
         type=int,
         default=DEFAULT_PREFILL_MEMORY_MB,
-        help="Memory for the attention scores of one prefill step, in MB. "
-        "The step shrinks as the prompt grows (not below 128). 0 keeps "
-        f"--prefill-step-size (default: {DEFAULT_PREFILL_MEMORY_MB})",
+        help="Memory for the attention scores of one prefill step, in MB, "
+        "where they are materialized (head dims without a fused kernel, or "
+        "a quantized KV cache). The step shrinks as the prompt grows (not "
+        "below 128). 0 keeps --prefill-step-size "
+        f"(default: {DEFAULT_PREFILL_MEMORY_MB})",
     )
     parser.add_argument(
         "--prompt-cache-size",

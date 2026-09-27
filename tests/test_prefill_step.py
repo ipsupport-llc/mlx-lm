@@ -8,9 +8,10 @@ import mlx.core as mx
 from mlx_lm.generate import (
     MIN_PREFILL_STEP,
     adaptive_prefill_step,
-    attention_heads,
+    attention_scores_heads,
     gemma4_mtp_generate_step,
     generate_step,
+    make_prefill_step,
     nemotron_h_mtp_generate_step,
 )
 from mlx_lm.models import llama, nemotron_h
@@ -32,9 +33,9 @@ class TestAdaptivePrefillStep(unittest.TestCase):
             step = adaptive_prefill_step(2048, offset, 16, 512 * MB)
             self.assertLess(step, 2048)
             if step > MIN_PREFILL_STEP:
-                self.assertLessEqual(16 * 2 * step * (offset + step), 512 * MB)
+                self.assertLessEqual(16 * 4 * step * (offset + step), 512 * MB)
                 # The largest such step.
-                self.assertGreater(16 * 2 * (step + 1) * (offset + step + 1), 512 * MB)
+                self.assertGreater(16 * 4 * (step + 1) * (offset + step + 1), 512 * MB)
 
     def test_step_shrinks_as_the_cache_grows(self):
         steps = [
@@ -50,28 +51,76 @@ class TestAdaptivePrefillStep(unittest.TestCase):
         self.assertEqual(adaptive_prefill_step(512, 0, 1, 1 << 40), 512)
 
 
-class TestAttentionHeads(unittest.TestCase):
-    def test_model_args(self):
-        model = types.SimpleNamespace(
-            args=types.SimpleNamespace(num_attention_heads=16)
-        )
-        self.assertEqual(attention_heads(model), 16)
+def _model(**args):
+    return types.SimpleNamespace(args=types.SimpleNamespace(**args))
 
-    def test_language_model_and_text_config(self):
-        wrapper = types.SimpleNamespace(
-            args=types.SimpleNamespace(text_config={"num_attention_heads": 8}),
+
+class TestAttentionScoresHeads(unittest.TestCase):
+    def test_fused_head_dims(self):
+        for head_dim in (64, 80, 128):
+            model = _model(num_attention_heads=16, head_dim=head_dim)
+            self.assertEqual(attention_scores_heads(model), (16, True))
+        # hidden_size // heads
+        model = _model(num_attention_heads=32, hidden_size=4096)
+        self.assertEqual(attention_scores_heads(model), (32, True))
+
+    def test_unfused_head_dims(self):
+        for head_dim in (8, 192, 256, 512):
+            model = _model(num_attention_heads=16, head_dim=head_dim)
+            self.assertEqual(attention_scores_heads(model), (16, False))
+        # MLA: query 192, value 128
+        model = _model(
+            num_attention_heads=16,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
         )
-        self.assertEqual(attention_heads(wrapper), 8)
-        nested = types.SimpleNamespace(
+        self.assertEqual(attention_scores_heads(model), (16, False))
+        # Unknown head dim: counted as unfused.
+        self.assertEqual(
+            attention_scores_heads(_model(num_attention_heads=8)), (8, False)
+        )
+
+    def test_gemma4_full_layers(self):
+        # The full-attention layers use global_head_dim (512: unfused).
+        wrapper = types.SimpleNamespace(
             args=types.SimpleNamespace(),
-            language_model=types.SimpleNamespace(
-                args=types.SimpleNamespace(num_attention_heads=12)
+            language_model=_model(
+                num_attention_heads=16, head_dim=256, global_head_dim=512
             ),
         )
-        self.assertEqual(attention_heads(nested), 12)
+        self.assertEqual(attention_scores_heads(wrapper), (16, False))
+        wrapper = _model(text_config={"num_attention_heads": 8, "head_dim": 128})
+        self.assertEqual(attention_scores_heads(wrapper), (8, True))
 
-    def test_unknown(self):
-        self.assertEqual(attention_heads(types.SimpleNamespace()), 32)
+    def test_no_attention(self):
+        self.assertEqual(attention_scores_heads(types.SimpleNamespace()), (0, True))
+        self.assertEqual(attention_scores_heads(_model(hidden_size=64)), (0, True))
+
+
+class TestMakePrefillStep(unittest.TestCase):
+    def test_fused_shrinks_only_when_quantized(self):
+        step = make_prefill_step(
+            _model(num_attention_heads=16, head_dim=128), 2048, 512 * MB
+        )
+        self.assertEqual(step(59720, False), 2048)
+        self.assertEqual(
+            step(59720, True), adaptive_prefill_step(2048, 59720, 16, 512 * MB)
+        )
+
+    def test_unfused_shrinks(self):
+        step = make_prefill_step(
+            _model(num_attention_heads=16, head_dim=512), 2048, 512 * MB
+        )
+        self.assertLess(step(59720, False), 2048)
+
+    def test_no_budget_or_no_attention(self):
+        unfused = _model(num_attention_heads=16, head_dim=512)
+        self.assertEqual(make_prefill_step(unfused, 2048, None)(59720, True), 2048)
+        self.assertEqual(
+            make_prefill_step(types.SimpleNamespace(), 2048, 512 * MB)(59720, True),
+            2048,
+        )
 
 
 class TestGenerateStepBudget(unittest.TestCase):
@@ -127,7 +176,7 @@ def _steps(progress):
 
 
 class TestMTPStepBudget(unittest.TestCase):
-    """The MTP prefill loops shrink the step too; tokens don't change."""
+    """The MTP prefill loops use the budget too; tokens don't change."""
 
     BUDGET = 4 * 2 * 256 * 512
 
@@ -177,7 +226,28 @@ class TestMTPStepBudget(unittest.TestCase):
         ]
         self.assertEqual(out, ref)
         self.assertEqual(seen[-1], (900, 900))
-        self.assertLess(max(_steps(seen)), 512)
+        # head_dim 32 / 64: the fused kernel, no scores array.
+        self.assertEqual(_steps(seen)[0], 512)
+
+        # A quantized cache uses the unfused quantized SDPA.
+        seen = []
+        for _ in gemma4_mtp_generate_step(
+            prompt,
+            model,
+            _drafter(),
+            max_tokens=4,
+            prefill_step_size=512,
+            prompt_progress_callback=lambda p, n: seen.append((p, n)),
+            prefill_memory_budget=self.BUDGET,
+            kv_bits=4,
+            kv_group_size=32,
+            quantized_kv_start=0,
+        ):
+            pass
+        self.assertEqual(seen[-1], (900, 900))
+        steps = _steps(seen)
+        self.assertEqual(steps[0], 512)  # offset 0: not quantized yet
+        self.assertLess(max(steps[1:]), 512)
 
 
 if __name__ == "__main__":

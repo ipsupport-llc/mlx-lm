@@ -298,13 +298,18 @@ class GenerationResponse:
 
 MIN_PREFILL_STEP = 128
 
+# Head dims mx.fast.scaled_dot_product_attention runs fused (no scores array)
+# for a prefill chunk (query length > 8), MLX 0.32. 192 and 256 are sent to
+# the unfused path in most cases.
+_FUSED_PREFILL_HEAD_DIMS = (64, 72, 80, 96, 128)
+
 
 def adaptive_prefill_step(
     max_step: int,
     offset: int,
     n_heads: int,
     budget_bytes: Optional[int],
-    score_bytes: int = 2,
+    score_bytes: int = 4,
     min_step: int = MIN_PREFILL_STEP,
 ) -> int:
     """The largest prefill chunk whose attention scores
@@ -312,30 +317,71 @@ def adaptive_prefill_step(
     layer) fit in ``budget_bytes``, clamped to
     ``[min(min_step, max_step), max_step]``. The scores grow with the cache
     offset: a fixed step runs out of memory on a long prompt. A
-    ``budget_bytes`` of ``None`` or 0 keeps ``max_step``.
+    ``budget_bytes`` of ``None`` or 0, or ``n_heads`` 0, keeps ``max_step``.
     """
-    if not budget_bytes:
+    if not budget_bytes or n_heads <= 0:
         return max_step
-    limit = budget_bytes / (max(n_heads, 1) * score_bytes)
+    limit = budget_bytes / (n_heads * score_bytes)
     # Positive root of step^2 + offset * step - limit = 0.
     step = int((math.sqrt(offset * offset + 4 * limit) - offset) / 2)
     return max(min(min_step, max_step), min(max_step, step))
 
 
-def attention_heads(model: nn.Module) -> int:
-    """Number of query heads per attention layer (32 if not known)."""
+def _text_args(model):
     for m in (model, getattr(model, "language_model", None)):
         args = getattr(m, "args", None)
         for a in (args, getattr(args, "text_config", None)):
-            if isinstance(a, dict):
-                n = a.get("num_attention_heads")
-            else:
-                n = getattr(a, "num_attention_heads", None)
-            if isinstance(n, (list, tuple)):
-                n = max(n, default=None)
-            if isinstance(n, int) and n > 0:
-                return n
-    return 32
+            a = a if isinstance(a, dict) else getattr(a, "__dict__", {})
+            if a.get("num_attention_heads"):
+                return a
+    return None
+
+
+def attention_scores_heads(model: nn.Module) -> Tuple[int, bool]:
+    """``(n_heads, fused)`` for the full-attention layers of ``model``:
+    ``fused`` is True when the fused SDPA kernel serves their prefill (no
+    scores array unless the KV cache is quantized). A model with no
+    ``num_attention_heads`` in its config (e.g. pure SSM) gives ``(0, True)``:
+    no step limit. A known head count with an unknown head dim counts as
+    unfused."""
+    a = _text_args(model)
+    if a is None:
+        return 0, True
+    n_heads = a["num_attention_heads"]
+    if isinstance(n_heads, (list, tuple)):
+        n_heads = max(n_heads)
+    if a.get("qk_nope_head_dim") is not None and a.get("qk_rope_head_dim") is not None:
+        q_dim = a["qk_nope_head_dim"] + a["qk_rope_head_dim"]
+    else:
+        q_dim = a.get("global_head_dim") or a.get("head_dim")
+        if not q_dim and a.get("hidden_size"):
+            q_dim = a["hidden_size"] // n_heads
+    v_dim = a.get("v_head_dim") or q_dim
+    fused = q_dim == v_dim and q_dim in _FUSED_PREFILL_HEAD_DIMS
+    return n_heads, fused
+
+
+def kv_cache_quantized(cache) -> bool:
+    return any(hasattr(c, "bits") for c in cache if c is not None)
+
+
+def make_prefill_step(
+    model: nn.Module, max_step: int, budget_bytes: Optional[int]
+) -> Callable[[int, bool], int]:
+    """``step(offset, quantized)``: the prefill step for a chunk at
+    ``offset``. It is limited by ``budget_bytes`` only where the scores are
+    materialized: unfused head dims, or a quantized KV cache (quantized
+    SDPA)."""
+    n_heads, fused = attention_scores_heads(model)
+    if not budget_bytes or n_heads == 0:
+        return lambda offset, quantized: max_step
+
+    def step(offset, quantized):
+        if fused and not quantized:
+            return max_step
+        return adaptive_prefill_step(max_step, offset, n_heads, budget_bytes)
+
+    return step
 
 
 def _cache_offset(cache) -> int:
@@ -485,14 +531,13 @@ def generate_step(
         # other in both directions). Positions count what the cache holds.
         chunk_size = getattr(model, "prefill_chunk_size", None)
         cached = _cache_offset(prompt_cache)
-        n_heads = attention_heads(model)
+        prefill_step = make_prefill_step(
+            model, prefill_step_size, prefill_memory_budget
+        )
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-            step = adaptive_prefill_step(
-                prefill_step_size,
-                cached + prompt_processed_tokens,
-                n_heads,
-                prefill_memory_budget,
+            step = prefill_step(
+                cached + prompt_processed_tokens, kv_cache_quantized(prompt_cache)
             )
             n_to_process = min(step, remaining)
             if chunk_size is not None:
@@ -651,11 +696,11 @@ def speculative_generate_step(
             return _process_and_sample(None, logits.squeeze(0))
 
     def _prefill(model, cache, y):
-        n_heads = attention_heads(model)
+        prefill_step = make_prefill_step(
+            model, prefill_step_size, prefill_memory_budget
+        )
         while y.size > 1:
-            step = adaptive_prefill_step(
-                prefill_step_size, _cache_offset(cache), n_heads, prefill_memory_budget
-            )
+            step = prefill_step(_cache_offset(cache), kv_cache_quantized(cache))
             n_to_process = min(step, y.size - 1)
             model(y[:n_to_process][None], cache=cache)
             quantize_cache_fn(cache)
@@ -854,13 +899,11 @@ def nemotron_h_mtp_generate_step(
     if prompt_progress_callback is None:
         prompt_progress_callback = lambda *_: None
     total = len(prompt)
-    n_heads = attention_heads(model)
+    prefill_step = make_prefill_step(model, prefill_step_size, prefill_memory_budget)
     cached = _cache_offset([c for c in model_cache if c is not None])
 
     def _step():
-        return adaptive_prefill_step(
-            prefill_step_size, cached + done, n_heads, prefill_memory_budget
-        )
+        return prefill_step(cached + done, kv_cache_quantized(model_cache))
 
     with mx.stream(stream):
         done = 0
@@ -1113,11 +1156,11 @@ def gemma4_mtp_generate_step(
         total = len(prompt)
         done = 0
         prompt_progress_callback(done, total)
-        n_heads = attention_heads(model)
+        prefill_step = make_prefill_step(
+            model, prefill_step_size, prefill_memory_budget
+        )
         while total - done > 1:
-            step = adaptive_prefill_step(
-                prefill_step_size, base + done, n_heads, prefill_memory_budget
-            )
+            step = prefill_step(base + done, kv_cache_quantized(cache))
             n = min(step, total - done - 1)
             text(prompt[done : done + n][None], cache=cache)
             quantize_cache_fn(cache)
