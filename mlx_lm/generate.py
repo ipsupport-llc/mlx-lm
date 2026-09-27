@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import math
 import sys
 import time
 from collections import deque
@@ -295,6 +296,100 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
+MIN_PREFILL_STEP = 16
+
+# Head dims mx.fast.scaled_dot_product_attention runs fused (no scores array)
+# for a prefill chunk (query length > 8), MLX 0.32. 192 and 256 are sent to
+# the unfused path in most cases.
+_FUSED_PREFILL_HEAD_DIMS = (64, 72, 80, 96, 128)
+
+
+def adaptive_prefill_step(
+    max_step: int,
+    offset: int,
+    n_heads: int,
+    budget_bytes: Optional[int],
+    score_bytes: int = 4,
+    min_step: int = MIN_PREFILL_STEP,
+) -> int:
+    """The largest prefill chunk whose attention scores
+    (``n_heads x step x (offset + step)`` of ``score_bytes``, one array of a
+    layer) fit in ``budget_bytes``, clamped to
+    ``[min(min_step, max_step), max_step]``. The scores grow with the cache
+    offset: a fixed step runs out of memory on a long prompt. A
+    ``budget_bytes`` of ``None`` or 0, or ``n_heads`` 0, keeps ``max_step``.
+    """
+    if not budget_bytes or n_heads <= 0:
+        return max_step
+    limit = budget_bytes / (n_heads * score_bytes)
+    # Positive root of step^2 + offset * step - limit = 0.
+    step = int((math.sqrt(offset * offset + 4 * limit) - offset) / 2)
+    return max(min(min_step, max_step), min(max_step, step))
+
+
+def _text_args(model):
+    for m in (model, getattr(model, "language_model", None)):
+        args = getattr(m, "args", None)
+        for a in (args, getattr(args, "text_config", None)):
+            a = a if isinstance(a, dict) else getattr(a, "__dict__", {})
+            if a.get("num_attention_heads"):
+                return a
+    return None
+
+
+def attention_scores_heads(model: nn.Module) -> Tuple[int, bool]:
+    """``(n_heads, fused)`` for the full-attention layers of ``model``:
+    ``fused`` is True when the fused SDPA kernel serves their prefill (no
+    scores array unless the KV cache is quantized). A model with no
+    ``num_attention_heads`` in its config (e.g. pure SSM) gives ``(0, True)``:
+    no step limit. A known head count with an unknown head dim counts as
+    unfused."""
+    a = _text_args(model)
+    if a is None:
+        return 0, True
+    n_heads = a["num_attention_heads"]
+    if isinstance(n_heads, (list, tuple)):
+        n_heads = max(n_heads)
+    if a.get("qk_nope_head_dim") is not None and a.get("qk_rope_head_dim") is not None:
+        q_dim = a["qk_nope_head_dim"] + a["qk_rope_head_dim"]
+    else:
+        q_dim = a.get("global_head_dim") or a.get("head_dim")
+        if not q_dim and a.get("hidden_size"):
+            q_dim = a["hidden_size"] // n_heads
+    v_dim = a.get("v_head_dim") or q_dim
+    fused = q_dim == v_dim and q_dim in _FUSED_PREFILL_HEAD_DIMS
+    return n_heads, fused
+
+
+def kv_cache_quantized(cache) -> bool:
+    return any(hasattr(c, "bits") for c in cache if c is not None)
+
+
+def make_prefill_step(
+    model: nn.Module, max_step: int, budget_bytes: Optional[int]
+) -> Callable[[int, bool], int]:
+    """``step(offset, quantized)``: the prefill step for a chunk at
+    ``offset``. It is limited by ``budget_bytes`` only where the scores are
+    materialized: unfused head dims, or a quantized KV cache (quantized
+    SDPA)."""
+    n_heads, fused = attention_scores_heads(model)
+    if not budget_bytes or n_heads == 0:
+        return lambda offset, quantized: max_step
+
+    def step(offset, quantized):
+        if fused and not quantized:
+            return max_step
+        return adaptive_prefill_step(max_step, offset, n_heads, budget_bytes)
+
+    return step
+
+
+def _cache_offset(cache) -> int:
+    return next(
+        (c.offset for c in cache if getattr(c, "offset", None) is not None), 0
+    )
+
+
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
@@ -319,6 +414,8 @@ def generate_step(
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    prefill_memory_budget: Optional[int] = None,
+    token_history: Optional[List[int]] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -347,6 +444,11 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        prefill_memory_budget (int, optional): Bytes for the attention scores
+          of one prefill chunk: the step shrinks as the cache grows (see
+          :func:`adaptive_prefill_step`). Default: ``None`` (fixed step).
+        token_history (List[int], optional): Tokens before ``prompt`` that
+          ``prompt_cache`` already holds. The logits processors see them.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -365,7 +467,7 @@ def generate_step(
             "Either input_embeddings or prompt (or both) must be provided."
         )
 
-    tokens = None
+    tokens = mx.array(token_history, prompt.dtype) if token_history else None
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -431,12 +533,16 @@ def generate_step(
         # processed in one pass (Gemma 4: an image's tokens attend to each
         # other in both directions). Positions count what the cache holds.
         chunk_size = getattr(model, "prefill_chunk_size", None)
-        cached = next(
-            (c.offset for c in prompt_cache if getattr(c, "offset", None) is not None), 0
+        cached = _cache_offset(prompt_cache)
+        prefill_step = make_prefill_step(
+            model, prefill_step_size, prefill_memory_budget
         )
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-            n_to_process = min(prefill_step_size, remaining)
+            step = prefill_step(
+                cached + prompt_processed_tokens, kv_cache_quantized(prompt_cache)
+            )
+            n_to_process = min(step, remaining)
             if chunk_size is not None:
                 n_to_process = max(
                     1, min(chunk_size(cached + prompt_processed_tokens, n_to_process), remaining)
@@ -501,6 +607,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
+    prefill_memory_budget: Optional[int] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -592,8 +699,12 @@ def speculative_generate_step(
             return _process_and_sample(None, logits.squeeze(0))
 
     def _prefill(model, cache, y):
+        prefill_step = make_prefill_step(
+            model, prefill_step_size, prefill_memory_budget
+        )
         while y.size > 1:
-            n_to_process = min(prefill_step_size, y.size - 1)
+            step = prefill_step(_cache_offset(cache), kv_cache_quantized(cache))
+            n_to_process = min(step, y.size - 1)
             model(y[:n_to_process][None], cache=cache)
             quantize_cache_fn(cache)
             mx.eval([c.state for c in cache])
@@ -734,6 +845,7 @@ def nemotron_h_mtp_generate_step(
     prefill_step_size: int = 2048,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
+    prefill_memory_budget: Optional[int] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding using Nemotron-H's in-checkpoint MTP head.
 
@@ -790,14 +902,20 @@ def nemotron_h_mtp_generate_step(
     if prompt_progress_callback is None:
         prompt_progress_callback = lambda *_: None
     total = len(prompt)
+    prefill_step = make_prefill_step(model, prefill_step_size, prefill_memory_budget)
+    cached = _cache_offset([c for c in model_cache if c is not None])
+
+    def _step():
+        return prefill_step(cached + done, kv_cache_quantized(model_cache))
+
     with mx.stream(stream):
         done = 0
         prompt_progress_callback(done, total)
-        while total - done > prefill_step_size:
-            model.backbone(prompt[done : done + prefill_step_size][None], cache=model_cache)
+        while total - done > (step := _step()):
+            model.backbone(prompt[done : done + step][None], cache=model_cache)
             quantize_cache_fn(model_cache)
             mx.eval([c.state for c in model_cache if c is not None])
-            done += prefill_step_size
+            done += step
             prompt_progress_callback(done, total)
             mx.clear_cache()
         hidden = model.backbone(prompt[done:][None], cache=model_cache)
@@ -963,6 +1081,7 @@ def gemma4_mtp_generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    prefill_memory_budget: Optional[int] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Speculative decoding for Gemma 4 with its MTP drafter
     (``gemma4_assistant``, e.g. google/gemma-4-26B-A4B-it-assistant).
@@ -1040,8 +1159,12 @@ def gemma4_mtp_generate_step(
         total = len(prompt)
         done = 0
         prompt_progress_callback(done, total)
+        prefill_step = make_prefill_step(
+            model, prefill_step_size, prefill_memory_budget
+        )
         while total - done > 1:
-            n = min(prefill_step_size, total - done - 1)
+            step = prefill_step(base + done, kv_cache_quantized(cache))
+            n = min(step, total - done - 1)
             text(prompt[done : done + n][None], cache=cache)
             quantize_cache_fn(cache)
             mx.eval([c.state for c in cache])
@@ -1210,6 +1333,7 @@ def stream_generate(
                 prefill_step_size=kwargs.get("prefill_step_size", 2048),
                 prompt_progress_callback=kwargs.get("prompt_progress_callback"),
                 stream=stream,
+                prefill_memory_budget=kwargs.get("prefill_memory_budget"),
             )
         else:
             token_generator = generate_step(prompt, model, stream, **kwargs)
@@ -1248,6 +1372,7 @@ def stream_generate(
                         "kv_group_size",
                         "quantized_kv_start",
                         "prompt_progress_callback",
+                        "prefill_memory_budget",
                     )
                 },
             )
@@ -1271,6 +1396,8 @@ def stream_generate(
         # The server always passes it (None for text): speculative_generate_step
         # has no such parameter, and every request failed with a TypeError.
         kwargs.pop("input_embeddings", None)
+        # Its logits processors never see the prompt, cached or not.
+        kwargs.pop("token_history", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, stream, **kwargs
         )

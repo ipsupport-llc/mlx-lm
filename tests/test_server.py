@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import time
+import types
 import unittest
 from queue import Queue
 from unittest import mock
@@ -12,10 +13,20 @@ from unittest import mock
 import mlx.core as mx
 import requests
 
-from mlx_lm.generate import TextStateMachine
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.generate import TextStateMachine, generate_step, maybe_quantize_kv_cache
+from mlx_lm.models.cache import (
+    CacheList,
+    KVCache,
+    QuantizedKVCache,
+    QuantizedRotatingKVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+    stays_trimmable,
+)
+from mlx_lm.sample_utils import make_logits_processors
 from mlx_lm.server import (
     APIHandler,
+    GenerationContext,
     LRUPromptCache,
     ResponseGenerator,
     SamplingArguments,
@@ -640,6 +651,290 @@ class TestServerWithoutKVCacheQuantization(unittest.TestCase):
             response_generator.stop_and_join()
 
 
+class TestServerSingleCheckpoints(unittest.TestCase):
+    """The single-request path saves system / user checkpoints. A sliding
+    window cache can't be trimmed back from the whole sequence, so without
+    them a turn whose history differs from the cached answer reused nothing."""
+
+    SYSTEM = "You are a helpful assistant. " * 8
+
+    def _serve(self, kv_bits=None, prompt_cache_bytes=None):
+        provider = DummyModelProvider(kv_bits=kv_bits, quantized_kv_start=0)
+        provider.is_batchable = False
+        provider.cli_args.prompt_cache_bytes = prompt_cache_bytes
+        n_layers = len(provider.model.layers)
+        provider.model.make_cache = lambda: [
+            RotatingKVCache(max_size=16) for _ in range(n_layers)
+        ]
+        prompt_cache = LRUPromptCache()
+        generator = ResponseGenerator(provider, prompt_cache)
+        httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(generator, *args, **kwargs),
+        )
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join()
+            generator.stop_and_join()
+
+        self.addCleanup(stop)
+        return provider, prompt_cache, f"http://localhost:{httpd.server_port}"
+
+    def _chat(self, url, messages, max_tokens=4, content=False, **extra):
+        response = requests.post(
+            f"{url}/v1/chat/completions",
+            json={
+                "model": "chat_model",
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "messages": messages,
+                **extra,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        cached = body["usage"]["prompt_tokens_details"]["cached_tokens"]
+        if content:
+            return cached, body["choices"][0]["message"]["content"]
+        return cached
+
+    def _check_reuse(self, kv_bits=None):
+        provider, prompt_cache, url = self._serve(kv_bits)
+        first = [
+            {"role": "system", "content": self.SYSTEM},
+            {"role": "user", "content": "Hello!"},
+        ]
+        tokenizer = provider.tokenizer
+        prompt = tokenizer.apply_chat_template(first, add_generation_prompt=True)
+        sys_tokens = tokenizer.apply_chat_template(
+            first[:1] + [{"role": "user", "content": ""}]
+        )
+        n_system = next(i for i, (a, b) in enumerate(zip(sys_tokens, prompt)) if a != b)
+        self.assertGreater(n_system, 16)
+
+        self.assertEqual(self._chat(url, first), 0)
+        second = first + [
+            {"role": "assistant", "content": "Something else entirely."},
+            {"role": "user", "content": "Again."},
+        ]
+        cached = self._chat(url, second)
+        self.assertGreaterEqual(cached, n_system)
+        # The user checkpoint holds the whole first prompt but its last token.
+        self.assertEqual(cached, len(prompt) - 1)
+
+        # A new user turn under the same system prompt reuses the system part.
+        other = [first[0], {"role": "user", "content": "Different question?"}]
+        self.assertGreaterEqual(self._chat(url, other), n_system)
+        return prompt_cache, provider
+
+    def test_checkpoints_are_reused(self):
+        self._check_reuse()
+
+    def test_checkpoints_with_quantized_kv(self):
+        prompt_cache, provider = self._check_reuse(kv_bits=4)
+        tokens = provider.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": self.SYSTEM},
+                {"role": "user", "content": "Hi"},
+            ],
+            add_generation_prompt=True,
+        )
+        cache, rest = prompt_cache.fetch_nearest_cache(provider.model_key, tokens)
+        self.assertIsNotNone(cache)
+        self.assertLess(len(rest), len(tokens))
+        for c in cache:
+            self.assertIsInstance(c, QuantizedRotatingKVCache)
+
+    def test_checkpoint_hit_matches_cold_run(self):
+        # The second turn resumes from the user checkpoint. A cold run with
+        # the prefill split at the same points gives the same tokens.
+        for kv_bits in (None, 4):
+            with self.subTest(kv_bits=kv_bits):
+                provider, _, url = self._serve(kv_bits)
+                tokenizer, model = provider.tokenizer, provider.model
+                first = [
+                    {"role": "system", "content": self.SYSTEM},
+                    {"role": "user", "content": "Hello!"},
+                ]
+                second = first + [
+                    {"role": "assistant", "content": "Something else entirely."},
+                    {"role": "user", "content": "Again."},
+                ]
+                self._chat(url, first)
+                cached, text = self._chat(url, second, max_tokens=12, content=True)
+                self.assertGreater(cached, 0)
+
+                prompt = tokenizer.apply_chat_template(
+                    second, add_generation_prompt=True
+                )
+                sys_tokens = tokenizer.apply_chat_template(
+                    first[:1] + [{"role": "user", "content": ""}]
+                )
+                n_system = next(
+                    i for i, (a, b) in enumerate(zip(sys_tokens, prompt)) if a != b
+                )
+                cache = make_prompt_cache(model)
+                done = 0
+                for end in (n_system, cached):
+                    model(mx.array(prompt[done:end])[None], cache=cache)
+                    maybe_quantize_kv_cache(cache, 0, 64, kv_bits)
+                    done = end
+                tokens = []
+                for t, _ in generate_step(
+                    mx.array(prompt[cached:]),
+                    model,
+                    max_tokens=12,
+                    prompt_cache=cache,
+                    kv_bits=kv_bits,
+                    kv_group_size=64,
+                    quantized_kv_start=0,
+                ):
+                    if t in tokenizer.eos_token_ids:
+                        break
+                    tokens.append(t)
+                self.assertEqual(text, tokenizer.decode(tokens))
+
+    def test_penalties_see_the_cached_prompt(self):
+        # A repetition penalty counts the prompt tokens held by the cache
+        # (checkpoint or cache hit) as in a cold run.
+        provider, _, url = self._serve()
+        tokenizer, model = provider.tokenizer, provider.model
+        first = [
+            {"role": "system", "content": self.SYSTEM},
+            {"role": "user", "content": "Say hello hello hello."},
+        ]
+        second = first + [
+            {"role": "assistant", "content": "hello hello hello"},
+            {"role": "user", "content": "Again, hello hello hello."},
+        ]
+        extra = dict(repetition_penalty=1.5, repetition_context_size=200)
+        self._chat(url, first, **extra)
+        cached, text = self._chat(url, second, 16, True, **extra)
+        self.assertGreater(cached, 0)
+
+        prompt = tokenizer.apply_chat_template(second, add_generation_prompt=True)
+        tokens = []
+        for t, _ in generate_step(
+            mx.array(prompt),
+            model,
+            max_tokens=16,
+            logits_processors=make_logits_processors(
+                repetition_penalty=1.5, repetition_context_size=200
+            ),
+        ):
+            if t in tokenizer.eos_token_ids:
+                break
+            tokens.append(t)
+        self.assertEqual(text, tokenizer.decode(tokens))
+
+    def test_prompt_cache_bytes(self):
+        # --prompt-cache-bytes holds in the single path. A checkpoint that
+        # can't fit next to the live cache is not copied.
+        for cap in (1, 1 << 30):
+            with self.subTest(cap=cap):
+                provider, prompt_cache, url = self._serve(prompt_cache_bytes=cap)
+                first = [
+                    {"role": "system", "content": self.SYSTEM},
+                    {"role": "user", "content": "Hello!"},
+                ]
+                self._chat(url, first)
+                self.assertLessEqual(prompt_cache.nbytes, cap)
+                stats = prompt_cache.stats_by_type()
+                n = 0 if cap == 1 else 1
+                self.assertEqual(stats["system"]["n_sequences"], n)
+                self.assertEqual(stats["assistant"]["n_sequences"], n)
+
+    def test_trimmable_cache_skips_checkpoints(self):
+        self.assertTrue(stays_trimmable([KVCache(), CacheList(KVCache())]))
+        self.assertFalse(stays_trimmable([KVCache(), RotatingKVCache(max_size=16)]))
+        self.assertFalse(stays_trimmable([CacheList(RotatingKVCache(max_size=16))]))
+
+        gen = self._generator(prefill_step_size=4)
+        n = gen._prefill_checkpoints(
+            _tiny_llama(),
+            None,
+            [KVCache(), KVCache()],
+            2,
+            list(range(40)),
+            0,
+            [list(range(20)), list(range(20, 40))],
+            ["system", "user"],
+            mx.default_stream(mx.default_device()),
+            lambda *_: None,
+            GenerationContext(None, None, None, None, None, None),
+        )
+        self.assertEqual(n, 0)
+        self.assertEqual(len(gen.prompt_cache), 0)
+
+    def test_stop_during_checkpoint_prefill(self):
+        gen = self._generator(prefill_step_size=4)
+        ctx = GenerationContext(None, None, None, None, None, None)
+
+        def progress(done, total):
+            if done > 0:
+                ctx.stop()
+
+        cache = [RotatingKVCache(max_size=16) for _ in range(2)]
+        n = gen._prefill_checkpoints(
+            _tiny_llama(),
+            None,
+            cache,
+            2,
+            list(range(40)),
+            0,
+            [list(range(20)), list(range(20, 40))],
+            ["system", "user"],
+            mx.default_stream(mx.default_device()),
+            progress,
+            ctx,
+        )
+        self.assertIsNone(n)
+        self.assertEqual(len(gen.prompt_cache), 0)
+        self.assertEqual(cache[0].offset, 4)
+
+    def _generator(self, prefill_step_size):
+        gen = object.__new__(ResponseGenerator)
+        gen.model_provider = types.SimpleNamespace(
+            model_key="tiny",
+            cli_args=types.SimpleNamespace(
+                prefill_step_size=prefill_step_size,
+                prefill_memory_mb=512,
+                kv_bits=None,
+                kv_group_size=64,
+                quantized_kv_start=0,
+            ),
+        )
+        gen.prompt_cache = LRUPromptCache()
+        gen._is_distributed = False
+        return gen
+
+
+def _tiny_llama():
+    from mlx_lm.models import llama
+
+    mx.random.seed(0)
+    model = llama.Model(
+        llama.ModelArgs(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            rope_theta=10000.0,
+            tie_word_embeddings=True,
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
 class TestKeepalive(unittest.TestCase):
     def test_keepalive_callback(self):
         """Test keepalive callback sends SSE comments and handles errors"""
@@ -690,6 +985,27 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def test_sliding_window_keeps_prefixes(self):
+        # A sliding window below its size is trimmable only until it is
+        # full: its prefix entries must stay.
+        def rotating(offset):
+            c = RotatingKVCache(max_size=16)
+            c.update_and_fetch(mx.zeros((1, 1, offset, 8)), mx.zeros((1, 1, offset, 8)))
+            return [c]
+
+        cache = LRUPromptCache()
+        cache.insert_cache("m", [1, 2, 3], rotating(3), cache_type="system")
+        cache.insert_cache("m", [1, 2, 3, 4, 5], rotating(5))
+        self.assertEqual(len(cache), 2)
+        c, rest = cache.fetch_nearest_cache("m", [1, 2, 3, 9])
+        self.assertEqual(rest, [9])
+
+        # A cache that stays trimmable drops its prefixes, as before.
+        cache = LRUPromptCache()
+        cache.insert_cache("m", [1, 2, 3], [MockCache("a")], cache_type="system")
+        cache.insert_cache("m", [1, 2, 3, 4, 5], [MockCache("b")])
+        self.assertEqual(len(cache), 1)
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 

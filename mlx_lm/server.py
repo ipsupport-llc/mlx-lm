@@ -1,6 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
+import copy
 import gc
 import json
 import logging
@@ -37,11 +38,21 @@ from .generate import (
     BatchGenerator,
     TextStateMachine,
     _model_supports_nemotron_h_mtp,
+    kv_cache_quantized,
+    make_prefill_step,
     make_stop_sequences,
     make_text_state_machine,
+    maybe_quantize_kv_cache,
     stream_generate,
+    wired_limit,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import (
+    LRUPromptCache,
+    make_prompt_cache,
+    stays_trimmable,
+)
+
+DEFAULT_PREFILL_MEMORY_MB = 512
 from .multimodal import extract_images, load_image_inputs
 from .multimodal import vision_spans as multimodal_vision_spans
 from .sample_utils import greedy_sampler, make_logits_processors, make_sampler
@@ -981,7 +992,9 @@ class ResponseGenerator:
                     )
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, segments, segment_types, initial_state = self._tokenize(
+                tokenizer, request, args
+            )
 
             # Image requests: expand each image placeholder into its real
             # soft-token span and fuse the image features into the prompt
@@ -1045,6 +1058,36 @@ class ResponseGenerator:
                 if use_draft:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
+            self._log_prefill_step(model, len(cache_prompt), ctx.prompt_cache_count)
+
+            # Prefill up to the end of the system and user segments and save a
+            # checkpoint at each, as the batched path does. A non-trimmable
+            # cache (e.g. a sliding window) can't be cut back from the whole
+            # sequence when the next turn diverges in the last answer.
+            n_prefilled = 0
+            if input_embeddings is None:
+                n_main = len(make_prompt_cache(model))
+                n_prefilled = self._prefill_checkpoints(
+                    model,
+                    draft_model if use_draft else None,
+                    cache,
+                    n_main,
+                    prompt,
+                    ctx.prompt_cache_count,
+                    segments,
+                    segment_types,
+                    stream,
+                    progress,
+                    ctx,
+                )
+                if n_prefilled is None:
+                    rqueue.put(None)
+                    return
+                rest = rest[n_prefilled:]
+
+            def generate_progress(processed, total):
+                progress(n_prefilled + processed, n_prefilled + total)
+
             # Process the prompt and generate tokens
             # Own matcher: the automaton is cached across requests.
             stop_matcher = stop_sequences.matcher()
@@ -1067,8 +1110,10 @@ class ResponseGenerator:
                     draft_model=draft_model if use_draft else None,
                     num_draft_tokens=args.num_draft_tokens,
                     input_embeddings=input_embeddings,
-                    prompt_progress_callback=progress,
+                    prompt_progress_callback=generate_progress,
+                    token_history=prompt[: ctx.prompt_cache_count + n_prefilled],
                     prefill_step_size=self.cli_args.prefill_step_size,
+                    prefill_memory_budget=self._prefill_memory_budget(),
                     kv_bits=self.cli_args.kv_bits,
                     kv_group_size=self.cli_args.kv_group_size,
                     quantized_kv_start=self.cli_args.quantized_kv_start,
@@ -1109,9 +1154,112 @@ class ResponseGenerator:
             self.prompt_cache.insert_cache(
                 self.model_provider.model_key, cache_key, cache
             )
+            cap = getattr(self.cli_args, "prompt_cache_bytes", None)
+            if cap is not None:
+                self.prompt_cache.trim_to(n_bytes=cap)
 
         except Exception as e:
             rqueue.put(e)
+
+    def _prefill_memory_budget(self):
+        mb = getattr(self.cli_args, "prefill_memory_mb", DEFAULT_PREFILL_MEMORY_MB)
+        return mb * (1 << 20) if mb else None
+
+    def _log_prefill_step(self, model, n_prompt, n_cached):
+        budget = self._prefill_memory_budget()
+        max_step = self.cli_args.prefill_step_size
+        if budget is None or n_prompt - n_cached <= 1:
+            return
+        step = make_prefill_step(model, max_step, budget)
+        kv_bits = self.cli_args.kv_bits
+        start = self.cli_args.quantized_kv_start
+        first = step(n_cached, kv_bits is not None and n_cached >= start)
+        last = step(n_prompt, kv_bits is not None and n_prompt >= start)
+        if last < 128:
+            logging.warning(
+                f"Prefill step down to {last} at {n_prompt} tokens: prefill "
+                "is slow. A larger --prefill-memory-mb gives larger steps."
+            )
+        elif last < max_step:
+            logging.info(
+                f"Prefill step {first} at {n_cached} tokens, {last} at "
+                f"{n_prompt} tokens (--prefill-memory-mb {budget >> 20})"
+            )
+
+    def _prefill_checkpoints(
+        self,
+        model,
+        draft_model,
+        cache,
+        n_main,
+        prompt,
+        n_cached,
+        segments,
+        segment_types,
+        stream,
+        progress,
+        ctx,
+    ):
+        """Prefill `prompt[n_cached:]` up to the end of each system / user
+        segment and insert a copy of the cache there. The last prompt token
+        is left for generation. Return the number of tokens prefilled, or
+        None if the request was stopped."""
+        # Such a cache is trimmed back from the full sequence on the next
+        # turn, and insert_cache drops its prefixes anyway.
+        if stays_trimmable(cache):
+            return 0
+        ends = []
+        end = 0
+        for seg, seg_type in zip(segments, segment_types):
+            end += len(seg)
+            if seg_type in ("system", "user"):
+                ends.append((min(end, len(prompt) - 1), seg_type))
+        ends = [(e, t) for e, t in ends if e > n_cached]
+        if not ends:
+            return 0
+
+        cli_args = self.cli_args
+        quantize = lambda: maybe_quantize_kv_cache(
+            cache, cli_args.quantized_kv_start, cli_args.kv_group_size, cli_args.kv_bits
+        )
+        prefill_step = make_prefill_step(
+            model, cli_args.prefill_step_size, self._prefill_memory_budget()
+        )
+        total = len(prompt) - n_cached
+        done = n_cached
+        with wired_limit(model, [stream]), mx.stream(stream):
+            progress(0, total)
+            for end, seg_type in ends:
+                while done < end:
+                    if ctx._should_stop and not self._is_distributed:
+                        return None
+                    step = prefill_step(done, kv_cache_quantized(cache))
+                    n = min(step, end - done)
+                    tokens = mx.array(prompt[done : done + n])[None]
+                    model(tokens, cache=cache[:n_main])
+                    if draft_model is not None and len(cache) > n_main:
+                        draft_model(tokens, cache=cache[n_main:])
+                    # Same state generate_step would have at this offset.
+                    quantize()
+                    mx.eval([c.state for c in cache if c is not None])
+                    done += n
+                    progress(done - n_cached, total)
+                    mx.clear_cache()
+                # The live cache and the copy count against
+                # --prompt-cache-bytes: make room before the copy.
+                nbytes = sum(c.nbytes for c in cache if c is not None)
+                cap = getattr(cli_args, "prompt_cache_bytes", None)
+                if cap is not None:
+                    if 2 * nbytes > cap:
+                        continue
+                    self.prompt_cache.trim_to(n_bytes=cap - 2 * nbytes)
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key,
+                    prompt[:end],
+                    copy.deepcopy(cache),
+                    cache_type=seg_type,
+                )
+        return done - n_cached
 
     def _match_draft_slots(self, cache, rest, cache_prompt, use_draft):
         """A cached prompt's slots for this request: a cache without draft
@@ -2056,6 +2204,17 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--prefill-memory-mb",
+        type=int,
+        default=DEFAULT_PREFILL_MEMORY_MB,
+        help="Memory for the attention scores of one prefill step, in MB, "
+        "where they are materialized (head dims without a fused kernel, or "
+        "a quantized KV cache). The step shrinks as the prompt grows (not "
+        "below 16). Single-request path only (draft model, MTP, --kv-bits, "
+        "seed, images): batched prefill keeps --prefill-step-size. 0 keeps "
+        f"--prefill-step-size (default: {DEFAULT_PREFILL_MEMORY_MB})",
     )
     parser.add_argument(
         "--prompt-cache-size",
