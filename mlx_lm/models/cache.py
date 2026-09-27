@@ -119,6 +119,18 @@ def can_trim_prompt_cache(cache: List[Any]) -> bool:
     return all(c.is_trimmable() for c in cache)
 
 
+def stays_trimmable(cache: List[Any]) -> bool:
+    """Trimmable now and at any length (a sliding window stops being
+    trimmable once it is full)."""
+
+    def ok(c):
+        if isinstance(c, CacheList):
+            return all(ok(x) for x in c.caches)
+        return c.is_trimmable() and not isinstance(c, _RotatingKVCacheBase)
+
+    return all(ok(c) for c in cache if c is not None)
+
+
 def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     """
     Trim the model's cache by the given number of tokens.
@@ -1943,9 +1955,10 @@ class LRUPromptCache:
             self._lru.remove(model, tokens)
         self._lru.push(model, tokens, cache_type)
 
-        # If it is a trimmable cache remove all prefixes cause they just take
-        # space
-        if can_trim_prompt_cache(prompt_cache):
+        # If the cache stays trimmable remove all prefixes cause they just
+        # take space. A sliding window below its size is trimmable only for
+        # now: its prefixes are still needed later.
+        if stays_trimmable(prompt_cache):
             for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
                 self._n_bytes -= entry.nbytes
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes

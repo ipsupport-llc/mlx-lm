@@ -21,6 +21,7 @@ from mlx_lm.models.cache import (
     QuantizedRotatingKVCache,
     RotatingKVCache,
     make_prompt_cache,
+    stays_trimmable,
 )
 from mlx_lm.sample_utils import make_logits_processors
 from mlx_lm.server import (
@@ -31,7 +32,6 @@ from mlx_lm.server import (
     SamplingArguments,
     ToolCallFormatter,
     _make_sampler,
-    _stays_trimmable,
 )
 from mlx_lm.tool_parsers import pythonic
 from mlx_lm.utils import load
@@ -849,9 +849,9 @@ class TestServerSingleCheckpoints(unittest.TestCase):
                 self.assertEqual(stats["assistant"]["n_sequences"], n)
 
     def test_trimmable_cache_skips_checkpoints(self):
-        self.assertTrue(_stays_trimmable([KVCache(), CacheList(KVCache())]))
-        self.assertFalse(_stays_trimmable([KVCache(), RotatingKVCache(max_size=16)]))
-        self.assertFalse(_stays_trimmable([CacheList(RotatingKVCache(max_size=16))]))
+        self.assertTrue(stays_trimmable([KVCache(), CacheList(KVCache())]))
+        self.assertFalse(stays_trimmable([KVCache(), RotatingKVCache(max_size=16)]))
+        self.assertFalse(stays_trimmable([CacheList(RotatingKVCache(max_size=16))]))
 
         gen = self._generator(prefill_step_size=4)
         n = gen._prefill_checkpoints(
@@ -985,6 +985,27 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def test_sliding_window_keeps_prefixes(self):
+        # A sliding window below its size is trimmable only until it is
+        # full: its prefix entries must stay.
+        def rotating(offset):
+            c = RotatingKVCache(max_size=16)
+            c.update_and_fetch(mx.zeros((1, 1, offset, 8)), mx.zeros((1, 1, offset, 8)))
+            return [c]
+
+        cache = LRUPromptCache()
+        cache.insert_cache("m", [1, 2, 3], rotating(3), cache_type="system")
+        cache.insert_cache("m", [1, 2, 3, 4, 5], rotating(5))
+        self.assertEqual(len(cache), 2)
+        c, rest = cache.fetch_nearest_cache("m", [1, 2, 3, 9])
+        self.assertEqual(rest, [9])
+
+        # A cache that stays trimmable drops its prefixes, as before.
+        cache = LRUPromptCache()
+        cache.insert_cache("m", [1, 2, 3], [MockCache("a")], cache_type="system")
+        cache.insert_cache("m", [1, 2, 3, 4, 5], [MockCache("b")])
+        self.assertEqual(len(cache), 1)
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 

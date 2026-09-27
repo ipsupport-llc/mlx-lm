@@ -47,11 +47,9 @@ from .generate import (
     wired_limit,
 )
 from .models.cache import (
-    CacheList,
     LRUPromptCache,
-    QuantizedRotatingKVCache,
-    RotatingKVCache,
     make_prompt_cache,
+    stays_trimmable,
 )
 
 DEFAULT_PREFILL_MEMORY_MB = 512
@@ -64,20 +62,6 @@ from .utils import (
     maybe_set_recommended_wired_limit,
     sharded_load,
 )
-
-
-def _stays_trimmable(cache):
-    """Trimmable now and for any length (a sliding window stops being
-    trimmable once it is full)."""
-
-    def ok(c):
-        if isinstance(c, CacheList):
-            return all(ok(x) for x in c.caches)
-        return c.is_trimmable() and not isinstance(
-            c, (RotatingKVCache, QuantizedRotatingKVCache)
-        )
-
-    return all(ok(c) for c in cache if c is not None)
 
 
 def get_system_fingerprint():
@@ -1222,7 +1206,7 @@ class ResponseGenerator:
         None if the request was stopped."""
         # Such a cache is trimmed back from the full sequence on the next
         # turn, and insert_cache drops its prefixes anyway.
-        if _stays_trimmable(cache):
+        if stays_trimmable(cache):
             return 0
         ends = []
         end = 0
@@ -1261,20 +1245,20 @@ class ResponseGenerator:
                     done += n
                     progress(done - n_cached, total)
                     mx.clear_cache()
-                # The live cache counts against --prompt-cache-bytes too, as
-                # in the batched path.
+                # The live cache and the copy count against
+                # --prompt-cache-bytes: make room before the copy.
                 nbytes = sum(c.nbytes for c in cache if c is not None)
                 cap = getattr(cli_args, "prompt_cache_bytes", None)
-                if cap is not None and 2 * nbytes > cap:
-                    continue
+                if cap is not None:
+                    if 2 * nbytes > cap:
+                        continue
+                    self.prompt_cache.trim_to(n_bytes=cap - 2 * nbytes)
                 self.prompt_cache.insert_cache(
                     self.model_provider.model_key,
                     prompt[:end],
                     copy.deepcopy(cache),
                     cache_type=seg_type,
                 )
-                if cap is not None:
-                    self.prompt_cache.trim_to(n_bytes=cap - nbytes)
         return done - n_cached
 
     def _match_draft_slots(self, cache, rest, cache_prompt, use_draft):
