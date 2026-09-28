@@ -926,6 +926,17 @@ class TestServerSingleCheckpoints(unittest.TestCase):
                 self.assertEqual(stats["system"]["n_sequences"], n)
                 self.assertEqual(stats["assistant"]["n_sequences"], n)
 
+    def test_prompt_cache_bytes_batched(self):
+        # The batched path trims after its checkpoint and final inserts too.
+        provider, prompt_cache, url = self._serve(prompt_cache_bytes=1, batchable=True)
+        first = [
+            {"role": "system", "content": self.SYSTEM},
+            {"role": "user", "content": "Hello!"},
+        ]
+        self._chat(url, first)
+        self._chat(url, first + [{"role": "assistant", "content": "Hi."}])
+        self.assertLessEqual(prompt_cache.nbytes, 1)
+
     def test_trimmable_cache_skips_checkpoints(self):
         self.assertTrue(stays_trimmable([KVCache(), CacheList(KVCache())]))
         self.assertFalse(stays_trimmable([KVCache(), RotatingKVCache(max_size=16)]))

@@ -549,6 +549,14 @@ class ResponseGenerator:
         segment_types = segment_types[:i] + ["user"] + segment_types[i:]
         return segments, segment_types
 
+    def _trim_to_cap(self, batch_generator):
+        """Keep the stored caches and the active batch's live caches within
+        --prompt-cache-bytes."""
+        total = getattr(self.cli_args, "prompt_cache_bytes", None)
+        if total is not None:
+            active = batch_generator.prompt_cache_nbytes
+            self.prompt_cache.trim_to(n_bytes=total - active)
+
     def _log_cache_reuse(self, n_reused, n_prompt):
         logging.info(f"Prompt cache: reused {n_reused} of {n_prompt} tokens")
         # A client that changes an earlier part of the prompt shows here.
@@ -866,10 +874,7 @@ class ResponseGenerator:
                     # just making sure we don't leave a reference around
                     del cache
 
-                    if self.model_provider.cli_args.prompt_cache_bytes is not None:
-                        total = self.model_provider.cli_args.prompt_cache_bytes
-                        active = batch_generator.prompt_cache_nbytes
-                        self.prompt_cache.trim_to(n_bytes=total - active)
+                    self._trim_to_cap(batch_generator)
                     continue
 
                 # No batch generator. Load the model and if it's not
@@ -950,6 +955,8 @@ class ResponseGenerator:
                             cache,
                             cache_type=batch_results[uid]["segment_types"].pop(),
                         )
+                    if caches:
+                        self._trim_to_cap(batch_generator)
                     del caches
 
                     for r in gen_responses:
@@ -989,6 +996,7 @@ class ResponseGenerator:
                                 r.prompt_cache,
                                 cache_type="assistant",
                             )
+                            self._trim_to_cap(batch_generator)
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
