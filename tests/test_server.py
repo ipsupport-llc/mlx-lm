@@ -673,9 +673,9 @@ class TestServerSingleCheckpoints(unittest.TestCase):
 
     SYSTEM = "You are a helpful assistant. " * 8
 
-    def _serve(self, kv_bits=None, prompt_cache_bytes=None):
+    def _serve(self, kv_bits=None, prompt_cache_bytes=None, batchable=False):
         provider = DummyModelProvider(kv_bits=kv_bits, quantized_kv_start=0)
-        provider.is_batchable = False
+        provider.is_batchable = batchable
         provider.cli_args.prompt_cache_bytes = prompt_cache_bytes
         n_layers = len(provider.model.layers)
         provider.model.make_cache = lambda: [
@@ -772,6 +772,42 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         self.assertIn(f"Prompt cache: reused 0 of {len(prompt)} tokens", text)
         self.assertIn(f"Prompt cache: reused {cached} of", text)
         self.assertIn("Prompt cache: diverged from a cached prompt at token", text)
+
+    def test_junction_checkpoint(self):
+        for batchable in (False, True):
+            with self.subTest(batchable=batchable):
+                self._check_junction(batchable)
+
+    def _check_junction(self, batchable):
+        # A client changes the middle of the prompt on each request (e.g. a
+        # timestamp). The second request saves a checkpoint where it
+        # diverged from the first; the third reuses it.
+        provider, prompt_cache, url = self._serve(batchable=batchable)
+        tokenizer = provider.tokenizer
+        filler = "You are a helpful assistant. " * 45
+
+        def messages(stamp):
+            system = f"{filler}Time: {stamp}.\n{filler}"
+            return [
+                {"role": "system", "content": system},
+                {"role": "user", "content": "Hello!"},
+            ]
+
+        prompts = [
+            tokenizer.apply_chat_template(messages(t), add_generation_prompt=True)
+            for t in ("alpha", "bravo")
+        ]
+        k = next(i for i, (a, b) in enumerate(zip(*prompts)) if a != b)
+        self.assertGreater(k, 256)
+
+        self.assertEqual(self._chat(url, messages("alpha")), 0)
+        with self.assertLogs(level="INFO") as logs:
+            self.assertEqual(self._chat(url, messages("bravo")), 0)
+        self.assertIn(
+            f"Prompt cache: checkpoint at the junction, token {k}",
+            "\n".join(logs.output),
+        )
+        self.assertGreaterEqual(self._chat(url, messages("charlie")), k)
 
     def test_checkpoints_are_reused(self):
         self._check_reuse()
