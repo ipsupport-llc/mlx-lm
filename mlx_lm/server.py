@@ -39,6 +39,9 @@ from .generate import (
     TextStateMachine,
     _model_supports_nemotron_h_mtp,
     kv_cache_quantized,
+    DEFAULT_PREFILL_SCORE_BYTES,
+    MIN_PREFILL_STEP,
+    PrefillBudget,
     make_prefill_step,
     make_stop_sequences,
     make_text_state_machine,
@@ -53,6 +56,54 @@ from .models.cache import (
 )
 
 DEFAULT_PREFILL_MEMORY_MB = 512
+
+# Defaults of the server's memory / checkpoint options (see their --help).
+# Also used when a cli_args object lacks one (tests, embedders).
+SERVER_DEFAULTS = {
+    "prefill_memory_mb": DEFAULT_PREFILL_MEMORY_MB,
+    "min_prefill_step": MIN_PREFILL_STEP,
+    "prefill_score_bytes": DEFAULT_PREFILL_SCORE_BYTES,
+    "prefill_step_warn_below": 128,
+    "memory_headroom_fraction": 0.9,
+    "oom_retry_step_divisor": 2,
+    "junction_min_gap_tokens": 256,
+}
+# Smallest valid value of the integer options above.
+_OPT_MIN = {
+    "prefill_memory_mb": 0,
+    "min_prefill_step": 1,
+    "prefill_score_bytes": 1,
+    "prefill_step_warn_below": 0,
+    "oom_retry_step_divisor": 1,
+    "junction_min_gap_tokens": 0,
+}
+
+
+def _int_at_least(lo):
+    def parse(value):
+        try:
+            n = int(value)
+        except ValueError:
+            n = None
+        if n is None or n < lo:
+            raise argparse.ArgumentTypeError(
+                f"must be an integer >= {lo}, got {value!r}"
+            )
+        return n
+
+    return parse
+
+
+def _fraction(value):
+    try:
+        x = float(value)
+    except ValueError:
+        x = None
+    if x is None or not 0 < x <= 1:
+        raise argparse.ArgumentTypeError(
+            f"must be a number in (0, 1], got {value!r}"
+        )
+    return x
 from .multimodal import extract_images, load_image_inputs
 from .multimodal import vision_spans as multimodal_vision_spans
 from .sample_utils import greedy_sampler, make_logits_processors, make_sampler
@@ -62,6 +113,26 @@ from .utils import (
     maybe_set_recommended_wired_limit,
     sharded_load,
 )
+
+
+def _is_metal_oom(e):
+    """A Metal command buffer that failed for lack of GPU memory. MLX raises
+    it as RuntimeError: "[METAL] Command buffer execution failed:
+    Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"."""
+    msg = str(e)
+    return isinstance(e, RuntimeError) and (
+        "kIOGPUCommandBufferCallbackErrorOutOfMemory" in msg
+        or ("[METAL]" in msg and "Insufficient Memory" in msg)
+    )
+
+
+def checkpoint_room(live, active, limit, prefill_budget, headroom_fraction):
+    """Bytes missing to copy a live cache of `live` bytes and still run the
+    next prefill chunk (`prefill_budget`) within `headroom_fraction` of
+    `limit` (Metal's recommended working set; the rest covers allocations
+    not counted here, e.g. activations besides the attention scores), with
+    `active` bytes in use. 0 or less: it fits."""
+    return active + live + prefill_budget - int(headroom_fraction * limit)
 
 
 def get_system_fingerprint():
@@ -519,10 +590,6 @@ class ResponseGenerator:
     def is_healthy(self):
         return self.generation_available()
 
-    # A junction checkpoint needs this many tokens to the reused prefix, to
-    # the other checkpoints and to the prompt end.
-    JUNCTION_MIN_GAP = 256
-
     def _junction_split(self, segments, segment_types, n_cached, n_prompt):
         """Split the segments where the nearest cached prompt diverged from
         this one (a "user" checkpoint there), when the reused cache stops
@@ -531,7 +598,9 @@ class ResponseGenerator:
         div = self.prompt_cache.last_divergence
         if div is None:
             return segments, segment_types
-        k, gap = div[0], self.JUNCTION_MIN_GAP
+        # A junction checkpoint needs this many tokens to the reused prefix,
+        # to the other checkpoints and to the prompt end.
+        k, gap = div[0], self._opt("junction_min_gap_tokens")
         ends, end = [], 0
         for seg in segments:
             end += len(seg)
@@ -1020,8 +1089,14 @@ class ResponseGenerator:
         rqueue, request, args = request
 
         # Define the progress callback
+        # Progress only moves forward: a retry after an OOM starts again
+        # below what the client has already seen.
+        sent = [-1]
+
         def progress(tokens_processed, tokens_total):
-            rqueue.put((tokens_processed, tokens_total))
+            if tokens_processed > sent[0] or tokens_processed == tokens_total:
+                sent[0] = max(sent[0], tokens_processed)
+                rqueue.put((tokens_processed, tokens_total))
 
         try:
             # Load the model and tokenizer
@@ -1080,62 +1155,95 @@ class ResponseGenerator:
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
-            # Load the KV cache
-            self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, cache_prompt
-            )
-            # Image requests run without the draft model (it can't consume
-            # the fused image embeddings), so their caches have no draft
-            # slots: match the slots to this request.
             use_draft = (
                 self.model_provider.draft_model is not None
                 and input_embeddings is None
             )
-            cache, rest = self._match_draft_slots(cache, rest, cache_prompt, use_draft)
-            ctx.prompt_cache_count = len(cache_prompt) - len(rest)
-            self._log_cache_reuse(ctx.prompt_cache_count, len(cache_prompt))
-            cache_key = cache_prompt[:]
-            if input_embeddings is not None:
-                # `rest` is a slice of the cache key (pseudo ids at image
-                # positions); feed the real ids + embeddings for that tail.
-                n_cached = ctx.prompt_cache_count
-                rest = prompt[n_cached:]
-                input_embeddings = input_embeddings[n_cached:]
-            if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
-                if use_draft:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
-
-            self._log_prefill_step(model, len(cache_prompt), ctx.prompt_cache_count)
-
-            # Prefill up to the end of the system and user segments and save a
-            # checkpoint at each, as the batched path does. A non-trimmable
-            # cache (e.g. a sliding window) can't be cut back from the whole
-            # sequence when the next turn diverges in the last answer.
-            n_prefilled = 0
-            if input_embeddings is None:
-                segments, segment_types = self._junction_split(
-                    segments, segment_types, ctx.prompt_cache_count, len(prompt)
+            n_main = len(make_prompt_cache(model))
+            prompt_embeddings = input_embeddings
+            # A Metal OOM in the checkpoint prefill frees stored caches and
+            # starts once more from a fresh cache fetch, with half the prefill
+            # step (the failed cache is lost). Not covered: the prefill inside
+            # stream_generate (caches that stay trimmable, images, the tail
+            # after the last checkpoint).
+            for attempt in range(2):
+                input_embeddings = prompt_embeddings
+                seg, seg_types = segments, segment_types
+                # Load the KV cache
+                self._log_cache_stats()
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, cache_prompt
                 )
-                n_main = len(make_prompt_cache(model))
-                n_prefilled = self._prefill_checkpoints(
-                    model,
-                    draft_model if use_draft else None,
-                    cache,
-                    n_main,
-                    prompt,
-                    ctx.prompt_cache_count,
-                    segments,
-                    segment_types,
-                    stream,
-                    progress,
-                    ctx,
+                reused = self.prompt_cache.last_fetched
+                # Image requests run without the draft model (it can't consume
+                # the fused image embeddings), so their caches have no draft
+                # slots: match the slots to this request.
+                cache, rest = self._match_draft_slots(
+                    cache, rest, cache_prompt, use_draft
                 )
-                if n_prefilled is None:
-                    rqueue.put(None)
-                    return
-                rest = rest[n_prefilled:]
+                if cache is None:
+                    reused = None
+                ctx.prompt_cache_count = len(cache_prompt) - len(rest)
+                self._log_cache_reuse(ctx.prompt_cache_count, len(cache_prompt))
+                cache_key = cache_prompt[:]
+                if input_embeddings is not None:
+                    # `rest` is a slice of the cache key (pseudo ids at image
+                    # positions); feed the real ids + embeddings for that tail.
+                    n_cached = ctx.prompt_cache_count
+                    rest = prompt[n_cached:]
+                    input_embeddings = input_embeddings[n_cached:]
+                if cache is None:
+                    cache = make_prompt_cache(self.model_provider.model)
+                    if use_draft:
+                        cache += make_prompt_cache(self.model_provider.draft_model)
+
+                self._log_prefill_step(
+                    model, len(cache_prompt), ctx.prompt_cache_count
+                )
+
+                # Prefill up to the end of the system and user segments and
+                # save a checkpoint at each, as the batched path does. A
+                # non-trimmable cache (e.g. a sliding window) can't be cut back
+                # from the whole sequence when the next turn diverges in the
+                # last answer.
+                n_prefilled = 0
+                if input_embeddings is None:
+                    seg, seg_types = self._junction_split(
+                        seg, seg_types, ctx.prompt_cache_count, len(prompt)
+                    )
+                    try:
+                        n_prefilled = self._prefill_checkpoints(
+                            model,
+                            draft_model if use_draft else None,
+                            cache,
+                            n_main,
+                            prompt,
+                            ctx.prompt_cache_count,
+                            seg,
+                            seg_types,
+                            stream,
+                            progress,
+                            ctx,
+                            step_divisor=self._opt("oom_retry_step_divisor")
+                            ** attempt,
+                        )
+                    except RuntimeError as e:
+                        if attempt or self._is_distributed or not _is_metal_oom(e):
+                            raise
+                        oom = str(e)
+                    else:
+                        if n_prefilled is None:
+                            rqueue.put(None)
+                            return
+                        rest = rest[n_prefilled:]
+                        break
+                    # Out of the except block: the exception and its traceback
+                    # (frames holding the failed cache) are gone, so its
+                    # buffers can be freed.
+                    cache = None
+                    self._free_memory_after_oom(oom, reused)
+                else:
+                    break
 
             def generate_progress(processed, total):
                 progress(n_prefilled + processed, n_prefilled + total)
@@ -1213,9 +1321,82 @@ class ResponseGenerator:
         except Exception as e:
             rqueue.put(e)
 
-    def _prefill_memory_budget(self):
-        mb = getattr(self.cli_args, "prefill_memory_mb", DEFAULT_PREFILL_MEMORY_MB)
-        return mb * (1 << 20) if mb else None
+    def _memory_shortfall(self, nbytes, budget):
+        """checkpoint_room with the current memory in use, or None if the
+        device reports no working-set limit."""
+        limit = mx.device_info().get("max_recommended_working_set_size")
+        if not limit:
+            return None
+        return checkpoint_room(
+            nbytes,
+            mx.get_active_memory(),
+            limit,
+            budget.nbytes if budget else 0,
+            self._opt("memory_headroom_fraction"),
+        )
+
+    def _free_stored(self, short, keep=None):
+        self.prompt_cache.trim_to(
+            n_bytes=max(0, self.prompt_cache.nbytes - short), keep=keep
+        )
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+
+    def _make_memory_room(self, nbytes, divisor=1):
+        """Evict stored caches until a copy of `nbytes` and a prefill chunk
+        (the budget divided by `divisor`, as the current attempt runs) fit
+        in GPU memory. False if they can't."""
+        budget = self._prefill_memory_budget(divisor)
+        short = self._memory_shortfall(nbytes, budget)
+        if short is None or short <= 0:
+            return True
+        if self.prompt_cache.nbytes > 0:
+            self._free_stored(short)
+            short = self._memory_shortfall(nbytes, budget)
+        return short <= 0
+
+    def _free_memory_after_oom(self, msg, reused):
+        """Evict stored caches (not `reused`, the entry this request starts
+        from) for the shortfall of the retry: the reused cache again plus
+        the prefill budget the retry runs with."""
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        n_bytes = self.prompt_cache.nbytes
+        live = self.prompt_cache.entry_nbytes(reused)
+        budget = self._prefill_memory_budget(self._opt("oom_retry_step_divisor"))
+        short = self._memory_shortfall(live, budget)
+        if short is not None and short > 0:
+            self._free_stored(short, keep=reused)
+        logging.warning(
+            f"Prefill ran out of memory ({msg}); prompt cache trimmed from "
+            f"{n_bytes / 1e9:.2f} to {self.prompt_cache.nbytes / 1e9:.2f} GB, "
+            "retrying once"
+        )
+
+    def _opt(self, name):
+        """A server option; out-of-range values (cli_args not from
+        make_parser) are clamped to the valid range."""
+        value = getattr(self.cli_args, name, SERVER_DEFAULTS[name])
+        if name in _OPT_MIN:
+            return max(_OPT_MIN[name], int(value))
+        if name == "memory_headroom_fraction":
+            return min(1.0, value) if value > 0 else SERVER_DEFAULTS[name]
+        return value
+
+    def _prefill_memory_budget(self, divisor=1):
+        """The PrefillBudget from the server options (None if disabled);
+        `divisor` scales it down for an OOM retry."""
+        divisor = max(1, int(divisor))
+        mb = self._opt("prefill_memory_mb")
+        if not mb:
+            return None
+        return PrefillBudget(
+            nbytes=(mb << 20) // divisor,
+            min_step=self._opt("min_prefill_step"),
+            score_bytes=self._opt("prefill_score_bytes"),
+        )
 
     def _log_prefill_step(self, model, n_prompt, n_cached):
         budget = self._prefill_memory_budget()
@@ -1227,7 +1408,7 @@ class ResponseGenerator:
         start = self.cli_args.quantized_kv_start
         first = step(n_cached, kv_bits is not None and n_cached >= start)
         last = step(n_prompt, kv_bits is not None and n_prompt >= start)
-        if last < 128:
+        if last < self._opt("prefill_step_warn_below"):
             logging.warning(
                 f"Prefill step down to {last} at {n_prompt} tokens: prefill "
                 "is slow. A larger --prefill-memory-mb gives larger steps."
@@ -1235,7 +1416,8 @@ class ResponseGenerator:
         elif last < max_step:
             logging.info(
                 f"Prefill step {first} at {n_cached} tokens, {last} at "
-                f"{n_prompt} tokens (--prefill-memory-mb {budget >> 20})"
+                f"{n_prompt} tokens (--prefill-memory-mb "
+                f"{self._opt('prefill_memory_mb')})"
             )
 
     def _prefill_checkpoints(
@@ -1251,6 +1433,7 @@ class ResponseGenerator:
         stream,
         progress,
         ctx,
+        step_divisor=1,
     ):
         """Prefill `prompt[n_cached:]` up to the end of each system / user
         segment and insert a copy of the cache there. The last prompt token
@@ -1274,11 +1457,17 @@ class ResponseGenerator:
         quantize = lambda: maybe_quantize_kv_cache(
             cache, cli_args.quantized_kv_start, cli_args.kv_group_size, cli_args.kv_bits
         )
+        # A retry after an OOM runs smaller chunks (step_divisor > 1).
+        max_step = cli_args.prefill_step_size
+        min_step = min(self._opt("min_prefill_step"), max_step)
         prefill_step = make_prefill_step(
-            model, cli_args.prefill_step_size, self._prefill_memory_budget()
+            model,
+            max(min_step, max_step // step_divisor),
+            self._prefill_memory_budget(step_divisor),
         )
         total = len(prompt) - n_cached
         done = n_cached
+        skipped = False
         with wired_limit(model, [stream]), mx.stream(stream):
             progress(0, total)
             for end, seg_type in ends:
@@ -1305,12 +1494,25 @@ class ResponseGenerator:
                     if 2 * nbytes > cap:
                         continue
                     self.prompt_cache.trim_to(n_bytes=cap - 2 * nbytes)
+                # The copy and the next chunk must fit in GPU memory too:
+                # older entries go first, else no checkpoint.
+                if not self._make_memory_room(nbytes, step_divisor):
+                    if not skipped:
+                        logging.warning(
+                            "Prompt cache: checkpoint skipped: no memory room"
+                        )
+                    skipped = True
+                    continue
+                # Evaluated now, so the next room check sees its memory.
+                checkpoint = copy.deepcopy(cache)
+                mx.eval([c.state for c in checkpoint if c is not None])
                 self.prompt_cache.insert_cache(
                     self.model_provider.model_key,
                     prompt[:end],
-                    copy.deepcopy(cache),
+                    checkpoint,
                     cache_type=seg_type,
                 )
+                del checkpoint
         return done - n_cached
 
     def _match_draft_slots(self, cache, rest, cache_prompt, use_draft):
@@ -2123,7 +2325,7 @@ def run(
         response_generator.join()
 
 
-def main():
+def make_parser():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -2259,14 +2461,65 @@ def main():
     )
     parser.add_argument(
         "--prefill-memory-mb",
-        type=int,
-        default=DEFAULT_PREFILL_MEMORY_MB,
+        type=_int_at_least(0),
+        default=SERVER_DEFAULTS["prefill_memory_mb"],
         help="Memory for the attention scores of one prefill step, in MB, "
         "where they are materialized (head dims without a fused kernel, or "
         "a quantized KV cache). The step shrinks as the prompt grows (not "
-        "below 16). Single-request path only (draft model, MTP, --kv-bits, "
-        "seed, images): batched prefill keeps --prefill-step-size. 0 keeps "
-        f"--prefill-step-size (default: {DEFAULT_PREFILL_MEMORY_MB})",
+        "below --min-prefill-step). Single-request path only (draft model, "
+        "MTP, --kv-bits, seed, images): batched prefill keeps "
+        "--prefill-step-size. 0 keeps --prefill-step-size "
+        f"(default: {SERVER_DEFAULTS['prefill_memory_mb']})",
+    )
+    parser.add_argument(
+        "--min-prefill-step",
+        type=_int_at_least(1),
+        default=SERVER_DEFAULTS["min_prefill_step"],
+        help="Smallest prefill step --prefill-memory-mb may shrink to "
+        f"(default: {SERVER_DEFAULTS['min_prefill_step']})",
+    )
+    parser.add_argument(
+        "--prefill-score-bytes",
+        type=_int_at_least(1),
+        default=SERVER_DEFAULTS["prefill_score_bytes"],
+        help="Bytes per attention score assumed by --prefill-memory-mb "
+        "(4: fp32, the safe case; 2: bf16) "
+        f"(default: {SERVER_DEFAULTS['prefill_score_bytes']})",
+    )
+    parser.add_argument(
+        "--prefill-step-warn-below",
+        type=_int_at_least(0),
+        default=SERVER_DEFAULTS["prefill_step_warn_below"],
+        help="Log a warning (slow prefill) when the prefill step shrinks "
+        f"below this (default: {SERVER_DEFAULTS['prefill_step_warn_below']})",
+    )
+    parser.add_argument(
+        "--memory-headroom-fraction",
+        type=_fraction,
+        default=SERVER_DEFAULTS["memory_headroom_fraction"],
+        help="Fraction of Metal's recommended working set that memory in "
+        "use, a prompt-cache checkpoint copy and the prefill budget may "
+        "take together; above it, stored caches are evicted, then the "
+        "checkpoint is skipped. The rest is headroom for allocations not "
+        "counted (default: "
+        f"{SERVER_DEFAULTS['memory_headroom_fraction']})",
+    )
+    parser.add_argument(
+        "--oom-retry-step-divisor",
+        type=_int_at_least(1),
+        default=SERVER_DEFAULTS["oom_retry_step_divisor"],
+        help="After a Metal out-of-memory error in the checkpoint prefill, "
+        "retry once with the prefill step and --prefill-memory-mb divided "
+        f"by this (default: {SERVER_DEFAULTS['oom_retry_step_divisor']})",
+    )
+    parser.add_argument(
+        "--junction-min-gap-tokens",
+        type=_int_at_least(0),
+        default=SERVER_DEFAULTS["junction_min_gap_tokens"],
+        help="A checkpoint where the prompt diverges from a cached one is "
+        "saved only this many tokens or more away from the reused part, "
+        "other checkpoints and the prompt end (default: "
+        f"{SERVER_DEFAULTS['junction_min_gap_tokens']})",
     )
     parser.add_argument(
         "--prompt-cache-size",
@@ -2305,7 +2558,11 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = make_parser().parse_args()
     from . import multimodal
 
     multimodal.ALLOW_IMAGE_URLS = args.allow_image_urls
