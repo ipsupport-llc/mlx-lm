@@ -1903,6 +1903,7 @@ class LRUPromptCache:
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
         self.last_divergence = None
+        self.last_fetched = None
 
     def __len__(self):
         return len(self._lru)
@@ -1919,8 +1920,11 @@ class LRUPromptCache:
             if result.longer is not None and result.common_prefix < len(tokens)
             else None
         )
+        # (model, tokens) of the entry the returned cache is copied from.
+        self.last_fetched = None
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
+            self.last_fetched = (result.model, result.exact)
             return copy.deepcopy(cache_entry.prompt_cache), []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
@@ -1931,10 +1935,12 @@ class LRUPromptCache:
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
+                self.last_fetched = (result.model, result.longer)
                 return cache, tokens[prefix:]
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
+            self.last_fetched = (result.model, result.shorter)
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
 
         return None, tokens
@@ -1983,9 +1989,39 @@ class LRUPromptCache:
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
 
+    def entry_nbytes(self, key) -> int:
+        """Bytes of the entry at `key` ((model, tokens)), 0 if none."""
+        if key is None:
+            return 0
+        try:
+            return self._trie.get(*key).nbytes
+        except (KeyError, TypeError):
+            return 0
+
     def trim_to(
-        self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
+        self,
+        *,
+        n_sequences: Optional[int] = None,
+        n_bytes: Optional[int] = None,
+        keep=None,
     ):
+        """Evict LRU entries down to `n_sequences` / `n_bytes`. `keep`
+        ((model, tokens)) is not evicted but still counts."""
+        if keep is not None and self.entry_nbytes(keep) > 0:
+            model, tokens = keep
+            entry = self._trie.pop(model, tokens)
+            self._lru.remove(model, tokens)
+            self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            self.trim_to(
+                n_sequences=None if n_sequences is None else n_sequences - 1,
+                n_bytes=None if n_bytes is None else n_bytes - entry.nbytes,
+            )
+            self._trie.add(model, tokens, entry)
+            self._lru.push(model, tokens, entry.cache_type)
+            self._n_bytes += entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] += entry.nbytes
+            return
         n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
         n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
 

@@ -4,6 +4,7 @@ import http
 import io
 import json
 import threading
+import sys
 import time
 import types
 import unittest
@@ -963,55 +964,110 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         self.assertEqual(stats["system"]["n_sequences"], 0)
         self.assertEqual(stats["assistant"]["n_sequences"], 1)
 
-    def _failing_eval(self, n_failures):
+    OOM = (
+        "[METAL] Command buffer execution failed: Insufficient Memory "
+        "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+    )
+
+    def _failing_eval(self, fail_at, message=OOM):
+        """mx.eval that raises on the given calls made by _prefill_checkpoints
+        (1-based); other evals run normally."""
         real_eval = mx.eval
         calls = {"n": 0}
 
         def fake_eval(*args):
-            calls["n"] += 1
-            if calls["n"] <= n_failures:
-                raise RuntimeError(
-                    "[METAL] Command buffer execution failed: Insufficient Memory"
-                )
+            if _caller(1) == "_prefill_checkpoints":
+                calls["n"] += 1
+                if calls["n"] in fail_at:
+                    raise RuntimeError(message)
             return real_eval(*args)
 
         return mock.patch("mlx_lm.server.mx.eval", side_effect=fake_eval)
 
-    def test_prefill_oom_is_retried_once(self):
-        provider, prompt_cache, url = self._serve()
-        messages = [
-            {"role": "system", "content": self.SYSTEM},
+    def _messages(self, system=None):
+        return [
+            {"role": "system", "content": system or self.SYSTEM},
             {"role": "user", "content": "Hello!"},
         ]
-        with self.assertLogs(level="WARNING") as logs, self._failing_eval(1):
-            self._chat(url, messages)
+
+    def test_metal_oom_signature(self):
+        from mlx_lm.server import _is_metal_oom
+
+        self.assertTrue(_is_metal_oom(RuntimeError(self.OOM)))
+        self.assertTrue(
+            _is_metal_oom(
+                RuntimeError(
+                    "[METAL] Command buffer execution failed: Insufficient Memory"
+                )
+            )
+        )
+        self.assertFalse(_is_metal_oom(RuntimeError("out of memory")))
+        self.assertFalse(_is_metal_oom(MemoryError(self.OOM)))
+
+    def test_prefill_oom_is_retried_once(self):
+        _, _, cold_url = self._serve()
+        _, expected = self._chat(cold_url, self._messages(), 8, True)
+
+        provider, prompt_cache, url = self._serve()
+        other = self._messages("An unrelated system prompt. " * 12)
+        self._chat(url, other)
+        n_before = len(prompt_cache)
+        self.assertGreater(n_before, 0)
+
+        # The retry sees no memory room: stored caches go first.
+        limit = mx.device_info()["max_recommended_working_set_size"]
+        real_active = mx.get_active_memory
+
+        def active():
+            caller = _caller(2)
+            return limit if caller == "_free_memory_after_oom" else real_active()
+
+        memory = mock.patch("mlx_lm.server.mx.get_active_memory", side_effect=active)
+        with self.assertLogs(level="WARNING") as logs, self._failing_eval({1}):
+            with memory:
+                _, text = self._chat(url, self._messages(), 8, True)
         self.assertIn("retrying once", "\n".join(logs.output))
+        self.assertEqual(text, expected)
+        # The unrelated entries were evicted; this request's are stored.
+        tokens = provider.tokenizer.apply_chat_template(
+            other, add_generation_prompt=True
+        )
+        _, rest = prompt_cache.fetch_nearest_cache(provider.model_key, tokens)
+        self.assertEqual(len(rest), len(tokens))
         self.assertEqual(prompt_cache.stats_by_type()["system"]["n_sequences"], 1)
+
+    def test_other_runtime_error_is_not_retried(self):
+        provider, prompt_cache, url = self._serve()
+        self._chat(url, self._messages("An unrelated system prompt. " * 12))
+        n_before, bytes_before = len(prompt_cache), prompt_cache.nbytes
+        with self.assertNoLogs(level="WARNING"), self._failing_eval({1}, "boom"):
+            try:
+                response = requests.post(
+                    f"{url}/v1/chat/completions",
+                    json={
+                        "model": "chat_model",
+                        "max_tokens": 4,
+                        "messages": self._messages(),
+                    },
+                )
+                self.assertNotEqual(response.status_code, 200)
+            except requests.ConnectionError:
+                pass
+        self.assertEqual(len(prompt_cache), n_before)
+        self.assertEqual(prompt_cache.nbytes, bytes_before)
 
     def test_progress_after_an_oom_retry_only_moves_forward(self):
         provider, prompt_cache, url = self._serve()
         provider.cli_args.prefill_step_size = 16
-        messages = [
-            {"role": "system", "content": self.SYSTEM},
-            {"role": "user", "content": "Hello!"},
-        ]
         # Fail the third chunk: the retry starts again from 0.
-        real_eval, calls = mx.eval, {"n": 0}
-
-        def fake_eval(*args):
-            calls["n"] += 1
-            if calls["n"] == 3:
-                raise RuntimeError("[METAL] Insufficient Memory")
-            return real_eval(*args)
-
-        with mock.patch("mlx_lm.server.mx.eval", side_effect=fake_eval):
+        with self._failing_eval({3}):
             response = requests.post(
                 f"{url}/v1/chat/completions",
                 json={
                     "model": "chat_model",
                     "max_tokens": 4,
                     "stream": True,
-                    "messages": messages,
+                    "messages": self._messages(),
                 },
             )
             lines = [l.decode() for l in response.iter_lines() if l]
@@ -1026,7 +1082,7 @@ class TestServerSingleCheckpoints(unittest.TestCase):
             {"role": "system", "content": self.SYSTEM},
             {"role": "user", "content": "Hello!"},
         ]
-        with self._failing_eval(2):
+        with self._failing_eval({1, 2}):
             try:
                 response = requests.post(
                     f"{url}/v1/chat/completions",
@@ -1103,6 +1159,19 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         return gen
 
 
+def _caller(depth):
+    """Name of the function `depth` calls up from a mock's side_effect,
+    not counting unittest.mock frames."""
+    f = sys._getframe(2)
+    while depth:
+        if not f.f_code.co_filename.endswith("mock.py"):
+            depth -= 1
+            if not depth:
+                break
+        f = f.f_back
+    return f.f_code.co_name
+
+
 def _tiny_llama():
     from mlx_lm.models import llama
 
@@ -1175,6 +1244,17 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def test_trim_to_keeps_an_entry(self):
+        cache = LRUPromptCache()
+        cache.insert_cache("m", [1], [MockCache("aaaa")])
+        cache.insert_cache("m", [2], [MockCache("bbbb")])
+        cache.insert_cache("m", [3], [MockCache("cccc")])
+        cache.trim_to(n_bytes=4, keep=("m", [1]))
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.fetch_nearest_cache("m", [1])[1], [])
+        self.assertEqual(cache.last_fetched, ("m", [1]))
+        self.assertEqual(cache.entry_nbytes(("m", [1])), 4)
+
     def test_sliding_window_keeps_prefixes(self):
         # A sliding window below its size is trimmable only until it is
         # full: its prefix entries must stay.
