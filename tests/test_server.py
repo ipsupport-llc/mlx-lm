@@ -942,11 +942,74 @@ class TestServerSingleCheckpoints(unittest.TestCase):
     def test_checkpoint_room(self):
         gb = 1 << 30
         # 10 GB in use, 1 GB copy, 0.5 GB prefill scratch, 19 GB limit.
-        self.assertLessEqual(checkpoint_room(gb, 10 * gb, 19 * gb, gb // 2), 0)
+        self.assertLessEqual(checkpoint_room(gb, 10 * gb, 19 * gb, gb // 2, 0.9), 0)
         # 16.5 GB in use: 0.9 * 19 GB = 17.1 GB is exceeded by 0.9 GB.
-        short = checkpoint_room(gb, 16 * gb + gb // 2, 19 * gb, gb // 2)
+        short = checkpoint_room(gb, 16 * gb + gb // 2, 19 * gb, gb // 2, 0.9)
         self.assertEqual(short, 18 * gb - int(0.9 * 19 * gb))
         self.assertGreater(short, 0)
+        # A larger headroom fraction leaves room.
+        self.assertLessEqual(
+            checkpoint_room(gb, 16 * gb + gb // 2, 19 * gb, gb // 2, 1.0), 0
+        )
+
+    def test_memory_flags(self):
+        from mlx_lm.server import SERVER_DEFAULTS, make_parser
+
+        args = make_parser().parse_args([])
+        for name, value in SERVER_DEFAULTS.items():
+            self.assertEqual(getattr(args, name), value, name)
+        args = make_parser().parse_args(
+            [
+                "--memory-headroom-fraction", "0.8",
+                "--oom-retry-step-divisor", "4",
+                "--junction-min-gap-tokens", "64",
+                "--min-prefill-step", "32",
+                "--prefill-score-bytes", "2",
+                "--prefill-step-warn-below", "256",
+            ]
+        )  # fmt: skip
+        gen = self._generator(prefill_step_size=2048)
+        gen.model_provider.cli_args = args
+        self.assertEqual(gen._opt("memory_headroom_fraction"), 0.8)
+        self.assertEqual(gen._opt("junction_min_gap_tokens"), 64)
+        budget = gen._prefill_memory_budget(args.oom_retry_step_divisor)
+        self.assertEqual(budget.nbytes, (512 << 20) // 4)
+        self.assertEqual((budget.min_step, budget.score_bytes), (32, 2))
+        # Headroom reaches the room check.
+        limit = mx.device_info()["max_recommended_working_set_size"]
+        with mock.patch(
+            "mlx_lm.server.mx.get_active_memory", return_value=int(0.85 * limit)
+        ):
+            self.assertIsNotNone(gen._memory_shortfall(0, None))
+            self.assertGreater(gen._memory_shortfall(0, None), 0)
+            args.memory_headroom_fraction = 0.9
+            self.assertLessEqual(gen._memory_shortfall(0, None), 0)
+
+    def test_retry_step_divisor_reaches_the_prefill(self):
+        # The retry's step is the configured step divided by the flag.
+        gen = self._generator(prefill_step_size=128)
+        gen.model_provider.cli_args.oom_retry_step_divisor = 4
+        gen.model_provider.cli_args.prefill_memory_mb = 0
+        seen = []
+        ctx = GenerationContext(None, None, None, None, None, None)
+        cache = [RotatingKVCache(max_size=16) for _ in range(2)]
+        gen._prefill_checkpoints(
+            _tiny_llama(), None, cache, 2, list(range(200)), 0,
+            [list(range(100)), list(range(100, 200))], ["system", "user"],
+            mx.default_stream(mx.default_device()),
+            lambda p, t: seen.append(p), ctx, step_divisor=4,
+        )  # fmt: skip
+        steps = [b - a for a, b in zip(seen, seen[1:]) if b > a]
+        self.assertEqual(max(steps), 32)
+
+    def test_junction_gap_flag(self):
+        gen = self._generator(prefill_step_size=64)
+        gen.prompt_cache.last_divergence = (100, 300)
+        segs, types_ = [list(range(300))], ["user"]
+        self.assertEqual(gen._junction_split(segs, types_, 0, 300), (segs, types_))
+        gen.model_provider.cli_args.junction_min_gap_tokens = 50
+        segs2, types2 = gen._junction_split(segs, types_, 0, 300)
+        self.assertEqual([len(x) for x in segs2], [100, 200])
 
     def test_checkpoint_skipped_without_memory_room(self):
         provider, prompt_cache, url = self._serve()

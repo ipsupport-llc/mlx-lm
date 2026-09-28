@@ -297,6 +297,22 @@ class GenerationResponse:
 
 
 MIN_PREFILL_STEP = 16
+DEFAULT_PREFILL_SCORE_BYTES = 4
+
+
+@dataclass
+class PrefillBudget:
+    """Memory budget for the attention scores of one prefill chunk.
+
+    Args:
+        nbytes: bytes for the scores array of one layer.
+        min_step: the step never goes below this (or the max step).
+        score_bytes: bytes per score element assumed (4: fp32, safe).
+    """
+
+    nbytes: int
+    min_step: int = MIN_PREFILL_STEP
+    score_bytes: int = DEFAULT_PREFILL_SCORE_BYTES
 
 # Head dims mx.fast.scaled_dot_product_attention runs fused (no scores array)
 # for a prefill chunk (query length > 8), MLX 0.32. 192 and 256 are sent to
@@ -309,7 +325,7 @@ def adaptive_prefill_step(
     offset: int,
     n_heads: int,
     budget_bytes: Optional[int],
-    score_bytes: int = 4,
+    score_bytes: int = DEFAULT_PREFILL_SCORE_BYTES,
     min_step: int = MIN_PREFILL_STEP,
 ) -> int:
     """The largest prefill chunk whose attention scores
@@ -366,20 +382,31 @@ def kv_cache_quantized(cache) -> bool:
 
 
 def make_prefill_step(
-    model: nn.Module, max_step: int, budget_bytes: Optional[int]
+    model: nn.Module,
+    max_step: int,
+    budget: Union[None, int, PrefillBudget],
 ) -> Callable[[int, bool], int]:
     """``step(offset, quantized)``: the prefill step for a chunk at
-    ``offset``. It is limited by ``budget_bytes`` only where the scores are
-    materialized: unfused head dims, or a quantized KV cache (quantized
-    SDPA)."""
+    ``offset``. It is limited by ``budget`` (bytes, or a
+    :class:`PrefillBudget`) only where the scores are materialized: unfused
+    head dims, or a quantized KV cache (quantized SDPA)."""
+    if budget is not None and not isinstance(budget, PrefillBudget):
+        budget = PrefillBudget(budget)
     n_heads, fused = attention_scores_heads(model)
-    if not budget_bytes or n_heads == 0:
+    if budget is None or not budget.nbytes or n_heads == 0:
         return lambda offset, quantized: max_step
 
     def step(offset, quantized):
         if fused and not quantized:
             return max_step
-        return adaptive_prefill_step(max_step, offset, n_heads, budget_bytes)
+        return adaptive_prefill_step(
+            max_step,
+            offset,
+            n_heads,
+            budget.nbytes,
+            score_bytes=budget.score_bytes,
+            min_step=budget.min_step,
+        )
 
     return step
 
@@ -414,7 +441,7 @@ def generate_step(
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
-    prefill_memory_budget: Optional[int] = None,
+    prefill_memory_budget: Union[None, int, PrefillBudget] = None,
     token_history: Optional[List[int]] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -444,9 +471,10 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
-        prefill_memory_budget (int, optional): Bytes for the attention scores
-          of one prefill chunk: the step shrinks as the cache grows (see
-          :func:`adaptive_prefill_step`). Default: ``None`` (fixed step).
+        prefill_memory_budget (int or PrefillBudget, optional): Bytes for the
+          attention scores of one prefill chunk: the step shrinks as the
+          cache grows (see :func:`adaptive_prefill_step`). Default: ``None``
+          (fixed step).
         token_history (List[int], optional): Tokens before ``prompt`` that
           ``prompt_cache`` already holds. The logits processors see them.
 
@@ -607,7 +635,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
-    prefill_memory_budget: Optional[int] = None,
+    prefill_memory_budget: Union[None, int, PrefillBudget] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -845,7 +873,7 @@ def nemotron_h_mtp_generate_step(
     prefill_step_size: int = 2048,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
-    prefill_memory_budget: Optional[int] = None,
+    prefill_memory_budget: Union[None, int, PrefillBudget] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Self-speculative decoding using Nemotron-H's in-checkpoint MTP head.
 
@@ -1081,7 +1109,7 @@ def gemma4_mtp_generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
-    prefill_memory_budget: Optional[int] = None,
+    prefill_memory_budget: Union[None, int, PrefillBudget] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Speculative decoding for Gemma 4 with its MTP drafter
     (``gemma4_assistant``, e.g. google/gemma-4-26B-A4B-it-assistant).
