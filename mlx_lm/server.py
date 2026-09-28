@@ -64,6 +64,18 @@ from .utils import (
 )
 
 
+def _is_metal_oom(e):
+    msg = str(e).lower()
+    return "insufficient memory" in msg or "out of memory" in msg
+
+
+def checkpoint_room(live, active, limit, prefill_budget):
+    """Bytes missing to copy a live cache of `live` bytes and still run the
+    next prefill chunk (`prefill_budget`) within 90% of `limit`, with
+    `active` bytes in use. 0 or less: it fits."""
+    return active + live + prefill_budget - int(0.9 * limit)
+
+
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
@@ -1080,62 +1092,80 @@ class ResponseGenerator:
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
-            # Load the KV cache
-            self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, cache_prompt
-            )
-            # Image requests run without the draft model (it can't consume
-            # the fused image embeddings), so their caches have no draft
-            # slots: match the slots to this request.
             use_draft = (
                 self.model_provider.draft_model is not None
                 and input_embeddings is None
             )
-            cache, rest = self._match_draft_slots(cache, rest, cache_prompt, use_draft)
-            ctx.prompt_cache_count = len(cache_prompt) - len(rest)
-            self._log_cache_reuse(ctx.prompt_cache_count, len(cache_prompt))
-            cache_key = cache_prompt[:]
-            if input_embeddings is not None:
-                # `rest` is a slice of the cache key (pseudo ids at image
-                # positions); feed the real ids + embeddings for that tail.
-                n_cached = ctx.prompt_cache_count
-                rest = prompt[n_cached:]
-                input_embeddings = input_embeddings[n_cached:]
-            if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
-                if use_draft:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+            n_main = len(make_prompt_cache(model))
+            prompt_embeddings = input_embeddings
+            # A Metal OOM in the checkpoint prefill frees stored caches and
+            # starts once more from a fresh cache (the failed one is lost).
+            for attempt in range(2):
+                try:
+                    cache = None
+                    input_embeddings = prompt_embeddings
+                    seg, seg_types = segments, segment_types
+                    # Load the KV cache
+                    self._log_cache_stats()
+                    cache, rest = self.prompt_cache.fetch_nearest_cache(
+                        self.model_provider.model_key, cache_prompt
+                    )
+                    # Image requests run without the draft model (it can't consume
+                    # the fused image embeddings), so their caches have no draft
+                    # slots: match the slots to this request.
+                    cache, rest = self._match_draft_slots(
+                        cache, rest, cache_prompt, use_draft
+                    )
+                    ctx.prompt_cache_count = len(cache_prompt) - len(rest)
+                    self._log_cache_reuse(ctx.prompt_cache_count, len(cache_prompt))
+                    cache_key = cache_prompt[:]
+                    if input_embeddings is not None:
+                        # `rest` is a slice of the cache key (pseudo ids at image
+                        # positions); feed the real ids + embeddings for that tail.
+                        n_cached = ctx.prompt_cache_count
+                        rest = prompt[n_cached:]
+                        input_embeddings = input_embeddings[n_cached:]
+                    if cache is None:
+                        cache = make_prompt_cache(self.model_provider.model)
+                        if use_draft:
+                            cache += make_prompt_cache(self.model_provider.draft_model)
 
-            self._log_prefill_step(model, len(cache_prompt), ctx.prompt_cache_count)
+                    self._log_prefill_step(
+                        model, len(cache_prompt), ctx.prompt_cache_count
+                    )
 
-            # Prefill up to the end of the system and user segments and save a
-            # checkpoint at each, as the batched path does. A non-trimmable
-            # cache (e.g. a sliding window) can't be cut back from the whole
-            # sequence when the next turn diverges in the last answer.
-            n_prefilled = 0
-            if input_embeddings is None:
-                segments, segment_types = self._junction_split(
-                    segments, segment_types, ctx.prompt_cache_count, len(prompt)
-                )
-                n_main = len(make_prompt_cache(model))
-                n_prefilled = self._prefill_checkpoints(
-                    model,
-                    draft_model if use_draft else None,
-                    cache,
-                    n_main,
-                    prompt,
-                    ctx.prompt_cache_count,
-                    segments,
-                    segment_types,
-                    stream,
-                    progress,
-                    ctx,
-                )
-                if n_prefilled is None:
-                    rqueue.put(None)
-                    return
-                rest = rest[n_prefilled:]
+                    # Prefill up to the end of the system and user segments and save a
+                    # checkpoint at each, as the batched path does. A non-trimmable
+                    # cache (e.g. a sliding window) can't be cut back from the whole
+                    # sequence when the next turn diverges in the last answer.
+                    n_prefilled = 0
+                    if input_embeddings is None:
+                        seg, seg_types = self._junction_split(
+                            seg, seg_types, ctx.prompt_cache_count, len(prompt)
+                        )
+                        n_prefilled = self._prefill_checkpoints(
+                            model,
+                            draft_model if use_draft else None,
+                            cache,
+                            n_main,
+                            prompt,
+                            ctx.prompt_cache_count,
+                            seg,
+                            seg_types,
+                            stream,
+                            progress,
+                            ctx,
+                        )
+                        if n_prefilled is None:
+                            rqueue.put(None)
+                            return
+                        rest = rest[n_prefilled:]
+                    break
+                except RuntimeError as e:
+                    if attempt or self._is_distributed or not _is_metal_oom(e):
+                        raise
+                    del cache
+                    self._free_memory_after_oom(e)
 
             def generate_progress(processed, total):
                 progress(n_prefilled + processed, n_prefilled + total)
@@ -1213,6 +1243,31 @@ class ResponseGenerator:
         except Exception as e:
             rqueue.put(e)
 
+    def _make_memory_room(self, nbytes):
+        """Evict stored caches until a copy of `nbytes` and a prefill chunk
+        fit in GPU memory. False if they can't."""
+        limit = mx.device_info()["max_recommended_working_set_size"]
+        budget = self._prefill_memory_budget() or 0
+        short = checkpoint_room(nbytes, mx.get_active_memory(), limit, budget)
+        if short <= 0:
+            return True
+        if self.prompt_cache.nbytes > 0:
+            self.prompt_cache.trim_to(n_bytes=max(0, self.prompt_cache.nbytes - short))
+            gc.collect()
+            short = checkpoint_room(nbytes, mx.get_active_memory(), limit, budget)
+        return short <= 0
+
+    def _free_memory_after_oom(self, e):
+        n_bytes = self.prompt_cache.nbytes
+        self.prompt_cache.trim_to(n_bytes=n_bytes // 2)
+        gc.collect()
+        mx.clear_cache()
+        logging.warning(
+            f"Prefill ran out of memory ({e}); prompt cache trimmed from "
+            f"{n_bytes / 1e9:.2f} to {self.prompt_cache.nbytes / 1e9:.2f} GB, "
+            "retrying once"
+        )
+
     def _prefill_memory_budget(self):
         mb = getattr(self.cli_args, "prefill_memory_mb", DEFAULT_PREFILL_MEMORY_MB)
         return mb * (1 << 20) if mb else None
@@ -1279,6 +1334,7 @@ class ResponseGenerator:
         )
         total = len(prompt) - n_cached
         done = n_cached
+        skipped = False
         with wired_limit(model, [stream]), mx.stream(stream):
             progress(0, total)
             for end, seg_type in ends:
@@ -1305,6 +1361,15 @@ class ResponseGenerator:
                     if 2 * nbytes > cap:
                         continue
                     self.prompt_cache.trim_to(n_bytes=cap - 2 * nbytes)
+                # The copy and the next chunk must fit in GPU memory too:
+                # older entries go first, else no checkpoint.
+                if not self._make_memory_room(nbytes):
+                    if not skipped:
+                        logging.warning(
+                            "Prompt cache: checkpoint skipped: no memory room"
+                        )
+                    skipped = True
+                    continue
                 self.prompt_cache.insert_cache(
                     self.model_provider.model_key,
                     prompt[:end],

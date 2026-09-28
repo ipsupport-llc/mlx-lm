@@ -32,6 +32,7 @@ from mlx_lm.server import (
     SamplingArguments,
     ToolCallFormatter,
     _make_sampler,
+    checkpoint_room,
 )
 from mlx_lm.tool_parsers import pythonic
 from mlx_lm.utils import load
@@ -936,6 +937,74 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         self._chat(url, first)
         self._chat(url, first + [{"role": "assistant", "content": "Hi."}])
         self.assertLessEqual(prompt_cache.nbytes, 1)
+
+    def test_checkpoint_room(self):
+        gb = 1 << 30
+        # 10 GB in use, 1 GB copy, 0.5 GB prefill scratch, 19 GB limit.
+        self.assertLessEqual(checkpoint_room(gb, 10 * gb, 19 * gb, gb // 2), 0)
+        # 16.5 GB in use: 0.9 * 19 GB = 17.1 GB is exceeded by 0.9 GB.
+        short = checkpoint_room(gb, 16 * gb + gb // 2, 19 * gb, gb // 2)
+        self.assertEqual(short, 18 * gb - int(0.9 * 19 * gb))
+        self.assertGreater(short, 0)
+
+    def test_checkpoint_skipped_without_memory_room(self):
+        provider, prompt_cache, url = self._serve()
+        messages = [
+            {"role": "system", "content": self.SYSTEM},
+            {"role": "user", "content": "Hello!"},
+        ]
+        limit = mx.device_info()["max_recommended_working_set_size"]
+        with mock.patch("mlx_lm.server.mx.get_active_memory", return_value=limit):
+            with self.assertLogs(level="WARNING") as logs:
+                self._chat(url, messages)
+        text = "\n".join(logs.output)
+        self.assertEqual(text.count("checkpoint skipped: no memory room"), 1)
+        stats = prompt_cache.stats_by_type()
+        self.assertEqual(stats["system"]["n_sequences"], 0)
+        self.assertEqual(stats["assistant"]["n_sequences"], 1)
+
+    def _failing_eval(self, n_failures):
+        real_eval = mx.eval
+        calls = {"n": 0}
+
+        def fake_eval(*args):
+            calls["n"] += 1
+            if calls["n"] <= n_failures:
+                raise RuntimeError(
+                    "[METAL] Command buffer execution failed: Insufficient Memory"
+                )
+            return real_eval(*args)
+
+        return mock.patch("mlx_lm.server.mx.eval", side_effect=fake_eval)
+
+    def test_prefill_oom_is_retried_once(self):
+        provider, prompt_cache, url = self._serve()
+        messages = [
+            {"role": "system", "content": self.SYSTEM},
+            {"role": "user", "content": "Hello!"},
+        ]
+        with self.assertLogs(level="WARNING") as logs, self._failing_eval(1):
+            self._chat(url, messages)
+        self.assertIn("retrying once", "\n".join(logs.output))
+        self.assertEqual(prompt_cache.stats_by_type()["system"]["n_sequences"], 1)
+
+    def test_prefill_oom_twice_fails_the_request(self):
+        provider, prompt_cache, url = self._serve()
+        messages = [
+            {"role": "system", "content": self.SYSTEM},
+            {"role": "user", "content": "Hello!"},
+        ]
+        with self._failing_eval(2):
+            try:
+                response = requests.post(
+                    f"{url}/v1/chat/completions",
+                    json={"model": "chat_model", "max_tokens": 4, "messages": messages},
+                )
+                self.assertNotEqual(response.status_code, 200)
+            except requests.ConnectionError:
+                pass
+        # The server keeps serving.
+        self._chat(url, messages)
 
     def test_trimmable_cache_skips_checkpoints(self):
         self.assertTrue(stays_trimmable([KVCache(), CacheList(KVCache())]))
