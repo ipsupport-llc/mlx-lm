@@ -985,6 +985,49 @@ class TestServerSingleCheckpoints(unittest.TestCase):
             args.memory_headroom_fraction = 0.9
             self.assertLessEqual(gen._memory_shortfall(0, None), 0)
 
+    def test_memory_flags_are_validated(self):
+        from mlx_lm.server import make_parser
+
+        bad = [
+            ("--oom-retry-step-divisor", "0"),
+            ("--min-prefill-step", "0"),
+            ("--prefill-score-bytes", "0"),
+            ("--prefill-memory-mb", "-1"),
+            ("--junction-min-gap-tokens", "-1"),
+            ("--prefill-step-warn-below", "-5"),
+            ("--memory-headroom-fraction", "0"),
+            ("--memory-headroom-fraction", "1.5"),
+            ("--memory-headroom-fraction", "abc"),
+            ("--min-prefill-step", "2.5"),
+        ]
+        for flag, value in bad:
+            with self.subTest(flag=flag, value=value):
+                stderr = mock.patch("sys.stderr", new_callable=io.StringIO)
+                with stderr as err, self.assertRaises(SystemExit):
+                    make_parser().parse_args([flag, value])
+                self.assertIn(flag, err.getvalue())
+        ok = make_parser().parse_args(
+            ["--memory-headroom-fraction", "1", "--prefill-memory-mb", "0"]
+        )
+        self.assertEqual(
+            (ok.memory_headroom_fraction, ok.prefill_memory_mb), (1.0, 0)
+        )
+
+    def test_foreign_cli_args_are_clamped(self):
+        gen = self._generator(prefill_step_size=128)
+        args = gen.model_provider.cli_args
+        args.oom_retry_step_divisor = 0
+        args.min_prefill_step = -3
+        args.memory_headroom_fraction = 2.0
+        args.junction_min_gap_tokens = -10
+        self.assertEqual(gen._opt("oom_retry_step_divisor"), 1)
+        self.assertEqual(gen._opt("min_prefill_step"), 1)
+        self.assertEqual(gen._opt("memory_headroom_fraction"), 1.0)
+        self.assertEqual(gen._opt("junction_min_gap_tokens"), 0)
+        args.memory_headroom_fraction = -1
+        self.assertEqual(gen._opt("memory_headroom_fraction"), 0.9)
+        self.assertEqual(gen._prefill_memory_budget(0).nbytes, 512 << 20)
+
     def test_retry_step_divisor_reaches_the_prefill(self):
         # The retry's step is the configured step divided by the flag.
         gen = self._generator(prefill_step_size=128)

@@ -68,6 +68,42 @@ SERVER_DEFAULTS = {
     "oom_retry_step_divisor": 2,
     "junction_min_gap_tokens": 256,
 }
+# Smallest valid value of the integer options above.
+_OPT_MIN = {
+    "prefill_memory_mb": 0,
+    "min_prefill_step": 1,
+    "prefill_score_bytes": 1,
+    "prefill_step_warn_below": 0,
+    "oom_retry_step_divisor": 1,
+    "junction_min_gap_tokens": 0,
+}
+
+
+def _int_at_least(lo):
+    def parse(value):
+        try:
+            n = int(value)
+        except ValueError:
+            n = None
+        if n is None or n < lo:
+            raise argparse.ArgumentTypeError(
+                f"must be an integer >= {lo}, got {value!r}"
+            )
+        return n
+
+    return parse
+
+
+def _fraction(value):
+    try:
+        x = float(value)
+    except ValueError:
+        x = None
+    if x is None or not 0 < x <= 1:
+        raise argparse.ArgumentTypeError(
+            f"must be a number in (0, 1], got {value!r}"
+        )
+    return x
 from .multimodal import extract_images, load_image_inputs
 from .multimodal import vision_spans as multimodal_vision_spans
 from .sample_utils import greedy_sampler, make_logits_processors, make_sampler
@@ -1145,6 +1181,8 @@ class ResponseGenerator:
                 cache, rest = self._match_draft_slots(
                     cache, rest, cache_prompt, use_draft
                 )
+                if cache is None:
+                    reused = None
                 ctx.prompt_cache_count = len(cache_prompt) - len(rest)
                 self._log_cache_reuse(ctx.prompt_cache_count, len(cache_prompt))
                 cache_key = cache_prompt[:]
@@ -1305,10 +1343,11 @@ class ResponseGenerator:
         mx.synchronize()
         mx.clear_cache()
 
-    def _make_memory_room(self, nbytes):
+    def _make_memory_room(self, nbytes, divisor=1):
         """Evict stored caches until a copy of `nbytes` and a prefill chunk
-        fit in GPU memory. False if they can't."""
-        budget = self._prefill_memory_budget()
+        (the budget divided by `divisor`, as the current attempt runs) fit
+        in GPU memory. False if they can't."""
+        budget = self._prefill_memory_budget(divisor)
         short = self._memory_shortfall(nbytes, budget)
         if short is None or short <= 0:
             return True
@@ -1337,11 +1376,19 @@ class ResponseGenerator:
         )
 
     def _opt(self, name):
-        return getattr(self.cli_args, name, SERVER_DEFAULTS[name])
+        """A server option; out-of-range values (cli_args not from
+        make_parser) are clamped to the valid range."""
+        value = getattr(self.cli_args, name, SERVER_DEFAULTS[name])
+        if name in _OPT_MIN:
+            return max(_OPT_MIN[name], int(value))
+        if name == "memory_headroom_fraction":
+            return min(1.0, value) if value > 0 else SERVER_DEFAULTS[name]
+        return value
 
     def _prefill_memory_budget(self, divisor=1):
         """The PrefillBudget from the server options (None if disabled);
         `divisor` scales it down for an OOM retry."""
+        divisor = max(1, int(divisor))
         mb = self._opt("prefill_memory_mb")
         if not mb:
             return None
@@ -1449,7 +1496,7 @@ class ResponseGenerator:
                     self.prompt_cache.trim_to(n_bytes=cap - 2 * nbytes)
                 # The copy and the next chunk must fit in GPU memory too:
                 # older entries go first, else no checkpoint.
-                if not self._make_memory_room(nbytes):
+                if not self._make_memory_room(nbytes, step_divisor):
                     if not skipped:
                         logging.warning(
                             "Prompt cache: checkpoint skipped: no memory room"
@@ -2414,26 +2461,26 @@ def make_parser():
     )
     parser.add_argument(
         "--prefill-memory-mb",
-        type=int,
-        default=DEFAULT_PREFILL_MEMORY_MB,
+        type=_int_at_least(0),
+        default=SERVER_DEFAULTS["prefill_memory_mb"],
         help="Memory for the attention scores of one prefill step, in MB, "
         "where they are materialized (head dims without a fused kernel, or "
         "a quantized KV cache). The step shrinks as the prompt grows (not "
         "below --min-prefill-step). Single-request path only (draft model, "
         "MTP, --kv-bits, seed, images): batched prefill keeps "
         "--prefill-step-size. 0 keeps --prefill-step-size "
-        f"(default: {DEFAULT_PREFILL_MEMORY_MB})",
+        f"(default: {SERVER_DEFAULTS['prefill_memory_mb']})",
     )
     parser.add_argument(
         "--min-prefill-step",
-        type=int,
+        type=_int_at_least(1),
         default=SERVER_DEFAULTS["min_prefill_step"],
         help="Smallest prefill step --prefill-memory-mb may shrink to "
         f"(default: {SERVER_DEFAULTS['min_prefill_step']})",
     )
     parser.add_argument(
         "--prefill-score-bytes",
-        type=int,
+        type=_int_at_least(1),
         default=SERVER_DEFAULTS["prefill_score_bytes"],
         help="Bytes per attention score assumed by --prefill-memory-mb "
         "(4: fp32, the safe case; 2: bf16) "
@@ -2441,14 +2488,14 @@ def make_parser():
     )
     parser.add_argument(
         "--prefill-step-warn-below",
-        type=int,
+        type=_int_at_least(0),
         default=SERVER_DEFAULTS["prefill_step_warn_below"],
         help="Log a warning (slow prefill) when the prefill step shrinks "
         f"below this (default: {SERVER_DEFAULTS['prefill_step_warn_below']})",
     )
     parser.add_argument(
         "--memory-headroom-fraction",
-        type=float,
+        type=_fraction,
         default=SERVER_DEFAULTS["memory_headroom_fraction"],
         help="Fraction of Metal's recommended working set that memory in "
         "use, a prompt-cache checkpoint copy and the prefill budget may "
@@ -2459,7 +2506,7 @@ def make_parser():
     )
     parser.add_argument(
         "--oom-retry-step-divisor",
-        type=int,
+        type=_int_at_least(1),
         default=SERVER_DEFAULTS["oom_retry_step_divisor"],
         help="After a Metal out-of-memory error in the checkpoint prefill, "
         "retry once with the prefill step and --prefill-memory-mb divided "
@@ -2467,7 +2514,7 @@ def make_parser():
     )
     parser.add_argument(
         "--junction-min-gap-tokens",
-        type=int,
+        type=_int_at_least(0),
         default=SERVER_DEFAULTS["junction_min_gap_tokens"],
         help="A checkpoint where the prompt diverges from a cached one is "
         "saved only this many tokens or more away from the reused part, "
