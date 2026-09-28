@@ -988,6 +988,38 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         self.assertIn("retrying once", "\n".join(logs.output))
         self.assertEqual(prompt_cache.stats_by_type()["system"]["n_sequences"], 1)
 
+    def test_progress_after_an_oom_retry_only_moves_forward(self):
+        provider, prompt_cache, url = self._serve()
+        provider.cli_args.prefill_step_size = 16
+        messages = [
+            {"role": "system", "content": self.SYSTEM},
+            {"role": "user", "content": "Hello!"},
+        ]
+        # Fail the third chunk: the retry starts again from 0.
+        real_eval, calls = mx.eval, {"n": 0}
+
+        def fake_eval(*args):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise RuntimeError("[METAL] Insufficient Memory")
+            return real_eval(*args)
+
+        with mock.patch("mlx_lm.server.mx.eval", side_effect=fake_eval):
+            response = requests.post(
+                f"{url}/v1/chat/completions",
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 4,
+                    "stream": True,
+                    "messages": messages,
+                },
+            )
+            lines = [l.decode() for l in response.iter_lines() if l]
+        keepalives = [l for l in lines if l.startswith(": keepalive")]
+        done = [int(l.split()[2].split("/")[0]) for l in keepalives]
+        self.assertGreater(len(done), 2)
+        self.assertEqual(done, sorted(done))
+
     def test_prefill_oom_twice_fails_the_request(self):
         provider, prompt_cache, url = self._serve()
         messages = [

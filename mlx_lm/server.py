@@ -1032,8 +1032,14 @@ class ResponseGenerator:
         rqueue, request, args = request
 
         # Define the progress callback
+        # Progress only moves forward: a retry after an OOM starts again
+        # below what the client has already seen.
+        sent = [-1]
+
         def progress(tokens_processed, tokens_total):
-            rqueue.put((tokens_processed, tokens_total))
+            if tokens_processed > sent[0] or tokens_processed == tokens_total:
+                sent[0] = max(sent[0], tokens_processed)
+                rqueue.put((tokens_processed, tokens_total))
 
         try:
             # Load the model and tokenizer
@@ -1164,8 +1170,12 @@ class ResponseGenerator:
                 except RuntimeError as e:
                     if attempt or self._is_distributed or not _is_metal_oom(e):
                         raise
-                    del cache
-                    self._free_memory_after_oom(e)
+                    oom = str(e)
+                # Out of the except block: the exception and its traceback
+                # (frames holding the failed cache) are gone, so its buffers
+                # can be freed.
+                cache = None
+                self._free_memory_after_oom(oom)
 
             def generate_progress(processed, total):
                 progress(n_prefilled + processed, n_prefilled + total)
@@ -1257,13 +1267,13 @@ class ResponseGenerator:
             short = checkpoint_room(nbytes, mx.get_active_memory(), limit, budget)
         return short <= 0
 
-    def _free_memory_after_oom(self, e):
+    def _free_memory_after_oom(self, msg):
         n_bytes = self.prompt_cache.nbytes
         self.prompt_cache.trim_to(n_bytes=n_bytes // 2)
         gc.collect()
         mx.clear_cache()
         logging.warning(
-            f"Prefill ran out of memory ({e}); prompt cache trimmed from "
+            f"Prefill ran out of memory ({msg}); prompt cache trimmed from "
             f"{n_bytes / 1e9:.2f} to {self.prompt_cache.nbytes / 1e9:.2f} GB, "
             "retrying once"
         )
@@ -1370,12 +1380,16 @@ class ResponseGenerator:
                         )
                     skipped = True
                     continue
+                # Evaluated now, so the next room check sees its memory.
+                checkpoint = copy.deepcopy(cache)
+                mx.eval([c.state for c in checkpoint if c is not None])
                 self.prompt_cache.insert_cache(
                     self.model_provider.model_key,
                     prompt[:end],
-                    copy.deepcopy(cache),
+                    checkpoint,
                     cache_type=seg_type,
                 )
+                del checkpoint
         return done - n_cached
 
     def _match_draft_slots(self, cache, rest, cache_prompt, use_draft):
