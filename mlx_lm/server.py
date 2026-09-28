@@ -519,6 +519,54 @@ class ResponseGenerator:
     def is_healthy(self):
         return self.generation_available()
 
+    # A junction checkpoint needs this many tokens to the reused prefix, to
+    # the other checkpoints and to the prompt end.
+    JUNCTION_MIN_GAP = 256
+
+    def _junction_split(self, segments, segment_types, n_cached, n_prompt):
+        """Split the segments where the nearest cached prompt diverged from
+        this one (a "user" checkpoint there), when the reused cache stops
+        short of it. A later request that changes the same place (e.g. a
+        timestamp) reuses the common part."""
+        div = self.prompt_cache.last_divergence
+        if div is None:
+            return segments, segment_types
+        k, gap = div[0], self.JUNCTION_MIN_GAP
+        ends, end = [], 0
+        for seg in segments:
+            end += len(seg)
+            ends.append(end)
+        if k - n_cached < gap or n_prompt - 1 - k < gap:
+            return segments, segment_types
+        if any(abs(k - e) < gap for e in ends[:-1]):
+            return segments, segment_types
+        i = next(i for i, e in enumerate(ends) if e > k)
+        cut = k - (ends[i] - len(segments[i]))
+        logging.info(f"Prompt cache: checkpoint at the junction, token {k}")
+        segments = (
+            segments[:i] + [segments[i][:cut], segments[i][cut:]] + segments[i + 1 :]
+        )
+        segment_types = segment_types[:i] + ["user"] + segment_types[i:]
+        return segments, segment_types
+
+    def _trim_to_cap(self, batch_generator):
+        """Keep the stored caches and the active batch's live caches within
+        --prompt-cache-bytes."""
+        total = getattr(self.cli_args, "prompt_cache_bytes", None)
+        if total is not None:
+            active = batch_generator.prompt_cache_nbytes
+            self.prompt_cache.trim_to(n_bytes=total - active)
+
+    def _log_cache_reuse(self, n_reused, n_prompt):
+        logging.info(f"Prompt cache: reused {n_reused} of {n_prompt} tokens")
+        # A client that changes an earlier part of the prompt shows here.
+        div = self.prompt_cache.last_divergence
+        if div is not None:
+            logging.info(
+                f"Prompt cache: diverged from a cached prompt at token {div[0]} "
+                f"(of {div[1]})"
+            )
+
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
         n_bytes = self.prompt_cache.nbytes
@@ -633,10 +681,6 @@ class ResponseGenerator:
             think_end = tokenizer.rfind_think_end(prompt)
             if think_start > think_end:
                 initial_state = "reasoning"
-
-        # It is not a user message so no segmentation needed.
-        if messages[-1]["role"] != "user":
-            return prompt, [prompt], ["assistant"], initial_state
 
         segments = []
         segment_types = []
@@ -787,6 +831,10 @@ class ResponseGenerator:
                         current_model_key, prompt
                     )
                     prompt_cache_count = len(prompt) - len(rest)
+                    self._log_cache_reuse(prompt_cache_count, len(prompt))
+                    segments, segment_types = self._junction_split(
+                        segments, segment_types, prompt_cache_count, len(prompt)
+                    )
                     N = prompt_cache_count
                     while N > 0:
                         if N >= len(segments[0]):
@@ -826,10 +874,7 @@ class ResponseGenerator:
                     # just making sure we don't leave a reference around
                     del cache
 
-                    if self.model_provider.cli_args.prompt_cache_bytes is not None:
-                        total = self.model_provider.cli_args.prompt_cache_bytes
-                        active = batch_generator.prompt_cache_nbytes
-                        self.prompt_cache.trim_to(n_bytes=total - active)
+                    self._trim_to_cap(batch_generator)
                     continue
 
                 # No batch generator. Load the model and if it's not
@@ -910,6 +955,8 @@ class ResponseGenerator:
                             cache,
                             cache_type=batch_results[uid]["segment_types"].pop(),
                         )
+                    if caches:
+                        self._trim_to_cap(batch_generator)
                     del caches
 
                     for r in gen_responses:
@@ -949,6 +996,7 @@ class ResponseGenerator:
                                 r.prompt_cache,
                                 cache_type="assistant",
                             )
+                            self._trim_to_cap(batch_generator)
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
@@ -1046,6 +1094,7 @@ class ResponseGenerator:
             )
             cache, rest = self._match_draft_slots(cache, rest, cache_prompt, use_draft)
             ctx.prompt_cache_count = len(cache_prompt) - len(rest)
+            self._log_cache_reuse(ctx.prompt_cache_count, len(cache_prompt))
             cache_key = cache_prompt[:]
             if input_embeddings is not None:
                 # `rest` is a slice of the cache key (pseudo ids at image
@@ -1066,6 +1115,9 @@ class ResponseGenerator:
             # sequence when the next turn diverges in the last answer.
             n_prefilled = 0
             if input_embeddings is None:
+                segments, segment_types = self._junction_split(
+                    segments, segment_types, ctx.prompt_cache_count, len(prompt)
+                )
                 n_main = len(make_prompt_cache(model))
                 n_prefilled = self._prefill_checkpoints(
                     model,
