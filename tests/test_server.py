@@ -246,6 +246,14 @@ class TestToolCallFormatter(unittest.TestCase):
         )
 
 
+def _complete(port, prompt, max_tokens=8):
+    url = f"http://localhost:{port}/v1/completions"
+    body = {"model": "default_model", "prompt": prompt, "max_tokens": max_tokens, "temperature": 0.0}
+    response = requests.post(url, json=body)
+    return response.status_code, json.loads(response.text)
+
+
+
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -268,6 +276,20 @@ class TestServer(unittest.TestCase):
         cls.httpd.server_close()
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
+
+    def test_exact_prompt_cache_hit_keeps_serving(self):
+        # A prompt equal to a stored prompt+completion is an exact cache
+        # hit; the batched path used to strip every segment and kill the
+        # generation thread ("empty prompt") for all later requests.
+        status, first = _complete(self.port, "Once upon a time")
+        self.assertEqual(status, 200)
+        prompt = "Once upon a time" + first["choices"][0]["text"]
+        status, second = _complete(self.port, prompt)
+        self.assertEqual(status, 200)
+        self.assertIn("choices", second)
+        self.assertTrue(self.response_generator.generation_available())
+        status, _ = _complete(self.port, "Hello")
+        self.assertEqual(status, 200)
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -632,6 +654,15 @@ class TestServerKVCacheQuantization(unittest.TestCase):
         cls.httpd.server_close()
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
+
+    def test_exact_prompt_cache_hit_single_path(self):
+        # Quantized KV takes the single path: an exact hit used to hand
+        # stream_generate an empty prompt (an error for a valid request).
+        status, first = _complete(self.port, "In a small village")
+        self.assertEqual(status, 200)
+        status, second = _complete(self.port, "In a small village" + first["choices"][0]["text"])
+        self.assertEqual(status, 200)
+        self.assertIn("choices", second)
 
     def test_quantized_kv_disables_batching(self):
         args = type("args", (object,), {"seed": None})
@@ -1357,9 +1388,33 @@ class TestLRUPromptCache(unittest.TestCase):
         cache.insert_cache("m", [3], [MockCache("cccc")])
         cache.trim_to(n_bytes=4, keep=("m", [1]))
         self.assertEqual(len(cache), 1)
-        self.assertEqual(cache.fetch_nearest_cache("m", [1])[1], [])
+        # An exact hit leaves the last token to process.
+        self.assertEqual(cache.fetch_nearest_cache("m", [1])[1], [1])
         self.assertEqual(cache.last_fetched, ("m", [1]))
         self.assertEqual(cache.entry_nbytes(("m", [1])), 4)
+
+    def test_exact_hit_on_a_cache_that_cannot_trim(self):
+        # A hybrid model's SSM state can't drop its last token: an exact
+        # hit falls back to the nearest shorter entry instead.
+        cache = LRUPromptCache()
+        cache.insert_cache("m", [1, 2], [MockCache("short", is_trimmable=False)])
+        cache.insert_cache("m", [1, 2, 3, 4], [MockCache("full", is_trimmable=False)])
+        c, rest = cache.fetch_nearest_cache("m", [1, 2, 3, 4])
+        self.assertEqual(c, [MockCache("short")])
+        self.assertEqual(rest, [3, 4])
+        # With no shorter entry: nothing to reuse.
+        cache = LRUPromptCache()
+        cache.insert_cache("m", [1, 2], [MockCache("only", is_trimmable=False)])
+        c, rest = cache.fetch_nearest_cache("m", [1, 2])
+        self.assertIsNone(c)
+        self.assertEqual(rest, [1, 2])
+
+    def test_one_token_prefix_is_reused(self):
+        cache = LRUPromptCache()
+        cache.insert_cache("m", [7], [MockCache("one", is_trimmable=False)])
+        c, rest = cache.fetch_nearest_cache("m", [7, 8, 9])
+        self.assertEqual(c, [MockCache("one")])
+        self.assertEqual(rest, [8, 9])
 
     def test_sliding_window_keeps_prefixes(self):
         # A sliding window below its size is trimmable only until it is
@@ -1440,7 +1495,7 @@ class TestLRUPromptCache(unittest.TestCase):
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, [MockCache("test1")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [2])  # exact: its last token left to process
         c, t = cache.fetch_nearest_cache(model, [1])
         self.assertEqual(c, [MockCache("test1")])
         self.assertEqual(t, [1])
@@ -1463,10 +1518,10 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [1, 2])
         c, t = cache.fetch_nearest_cache(model, [2, 3])
         self.assertEqual(c, [MockCache("test2")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [3])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, [MockCache("test3")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [4])
 
         cache.insert_cache(model, [4, 5], [MockCache("test4")], cache_type="user")
         c, t = cache.fetch_nearest_cache(model, [2, 3])
@@ -1474,10 +1529,10 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [2, 3])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, [MockCache("test3")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [4])
         c, t = cache.fetch_nearest_cache(model, [4, 5])
         self.assertEqual(c, [MockCache("test4")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [5])
 
         cache.insert_cache(model, [5, 6], [MockCache("test5")])
         cache.insert_cache(model, [6, 7], [MockCache("test6")])
@@ -1486,10 +1541,10 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(t, [5, 6])
         c, t = cache.fetch_nearest_cache(model, [6, 7])
         self.assertEqual(c, [MockCache("test6")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [7])
         c, t = cache.fetch_nearest_cache(model, [4, 5])
         self.assertEqual(c, [MockCache("test4")])
-        self.assertEqual(t, [])
+        self.assertEqual(t, [5])
 
     def test_insert_trimmable_cache_removes_immediate_prefix(self):
         cache = LRUPromptCache(max_size=10)

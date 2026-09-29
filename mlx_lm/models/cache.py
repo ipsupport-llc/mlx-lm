@@ -1823,20 +1823,23 @@ class PromptTrie:
 
         # Walk the tokens as far as we can
         last_index = -1
+        previous_index = -1  # the entry before `last_index`
         index = 0
         while index < len(tokens) and tokens[index] in current:
             current = current[tokens[index]]
             if "__value__" in current:
-                last_index = index
+                previous_index, last_index = last_index, index
             index += 1
 
-        # Got an exact match
+        # Got an exact match; the nearest shorter entry too, for a cache
+        # that can't be reused whole (fetch_nearest_cache)
         if last_index == len(tokens) - 1 >= 0:
-            return PromptTrieResult(model, tokens, None, None, 0)
+            shorter = tokens[: previous_index + 1] if previous_index >= 0 else None
+            return PromptTrieResult(model, tokens, shorter, None, 0)
 
         # Check if we found a prefix at any point
         shorter = None
-        if last_index > 0:
+        if last_index >= 0:
             shorter = tokens[: last_index + 1]
 
         # Check for sequences that are longer
@@ -1922,10 +1925,21 @@ class LRUPromptCache:
         )
         # (model, tokens) of the entry the returned cache is copied from.
         self.last_fetched = None
+        # An exact hit still leaves one token to process: generation needs
+        # the logits of the prompt's last token, and every caller (the
+        # batched path strips the reused tokens from its segments, the single
+        # path passes the rest to stream_generate) fails on an empty rest --
+        # a request that repeats a stored prompt+completion used to kill the
+        # batched generation thread. A cache that can't drop its last token
+        # (a hybrid model's SSM state) isn't reused whole: the shorter or
+        # longer entries below apply as if there were no exact one.
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
-            self.last_fetched = (result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            if can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                trim_prompt_cache(cache, 1)
+                self.last_fetched = (result.model, result.exact)
+                return cache, tokens[-1:]
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
