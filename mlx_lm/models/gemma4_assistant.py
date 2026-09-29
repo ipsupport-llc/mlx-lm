@@ -102,8 +102,10 @@ class Model(nn.Module):
               V)}`` from the main model, already RoPE'd, ``[B, heads, L,
               head_dim]``, containing only valid (accepted) positions; the
               sliding pair already cut to the last ``sliding_window`` keys.
-            position: absolute position of the token whose embedding is in
-              ``inputs_embeds`` (RoPE offset for the queries).
+            position: RoPE offset for the queries: the position of the main
+              model's last accepted token. It stays the same for every draft
+              step of a round, as in transformers' Gemma 4 assistant
+              candidate generator (``position_ids`` fixed across its loop).
 
         Returns:
             (logits ``[B, 1, vocab]``, next hidden ``[B, 1,
