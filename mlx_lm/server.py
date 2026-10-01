@@ -1,7 +1,6 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
-import copy
 import gc
 import json
 import logging
@@ -1486,33 +1485,32 @@ class ResponseGenerator:
                     done += n
                     progress(done - n_cached, total)
                     mx.clear_cache()
-                # The live cache and the copy count against
-                # --prompt-cache-bytes: make room before the copy.
+                # The live cache and the checkpoint count against
+                # --prompt-cache-bytes: make room before it's stored. It
+                # copies only what the entries above it don't hold (the
+                # positions past the last checkpoint, the sliding windows).
+                key = self.model_provider.model_key
                 nbytes = sum(c.nbytes for c in cache if c is not None)
+                added = lambda: self.prompt_cache.insert_nbytes(key, prompt[:end], cache)
                 cap = getattr(cli_args, "prompt_cache_bytes", None)
                 if cap is not None:
-                    if 2 * nbytes > cap:
+                    if nbytes + added() > cap:
                         continue
-                    self.prompt_cache.trim_to(n_bytes=cap - 2 * nbytes)
+                    self.prompt_cache.trim_to(n_bytes=cap - nbytes - added())
                 # The copy and the next chunk must fit in GPU memory too:
                 # older entries go first, else no checkpoint.
-                if not self._make_memory_room(nbytes, step_divisor):
+                if not self._make_memory_room(added(), step_divisor):
                     if not skipped:
                         logging.warning(
                             "Prompt cache: checkpoint skipped: no memory room"
                         )
                     skipped = True
                     continue
-                # Evaluated now, so the next room check sees its memory.
-                checkpoint = copy.deepcopy(cache)
-                mx.eval([c.state for c in checkpoint if c is not None])
+                # Copied and evaluated now, so the next room check sees its
+                # memory.
                 self.prompt_cache.insert_cache(
-                    self.model_provider.model_key,
-                    prompt[:end],
-                    checkpoint,
-                    cache_type=seg_type,
+                    key, prompt[:end], cache, cache_type=seg_type, copy=True
                 )
-                del checkpoint
         return done - n_cached
 
     def _match_draft_slots(self, cache, rest, cache_prompt, use_draft):
