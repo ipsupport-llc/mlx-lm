@@ -1812,6 +1812,19 @@ class PromptTrie:
             current = current[tok]
         return values
 
+    def ancestors(self, model: Any, tokens: List[int]):
+        """(length, value) of the values stored strictly above `tokens` (its
+        prefixes), the longest first."""
+        current = self._trie.get(model)
+        found = []
+        for i, tok in enumerate(tokens):
+            if current is None:
+                break
+            if "__value__" in current:
+                found.append((i, current["__value__"]))
+            current = current.get(tok)
+        return found[::-1]
+
     def search(self, model: Any, tokens: List[int]) -> PromptTrieResult:
         if model not in self._trie:
             return PromptTrieResult(model, None, None, None, 0)
@@ -1860,11 +1873,136 @@ class PromptTrie:
         return PromptTrieResult(model, None, shorter, longer, common_prefix)
 
 
+def _layer_kind(layer):
+    """What two layers must share for one's first positions to stand in for
+    the other's, or None if `layer` can't be stored in chunks: only caches
+    that grow by appending (a KV cache's first n positions are the cache of
+    the first n tokens). A sliding window or an SSM state is stored whole."""
+    if type(layer) is KVCache:
+        return (KVCache,)
+    if type(layer) is QuantizedKVCache:
+        return (QuantizedKVCache, layer.group_size, layer.bits)
+    return None
+
+
+def _kv_arrays(layer):
+    """A growing layer's buffers as a flat tuple (keys, values, or each one's
+    quantized parts)."""
+    if isinstance(layer, QuantizedKVCache):
+        return (*layer.keys, *layer.values)
+    return (layer.keys, layer.values)
+
+
+def _window_size(layer):
+    """The positions `_window_copy` keeps of `layer`, or None if it wouldn't
+    cut it."""
+    if type(layer) is not RotatingKVCache or layer.keys is None:
+        return None
+    size = layer.keys.shape[2]
+    # After a multi-token update the buffer is in temporal order.
+    if layer.offset < layer.max_size or size <= layer.max_size or layer._idx != size:
+        return None
+    return layer.max_size
+
+
+def _window_copy(layer):
+    """A copy of a sliding-window layer cut to what it will still use, or
+    None if there's nothing to cut. A multi-token update leaves the window
+    plus that update's tokens in the buffer (about `max_size` + a prefill
+    chunk); the updates after it read only the `keep` first positions and
+    the last `max_size` ones, which is the state a one-token update trims
+    the buffer to -- so they give the same keys and values either way."""
+    if _window_size(layer) is None:
+        return None
+    size = layer.keys.shape[2]
+    window = copy.copy(layer)
+    tail = layer.max_size - layer.keep
+    cut = lambda v: mx.contiguous(
+        mx.concatenate([v[..., : layer.keep, :], v[..., size - tail :, :]], axis=2)
+    )
+    window.keys, window.values = cut(layer.keys), cut(layer.values)
+    window._idx = layer.max_size
+    mx.eval(window.keys, window.values)
+    return window
+
+
+class _Chunk:
+    """Positions [start, end) of one growing layer, shared by every entry
+    whose prompt goes through the entry that stored it."""
+
+    __slots__ = ("arrays", "start", "end", "nbytes")
+
+    def __init__(self, layer, start, end, copy):
+        n = layer.offset
+        # A view keeps the whole buffer alive: only a whole, unpadded
+        # buffer nobody else writes to is kept as it is.
+        whole = start == 0 and end == n and _kv_arrays(layer)[0].shape[-2] == n
+        cut = lambda x: x[..., start:end, :]
+        if copy or not whole:
+            self.arrays = tuple(mx.contiguous(cut(x)) for x in _kv_arrays(layer))
+        else:
+            self.arrays = tuple(cut(x) for x in _kv_arrays(layer))
+        mx.eval(self.arrays)
+        self.start, self.end = start, end
+        self.nbytes = sum(x.nbytes for x in self.arrays)
+
+
+class _ChunkedLayer:
+    """A stored growing layer: its positions as chunks, the first ones those
+    of the entry above it in the trie."""
+
+    nbytes = 0  # counted by chunk
+
+    def __init__(self, layer, chunks):
+        self.kind = _layer_kind(layer)
+        # The layer's settings (class, group size, bits) without its buffers.
+        self.template = copy.copy(layer)
+        self.template.keys = self.template.values = None
+        self.template.offset = 0
+        self.chunks = chunks
+
+    @property
+    def offset(self):
+        return self.chunks[-1].end if self.chunks else 0
+
+    def is_trimmable(self):
+        # Stored layers aren't trimmed: a fetch trims its rebuilt copy.
+        return True
+
+    def rebuilt(self):
+        """The layer, in buffers of its own."""
+        layer = copy.copy(self.template)
+        parts = [c.arrays for c in self.chunks]
+        # New arrays even for one chunk: the stored ones must never be the
+        # objects a cache update writes into (one sharing their buffer is
+        # copied by its first write).
+        arrays = [
+            mx.contiguous(p[0]) if len(p) == 1 else mx.concatenate(p, axis=-2)
+            for p in zip(*parts)
+        ]
+        half = len(arrays) // 2
+        if isinstance(layer, QuantizedKVCache):
+            layer.keys, layer.values = tuple(arrays[:half]), tuple(arrays[half:])
+        else:
+            layer.keys, layer.values = arrays
+        layer.offset = self.offset
+        return layer
+
+
 class LRUPromptCache:
+    """Prompt caches by prompt, in a trie. The growing KV layers (full
+    attention) are stored in chunks: an entry keeps only the positions past
+    those of the entry above it and shares that one's chunks, so the
+    system / user checkpoints of a model with a sliding window or an SSM --
+    whose prefixes can't be trimmed back from a longer cache, so they're
+    stored as entries of their own -- and the next turns of a chat hold a
+    long document once, not once per entry. A chunk lives while an entry
+    uses it."""
+
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
-        nbytes: int
+        nbytes: int  # its layers', chunks included: what a fetch copies
         cache_type: str
 
     class CacheOrder:
@@ -1904,7 +2042,8 @@ class LRUPromptCache:
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
-        self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+        # id(chunk) -> [chunk, entries using it]
+        self._chunks = {}
         self.last_divergence = None
         self.last_fetched = None
 
@@ -1913,7 +2052,123 @@ class LRUPromptCache:
 
     @property
     def nbytes(self):
+        """The memory the stored caches take, each chunk once."""
         return self._n_bytes
+
+    # -- chunks
+
+    @staticmethod
+    def _own_nbytes(entry):
+        return sum(
+            0 if isinstance(c, _ChunkedLayer) else c.nbytes
+            for c in entry.prompt_cache
+            if c is not None
+        )
+
+    def _hold(self, entry):
+        self._n_bytes += self._own_nbytes(entry)
+        for layer in entry.prompt_cache:
+            if isinstance(layer, _ChunkedLayer):
+                for chunk in layer.chunks:
+                    held = self._chunks.setdefault(id(chunk), [chunk, 0])
+                    if held[1] == 0:
+                        self._n_bytes += chunk.nbytes
+                    held[1] += 1
+
+    def _release(self, entry):
+        self._n_bytes -= self._own_nbytes(entry)
+        for layer in entry.prompt_cache:
+            if isinstance(layer, _ChunkedLayer):
+                for chunk in layer.chunks:
+                    held = self._chunks[id(chunk)]
+                    held[1] -= 1
+                    if held[1] == 0:
+                        self._n_bytes -= chunk.nbytes
+                        del self._chunks[id(chunk)]
+
+    def _stored_layers(self, model, tokens, prompt_cache, copy_given):
+        """`prompt_cache` as it's stored at `tokens`: its growing layers in
+        chunks past the nearest entry above with the same layer, the others
+        whole (copied if `copy_given`: the caller goes on using them)."""
+        above = [e for _, e in self._trie.ancestors(model, tokens)]
+        stored = []
+        for i, layer in enumerate(prompt_cache):
+            kind = None if layer is None else _layer_kind(layer)
+            if kind is None or layer.keys is None:
+                window = None if layer is None else _window_copy(layer)
+                if window is not None:
+                    stored.append(window)
+                elif copy_given:
+                    # Evaluated now, so the next room check sees its memory.
+                    layer = copy.deepcopy(layer)
+                    mx.eval(layer.state)
+                    stored.append(layer)
+                else:
+                    stored.append(layer)
+                continue
+            base = []
+            for entry in above:
+                prev = entry.prompt_cache[i] if i < len(entry.prompt_cache) else None
+                # The nearest one this cache covers (a longer one leaves it).
+                if isinstance(prev, _ChunkedLayer) and prev.kind == kind:
+                    if prev.offset <= layer.offset:
+                        base = prev.chunks
+                        break
+            start = base[-1].end if base else 0
+            tail = (
+                [_Chunk(layer, start, layer.offset, copy_given)]
+                if layer.offset > start
+                else []
+            )
+            stored.append(_ChunkedLayer(layer, base + tail))
+        return stored
+
+    def insert_nbytes(self, model: Any, tokens: List[int], prompt_cache: List[Any]):
+        """About the memory inserting `prompt_cache` at `tokens` would add:
+        its layers past the entries above (the chunks it would share)."""
+        above = [e for _, e in self._trie.ancestors(model, tokens)]
+        total = 0
+        for i, layer in enumerate(prompt_cache):
+            if layer is None:
+                continue
+            kind = _layer_kind(layer)
+            if kind is None or layer.keys is None or layer.offset == 0:
+                window = _window_size(layer) if kind is None else None
+                if window is None:
+                    total += layer.nbytes
+                else:
+                    total += layer.nbytes * window // layer.keys.shape[2]
+                continue
+            start = 0
+            for entry in above:
+                prev = entry.prompt_cache[i] if i < len(entry.prompt_cache) else None
+                if isinstance(prev, _ChunkedLayer) and prev.kind == kind:
+                    if prev.offset <= layer.offset:
+                        start = prev.offset
+                        break
+            # The positions a chunk copies, not the buffer's padding.
+            total += sum(
+                x.nbytes * (layer.offset - start) // x.shape[-2]
+                for x in _kv_arrays(layer)
+            )
+        return total
+
+    def _rebuilt(self, entry):
+        return [
+            c.rebuilt() if isinstance(c, _ChunkedLayer) else copy.deepcopy(c)
+            for c in entry.prompt_cache
+        ]
+
+    def _remove(self, model, tokens):
+        entry = self._trie.pop(model, tokens)
+        self._release(entry)
+        return entry
+
+    def _evict_one(self):
+        model, tokens = self._lru.pop()
+        self._remove(model, tokens)
+
+    # --
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
@@ -1936,7 +2191,7 @@ class LRUPromptCache:
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+                cache = self._rebuilt(cache_entry)
                 trim_prompt_cache(cache, 1)
                 self.last_fetched = (result.model, result.exact)
                 return cache, tokens[-1:]
@@ -1945,7 +2200,7 @@ class LRUPromptCache:
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+                cache = self._rebuilt(cache_entry)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
@@ -1955,7 +2210,7 @@ class LRUPromptCache:
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
             self.last_fetched = (result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            return self._rebuilt(cache_entry), tokens[short_length:]
 
         return None, tokens
 
@@ -1966,45 +2221,47 @@ class LRUPromptCache:
         prompt_cache: List[Any],
         *,
         cache_type: str = "assistant",
+        copy: bool = False,
     ):
-        # Make the cache entry
+        """Store `prompt_cache` for `tokens`. `copy`: the caller goes on
+        using the cache (a live one, mid-prefill): what's kept is copied --
+        for the growing layers only the positions past the entry above."""
+        # A replaced entry: the new one is built on the entries above, not
+        # on itself.
+        prev = None
+        try:
+            prev = self._trie.get(model, tokens)
+        except KeyError:
+            pass
+        layers = self._stored_layers(model, tokens, prompt_cache, copy)
         entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
+            layers, sum(c.nbytes for c in prompt_cache if c is not None), cache_type
         )
-
-        # Insert into the trie and update the byte counter and lru position
-        self._n_bytes += entry.nbytes
-        self._n_bytes_by_type[cache_type] += entry.nbytes
-        prev = self._trie.add(model, tokens, entry)
+        self._hold(entry)
         if prev is not None:
-            self._n_bytes -= prev.nbytes
-            self._n_bytes_by_type[prev.cache_type] -= prev.nbytes
             self._lru.remove(model, tokens)
+            self._release(prev)
+        self._trie.add(model, tokens, entry)
         self._lru.push(model, tokens, cache_type)
 
         # If the cache stays trimmable remove all prefixes cause they just
-        # take space. A sliding window below its size is trimmable only for
-        # now: its prefixes are still needed later.
+        # take space (their chunks stay, this entry uses them). A sliding
+        # window below its size is trimmable only for now: its prefixes are
+        # still needed later.
         if stays_trimmable(prompt_cache):
-            for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
-                self._n_bytes -= entry.nbytes
-                self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            for prefix_len, prefix in self._trie.pop_prefixes(model, tokens):
+                self._release(prefix)
                 self._lru.remove(model, tokens[:prefix_len])
 
         # Ensure we match the constraints
         if len(self._lru) > self.max_size:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-        while self._n_bytes > self.max_bytes:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            self._evict_one()
+        while self._n_bytes > self.max_bytes and len(self._lru) > 0:
+            self._evict_one()
 
     def entry_nbytes(self, key) -> int:
-        """Bytes of the entry at `key` ((model, tokens)), 0 if none."""
+        """Bytes a fetch of the entry at `key` ((model, tokens)) copies, 0 if
+        there's none."""
         if key is None:
             return 0
         try:
@@ -2021,40 +2278,46 @@ class LRUPromptCache:
     ):
         """Evict LRU entries down to `n_sequences` / `n_bytes`. `keep`
         ((model, tokens)) is not evicted but still counts."""
-        if keep is not None and self.entry_nbytes(keep) > 0:
-            model, tokens = keep
-            entry = self._trie.pop(model, tokens)
-            self._lru.remove(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-            self.trim_to(
-                n_sequences=None if n_sequences is None else n_sequences - 1,
-                n_bytes=None if n_bytes is None else n_bytes - entry.nbytes,
-            )
-            self._trie.add(model, tokens, entry)
-            self._lru.push(model, tokens, entry.cache_type)
-            self._n_bytes += entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] += entry.nbytes
-            return
+        kept = None
+        try:
+            kept = self._trie.get(*keep) if keep is not None else None
+        except (KeyError, TypeError):
+            pass
+        if kept is not None:
+            # Out of the LRU only, while the others go.
+            self._lru.remove(*keep)
         n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
         n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
+        n_kept = 1 if kept is not None else 0
 
-        while len(self._lru) > n_sequences:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-        while self._n_bytes > n_bytes:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+        while len(self._lru) > 0 and len(self._lru) + n_kept > n_sequences:
+            self._evict_one()
+        while len(self._lru) > 0 and self._n_bytes > n_bytes:
+            self._evict_one()
+        if kept is not None:
+            self._lru.push(*keep, kept.cache_type)
 
     def stats_by_type(self):
+        """Entries and memory by type, a shared chunk counted once, for the
+        first type in system, user, assistant order that uses it."""
         result = {}
-        for cache_type in self._lru._ordering:
+        counted = set()
+        by_type = {k: [] for k in self._lru._ordering}
+        for cache_type, lru in self._lru._lrus.items():
+            for model, tokens in lru:
+                by_type[cache_type].append(self._trie.get(model, tokens))
+        for cache_type in ("system", "user", "assistant"):
+            n_bytes = 0
+            for entry in by_type.get(cache_type, []):
+                n_bytes += self._own_nbytes(entry)
+                for layer in entry.prompt_cache:
+                    if isinstance(layer, _ChunkedLayer):
+                        for chunk in layer.chunks:
+                            if id(chunk) not in counted:
+                                counted.add(id(chunk))
+                                n_bytes += chunk.nbytes
             result[cache_type] = {
-                "n_sequences": len(self._lru._lrus[cache_type]),
-                "n_bytes": self._n_bytes_by_type[cache_type],
+                "n_sequences": len(by_type.get(cache_type, [])),
+                "n_bytes": n_bytes,
             }
-        return result
+        return {k: result[k] for k in self._lru._ordering if k in result}

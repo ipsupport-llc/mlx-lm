@@ -678,9 +678,14 @@ class TestServerKVCacheQuantization(unittest.TestCase):
         self.assertIn("choices", json.loads(response.text))
 
         tokens = self.model_provider.tokenizer.encode(prompt)
-        cache, _ = self.prompt_cache.fetch_nearest_cache(
-            self.model_provider.model_key, tokens
-        )
+        # The response ends before the generation thread stores the cache.
+        for _ in range(100):
+            cache, _ = self.prompt_cache.fetch_nearest_cache(
+                self.model_provider.model_key, tokens
+            )
+            if cache is not None:
+                break
+            time.sleep(0.02)
         self.assertIsNotNone(cache)
         for c in cache:
             self.assertIsInstance(c, QuantizedKVCache)
@@ -1381,6 +1386,208 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    @staticmethod
+    def _hybrid(n, window=8, quantized=False):
+        """A sliding-window layer and a growing KV layer over tokens 0..n-1,
+        each position's keys/values its own index."""
+        kv = mx.arange(n, dtype=mx.float32).reshape(1, 1, n, 1) * mx.ones((1, 1, 1, 64))
+        rotating, full = RotatingKVCache(max_size=window), KVCache()
+        rotating.update_and_fetch(kv, kv)
+        full.update_and_fetch(kv, kv)
+        if quantized:
+            full = full.to_quantized(group_size=64, bits=8)
+        mx.eval(full.state, rotating.state)
+        return [rotating, full]
+
+    @staticmethod
+    def _kv_bytes(n, quantized=False):
+        """A growing layer's n positions, unpadded."""
+        layer = TestLRUPromptCache._hybrid(n, quantized=quantized)[1]
+        k, v = layer.keys, layer.values
+        arrays = (*k, *v) if quantized else (k, v)
+        return sum(x[..., :n, :].nbytes for x in arrays)
+
+    @staticmethod
+    def _positions(layer):
+        if isinstance(layer, QuantizedKVCache):
+            k = mx.dequantize(*layer.keys, group_size=layer.group_size, bits=layer.bits)
+        else:
+            k = layer.keys
+        return k[0, 0, : layer.offset, 0].tolist()
+
+    def _windows(self, *ns):
+        # Stored cut to the window.
+        def stored(w):
+            return w.nbytes * min(w.max_size, w.keys.shape[2]) // w.keys.shape[2]
+
+        return sum(stored(self._hybrid(n)[0]) for n in ns)
+
+    def _chain(self):
+        # A system and a user checkpoint, then the answered prompt.
+        cache = LRUPromptCache()
+        model = "m"
+        cache.insert_cache(model, list(range(16)), self._hybrid(16), cache_type="system")
+        cache.insert_cache(model, list(range(32)), self._hybrid(32), cache_type="user")
+        cache.insert_cache(model, list(range(48)), self._hybrid(48))
+        return cache, model
+
+    def test_entries_share_the_growing_layers(self):
+        cache, model = self._chain()
+        self.assertEqual(len(cache), 3)
+        # The growing layer's 48 positions are stored once.
+        self.assertEqual(cache.nbytes, self._windows(16, 32, 48) + self._kv_bytes(48))
+        # A fetch copies an entry whole.
+        self.assertEqual(
+            cache.entry_nbytes((model, list(range(32)))),
+            sum(c.nbytes for c in self._hybrid(32)),
+        )
+        stats = cache.stats_by_type()
+        self.assertEqual(stats["system"]["n_bytes"], self._windows(16) + self._kv_bytes(16))
+
+        # Each one comes back whole, its own positions only.
+        for n in (16, 32, 48):
+            c, rest = cache.fetch_nearest_cache(model, list(range(n)) + [99])
+            self.assertEqual(rest, [99])
+            self.assertIsInstance(c[1], KVCache)
+            self.assertEqual(c[1].offset, n)
+            self.assertEqual(self._positions(c[1]), list(range(n)))
+            # A copy: extending it leaves the stored chunks alone.
+            c[1].update_and_fetch(mx.zeros((1, 1, 4, 64)), mx.zeros((1, 1, 4, 64)))
+            c[1].keys[..., :2, :] = -1
+        c, _ = cache.fetch_nearest_cache(model, list(range(48)) + [99])
+        self.assertEqual(self._positions(c[1]), list(range(48)))
+
+    def test_the_next_turn_shares_the_checkpoints(self):
+        # Two answers to the same document and question: siblings in the
+        # trie, the part above them stored once.
+        cache, model = self._chain()
+        cache.insert_cache(model, list(range(32)) + [7] * 16, self._hybrid(48))
+        self.assertEqual(
+            cache.nbytes, self._windows(16, 32, 48, 48) + self._kv_bytes(48) + self._kv_bytes(16)
+        )
+        c, _ = cache.fetch_nearest_cache(model, list(range(32)) + [7] * 16 + [99])
+        self.assertEqual(self._positions(c[1]), list(range(48)))
+
+    def test_evicting_an_entry_keeps_the_chunks_others_use(self):
+        cache, model = self._chain()
+        # The answered prompt goes first (assistant entries are evicted
+        # before checkpoints): only its own positions are freed.
+        cache.trim_to(n_sequences=2)
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(cache.nbytes, self._windows(16, 32) + self._kv_bytes(32))
+        for n in (16, 32):
+            c, _ = cache.fetch_nearest_cache(model, list(range(n)) + [99])
+            self.assertEqual(c[1].offset, n)
+            self.assertEqual(self._positions(c[1]), list(range(n)))
+        # The system checkpoint before the user one: the user one keeps
+        # its first positions.
+        cache.trim_to(n_sequences=1, keep=(model, list(range(32))))
+        self.assertEqual(cache.nbytes, self._windows(32) + self._kv_bytes(32))
+        c, _ = cache.fetch_nearest_cache(model, list(range(32)) + [99])
+        self.assertEqual(self._positions(c[1]), list(range(32)))
+        cache.trim_to(n_sequences=0)
+        self.assertEqual(cache.nbytes, 0)
+        self.assertEqual(cache._chunks, {})
+
+    def test_replacing_an_entry(self):
+        cache, model = self._chain()
+        before = cache.nbytes
+        cache.insert_cache(model, list(range(32)), self._hybrid(32), cache_type="user")
+        self.assertEqual(len(cache), 3)
+        self.assertEqual(cache.nbytes, before + self._kv_bytes(16))
+        for n in (16, 32, 48):
+            c, _ = cache.fetch_nearest_cache(model, list(range(n)) + [99])
+            self.assertEqual(self._positions(c[1]), list(range(n)))
+
+    def test_a_live_cache_is_copied(self):
+        cache = LRUPromptCache()
+        live = self._hybrid(16)
+        cache.insert_cache("m", list(range(16)), live, cache_type="system", copy=True)
+        # The live cache goes on.
+        kv = mx.full((1, 1, 4, 64), -1.0)
+        live[1].update_and_fetch(kv, kv)
+        live[0].update_and_fetch(kv, kv)
+        c, _ = cache.fetch_nearest_cache("m", list(range(16)) + [99])
+        self.assertEqual(self._positions(c[1]), list(range(16)))
+        self.assertEqual(c[0].offset, 16)
+
+    def test_insert_nbytes(self):
+        cache, model = self._chain()
+        add = cache.insert_nbytes(model, list(range(64)), self._hybrid(64))
+        # The window as stored, and the 16 new positions, unpadded.
+        self.assertEqual(add, self._windows(64) + self._kv_bytes(64) // 4)
+        cache.insert_cache(model, list(range(64)), self._hybrid(64))
+        self.assertEqual(cache.nbytes, self._windows(16, 32, 48, 64) + self._kv_bytes(64))
+
+    def test_layers_of_another_kind_are_not_shared(self):
+        # A checkpoint before --quantized-kv-start and a quantized answer.
+        cache = LRUPromptCache()
+        cache.insert_cache("m", list(range(16)), self._hybrid(16), cache_type="system")
+        cache.insert_cache("m", list(range(48)), self._hybrid(48, quantized=True))
+        self.assertEqual(
+            cache.nbytes,
+            self._windows(16, 48) + self._kv_bytes(16) + self._kv_bytes(48, quantized=True),
+        )
+        # Both quantized: shared.
+        cache = LRUPromptCache()
+        cache.insert_cache("m", list(range(16)), self._hybrid(16, quantized=True), cache_type="system")
+        cache.insert_cache("m", list(range(48)), self._hybrid(48, quantized=True))
+        self.assertEqual(cache.nbytes, self._windows(16, 48) + self._kv_bytes(48, quantized=True))
+        for n in (16, 48):
+            c, _ = cache.fetch_nearest_cache("m", list(range(n)) + [99])
+            self.assertIsInstance(c[1], QuantizedKVCache)
+            self.assertEqual((c[1].offset, c[1].bits, c[1].group_size), (n, 8, 64))
+            self.assertEqual(self._positions(c[1]), list(range(n)))
+
+    def test_an_exact_hit_and_its_prefill_leave_the_entry_alone(self):
+        # The fetched copy of a one-chunk entry is trimmed by its last token,
+        # which the prefill then writes into its buffer.
+        cache = LRUPromptCache()
+        cache.insert_cache("m", list(range(16)), self._hybrid(16)[1:])
+        for _ in range(2):
+            c, rest = cache.fetch_nearest_cache("m", list(range(16)))
+            self.assertEqual(rest, [15])
+            kv = mx.full((1, 1, 1, 64), -1.0)
+            c[0].update_and_fetch(kv, kv)
+            mx.eval(c[0].keys)
+            self.assertEqual(self._positions(c[0])[-1], -1.0)
+        c, _ = cache.fetch_nearest_cache("m", list(range(16)) + [99])
+        self.assertEqual(self._positions(c[0]), list(range(16)))
+
+    def test_a_stored_window_is_cut_to_what_it_uses(self):
+        # A chunked prefill leaves window + chunk positions in the buffer;
+        # the stored copy keeps the window, and the next updates see the
+        # same keys either way.
+        for keep in (0, 2):
+            live = RotatingKVCache(max_size=16, keep=keep)
+            for n in (20, 30):
+                kv = mx.random.normal((1, 2, n, 8))
+                live.update_and_fetch(kv, kv)
+            self.assertGreater(live.keys.shape[2], 16)
+            cache = LRUPromptCache()
+            cache.insert_cache("m", list(range(50)), [live], copy=True)
+            self.assertEqual(cache.nbytes, live.nbytes * 16 // live.keys.shape[2])
+            stored, _ = cache.fetch_nearest_cache("m", list(range(50)) + [1])
+            stored = stored[0]
+            for n in (5, 1, 1, 7, 1):
+                kv = mx.random.normal((1, 2, n, 8))
+                a, _ = live.update_and_fetch(kv, kv)
+                b, _ = stored.update_and_fetch(kv, kv)
+                self.assertEqual(a.shape, b.shape)
+                self.assertTrue(mx.array_equal(a, b).item())
+                self.assertEqual((live.offset, live._idx), (stored.offset, stored._idx))
+                self.assertTrue(
+                    mx.array_equal(live.make_mask(1, window_size=8), stored.make_mask(1, window_size=8)).item()
+                    if live.make_mask(1, window_size=8) is not None
+                    else stored.make_mask(1, window_size=8) is None
+                )
+
+    def test_a_diverged_prompt_shares_nothing(self):
+        cache = LRUPromptCache()
+        cache.insert_cache("m", list(range(16)), self._hybrid(16), cache_type="system")
+        cache.insert_cache("m", list(range(8)) + [99] * 24, self._hybrid(32))
+        self.assertEqual(cache.nbytes, self._windows(16, 32) + self._kv_bytes(16) + self._kv_bytes(32))
+
     def test_trim_to_keeps_an_entry(self):
         cache = LRUPromptCache()
         cache.insert_cache("m", [1], [MockCache("aaaa")])
