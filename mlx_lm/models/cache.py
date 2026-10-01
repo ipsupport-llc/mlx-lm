@@ -1812,25 +1812,6 @@ class PromptTrie:
             current = current[tok]
         return values
 
-    def descendants(self, model: Any, tokens: List[int]):
-        """The values stored strictly below `tokens` (longer prompts that
-        start with it)."""
-        current = self._trie.get(model)
-        if current is None:
-            return
-        for tok in tokens:
-            if tok not in current:
-                return
-            current = current[tok]
-        stack = [current[t] for t in current if t != "__value__"]
-        while stack:
-            node = stack.pop()
-            for t, child in node.items():
-                if t == "__value__":
-                    yield child
-                else:
-                    stack.append(child)
-
     def ancestors(self, model: Any, tokens: List[int]):
         """(length, value) of the values stored strictly above `tokens` (its
         prefixes), the longest first."""
@@ -1985,6 +1966,7 @@ class _ChunkedLayer:
         return self.chunks[-1].end if self.chunks else 0
 
     def is_trimmable(self):
+        # Stored layers aren't trimmed: a fetch trims its rebuilt copy.
         return True
 
     def rebuilt(self):
@@ -1992,7 +1974,8 @@ class _ChunkedLayer:
         layer = copy.copy(self.template)
         parts = [c.arrays for c in self.chunks]
         # New arrays even for one chunk: the stored ones must never be the
-        # objects a cache update writes into.
+        # objects a cache update writes into (one sharing their buffer is
+        # copied by its first write).
         arrays = [
             mx.contiguous(p[0]) if len(p) == 1 else mx.concatenate(p, axis=-2)
             for p in zip(*parts)
@@ -2115,16 +2098,22 @@ class LRUPromptCache:
                 window = None if layer is None else _window_copy(layer)
                 if window is not None:
                     stored.append(window)
+                elif copy_given:
+                    # Evaluated now, so the next room check sees its memory.
+                    layer = copy.deepcopy(layer)
+                    mx.eval(layer.state)
+                    stored.append(layer)
                 else:
-                    stored.append(copy.deepcopy(layer) if copy_given else layer)
+                    stored.append(layer)
                 continue
             base = []
             for entry in above:
                 prev = entry.prompt_cache[i] if i < len(entry.prompt_cache) else None
+                # The nearest one this cache covers (a longer one leaves it).
                 if isinstance(prev, _ChunkedLayer) and prev.kind == kind:
                     if prev.offset <= layer.offset:
                         base = prev.chunks
-                    break
+                        break
             start = base[-1].end if base else 0
             tail = (
                 [_Chunk(layer, start, layer.offset, copy_given)]
@@ -2156,7 +2145,7 @@ class LRUPromptCache:
                 if isinstance(prev, _ChunkedLayer) and prev.kind == kind:
                     if prev.offset <= layer.offset:
                         start = prev.offset
-                    break
+                        break
             # The positions a chunk copies, not the buffer's padding.
             total += sum(
                 x.nbytes * (layer.offset - start) // x.shape[-2]

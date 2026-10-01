@@ -1539,6 +1539,21 @@ class TestLRUPromptCache(unittest.TestCase):
             self.assertEqual((c[1].offset, c[1].bits, c[1].group_size), (n, 8, 64))
             self.assertEqual(self._positions(c[1]), list(range(n)))
 
+    def test_an_exact_hit_and_its_prefill_leave_the_entry_alone(self):
+        # The fetched copy of a one-chunk entry is trimmed by its last token,
+        # which the prefill then writes into its buffer.
+        cache = LRUPromptCache()
+        cache.insert_cache("m", list(range(16)), self._hybrid(16)[1:])
+        for _ in range(2):
+            c, rest = cache.fetch_nearest_cache("m", list(range(16)))
+            self.assertEqual(rest, [15])
+            kv = mx.full((1, 1, 1, 64), -1.0)
+            c[0].update_and_fetch(kv, kv)
+            mx.eval(c[0].keys)
+            self.assertEqual(self._positions(c[0])[-1], -1.0)
+        c, _ = cache.fetch_nearest_cache("m", list(range(16)) + [99])
+        self.assertEqual(self._positions(c[0]), list(range(16)))
+
     def test_a_stored_window_is_cut_to_what_it_uses(self):
         # A chunked prefill leaves window + chunk positions in the buffer;
         # the stored copy keeps the window, and the next updates see the
