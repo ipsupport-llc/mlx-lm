@@ -1497,6 +1497,9 @@ class ResponseGenerator:
                     if nbytes + added() > cap:
                         continue
                     self.prompt_cache.trim_to(n_bytes=cap - nbytes - added())
+                    # An evicted checkpoint above it leaves more to copy.
+                    if self.prompt_cache.nbytes + nbytes + added() > cap:
+                        continue
                 # The copy and the next chunk must fit in GPU memory too:
                 # older entries go first, else no checkpoint.
                 if not self._make_memory_room(added(), step_divisor):

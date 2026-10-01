@@ -1912,6 +1912,39 @@ def _kv_arrays(layer):
     return (layer.keys, layer.values)
 
 
+def _window_size(layer):
+    """The positions `_window_copy` keeps of `layer`, or None if it wouldn't
+    cut it."""
+    if type(layer) is not RotatingKVCache or layer.keys is None:
+        return None
+    size = layer.keys.shape[2]
+    # After a multi-token update the buffer is in temporal order.
+    if layer.offset < layer.max_size or size <= layer.max_size or layer._idx != size:
+        return None
+    return layer.max_size
+
+
+def _window_copy(layer):
+    """A copy of a sliding-window layer cut to what it will still use, or
+    None if there's nothing to cut. A multi-token update leaves the window
+    plus that update's tokens in the buffer (about `max_size` + a prefill
+    chunk); the updates after it read only the `keep` first positions and
+    the last `max_size` ones, which is the state a one-token update trims
+    the buffer to -- so they give the same keys and values either way."""
+    if _window_size(layer) is None:
+        return None
+    size = layer.keys.shape[2]
+    window = copy.copy(layer)
+    tail = layer.max_size - layer.keep
+    cut = lambda v: mx.contiguous(
+        mx.concatenate([v[..., : layer.keep, :], v[..., size - tail :, :]], axis=2)
+    )
+    window.keys, window.values = cut(layer.keys), cut(layer.values)
+    window._idx = layer.max_size
+    mx.eval(window.keys, window.values)
+    return window
+
+
 class _Chunk:
     """Positions [start, end) of one growing layer, shared by every entry
     whose prompt goes through the entry that stored it."""
@@ -2079,7 +2112,11 @@ class LRUPromptCache:
         for i, layer in enumerate(prompt_cache):
             kind = None if layer is None else _layer_kind(layer)
             if kind is None or layer.keys is None:
-                stored.append(copy.deepcopy(layer) if copy_given else layer)
+                window = None if layer is None else _window_copy(layer)
+                if window is not None:
+                    stored.append(window)
+                else:
+                    stored.append(copy.deepcopy(layer) if copy_given else layer)
                 continue
             base = []
             for entry in above:
@@ -2107,7 +2144,11 @@ class LRUPromptCache:
                 continue
             kind = _layer_kind(layer)
             if kind is None or layer.keys is None or layer.offset == 0:
-                total += layer.nbytes
+                window = _window_size(layer) if kind is None else None
+                if window is None:
+                    total += layer.nbytes
+                else:
+                    total += layer.nbytes * window // layer.keys.shape[2]
                 continue
             start = 0
             for entry in above:
@@ -2116,7 +2157,11 @@ class LRUPromptCache:
                     if prev.offset <= layer.offset:
                         start = prev.offset
                     break
-            total += layer.nbytes * (layer.offset - start) // layer.offset
+            # The positions a chunk copies, not the buffer's padding.
+            total += sum(
+                x.nbytes * (layer.offset - start) // x.shape[-2]
+                for x in _kv_arrays(layer)
+            )
         return total
 
     def _rebuilt(self, entry):

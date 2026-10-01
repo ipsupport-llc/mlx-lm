@@ -1416,7 +1416,11 @@ class TestLRUPromptCache(unittest.TestCase):
         return k[0, 0, : layer.offset, 0].tolist()
 
     def _windows(self, *ns):
-        return sum(self._hybrid(n)[0].nbytes for n in ns)
+        # Stored cut to the window.
+        def stored(w):
+            return w.nbytes * min(w.max_size, w.keys.shape[2]) // w.keys.shape[2]
+
+        return sum(stored(self._hybrid(n)[0]) for n in ns)
 
     def _chain(self):
         # A system and a user checkpoint, then the answered prompt.
@@ -1510,8 +1514,10 @@ class TestLRUPromptCache(unittest.TestCase):
     def test_insert_nbytes(self):
         cache, model = self._chain()
         add = cache.insert_nbytes(model, list(range(64)), self._hybrid(64))
-        layer = self._hybrid(64)[1]
-        self.assertEqual(add, self._windows(64) + layer.nbytes * 16 // 64)
+        # The window as stored, and the 16 new positions, unpadded.
+        self.assertEqual(add, self._windows(64) + self._kv_bytes(64) // 4)
+        cache.insert_cache(model, list(range(64)), self._hybrid(64))
+        self.assertEqual(cache.nbytes, self._windows(16, 32, 48, 64) + self._kv_bytes(64))
 
     def test_layers_of_another_kind_are_not_shared(self):
         # A checkpoint before --quantized-kv-start and a quantized answer.
@@ -1532,6 +1538,34 @@ class TestLRUPromptCache(unittest.TestCase):
             self.assertIsInstance(c[1], QuantizedKVCache)
             self.assertEqual((c[1].offset, c[1].bits, c[1].group_size), (n, 8, 64))
             self.assertEqual(self._positions(c[1]), list(range(n)))
+
+    def test_a_stored_window_is_cut_to_what_it_uses(self):
+        # A chunked prefill leaves window + chunk positions in the buffer;
+        # the stored copy keeps the window, and the next updates see the
+        # same keys either way.
+        for keep in (0, 2):
+            live = RotatingKVCache(max_size=16, keep=keep)
+            for n in (20, 30):
+                kv = mx.random.normal((1, 2, n, 8))
+                live.update_and_fetch(kv, kv)
+            self.assertGreater(live.keys.shape[2], 16)
+            cache = LRUPromptCache()
+            cache.insert_cache("m", list(range(50)), [live], copy=True)
+            self.assertEqual(cache.nbytes, live.nbytes * 16 // live.keys.shape[2])
+            stored, _ = cache.fetch_nearest_cache("m", list(range(50)) + [1])
+            stored = stored[0]
+            for n in (5, 1, 1, 7, 1):
+                kv = mx.random.normal((1, 2, n, 8))
+                a, _ = live.update_and_fetch(kv, kv)
+                b, _ = stored.update_and_fetch(kv, kv)
+                self.assertEqual(a.shape, b.shape)
+                self.assertTrue(mx.array_equal(a, b).item())
+                self.assertEqual((live.offset, live._idx), (stored.offset, stored._idx))
+                self.assertTrue(
+                    mx.array_equal(live.make_mask(1, window_size=8), stored.make_mask(1, window_size=8)).item()
+                    if live.make_mask(1, window_size=8) is not None
+                    else stored.make_mask(1, window_size=8) is None
+                )
 
     def test_a_diverged_prompt_shares_nothing(self):
         cache = LRUPromptCache()
