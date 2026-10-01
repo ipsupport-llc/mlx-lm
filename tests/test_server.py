@@ -1035,6 +1035,7 @@ class TestServerSingleCheckpoints(unittest.TestCase):
             ("--memory-headroom-fraction", "1.5"),
             ("--memory-headroom-fraction", "abc"),
             ("--min-prefill-step", "2.5"),
+            ("--buffer-cache-mb", "-1"),
         ]
         for flag, value in bad:
             with self.subTest(flag=flag, value=value):
@@ -1048,6 +1049,9 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         self.assertEqual(
             (ok.memory_headroom_fraction, ok.prefill_memory_mb), (1.0, 0)
         )
+        # Unset by default: MLX's own cache limit stays.
+        self.assertIsNone(make_parser().parse_args([]).buffer_cache_mb)
+        self.assertEqual(make_parser().parse_args(["--buffer-cache-mb", "512"]).buffer_cache_mb, 512)
 
     def test_foreign_cli_args_are_clamped(self):
         gen = self._generator(prefill_step_size=128)
