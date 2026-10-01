@@ -2473,6 +2473,17 @@ def make_parser():
         f"(default: {SERVER_DEFAULTS['prefill_memory_mb']})",
     )
     parser.add_argument(
+        "--buffer-cache-mb",
+        type=_int_at_least(0),
+        default=None,
+        help="Cap on MLX's cache of freed buffers, in MB (mx.set_cache_limit). "
+        "By default MLX keeps freed buffers up to its memory limit; decoding "
+        "with a draft model allocates buffers of a new size every step (the "
+        "verify pass rewrites the sliding windows), and on Gemma 4 26B with a "
+        "22k-token prompt they piled up to ~4 GB, pushing the process into "
+        "swap on a 24 GB Mac. Unset keeps MLX's default.",
+    )
+    parser.add_argument(
         "--min-prefill-step",
         type=_int_at_least(1),
         default=SERVER_DEFAULTS["min_prefill_step"],
@@ -2568,6 +2579,8 @@ def main():
 
     multimodal.ALLOW_IMAGE_URLS = args.allow_image_urls
     _ = maybe_set_recommended_wired_limit()
+    if args.buffer_cache_mb is not None:
+        mx.set_cache_limit(args.buffer_cache_mb << 20)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
