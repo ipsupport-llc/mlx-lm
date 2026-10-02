@@ -43,6 +43,7 @@ import hashlib
 import http.client
 import io
 import json
+import math
 import socket
 import threading
 import time
@@ -51,6 +52,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
+import numpy as np
 
 # Pseudo token ids for image positions in prompt-cache keys only. Far above
 # any real vocabulary so they can never collide with a real token.
@@ -348,21 +350,74 @@ def _decode(blob: bytes):
     return ImageOps.exif_transpose(image).convert("RGB")
 
 
+class UnifiedImageProcessor:
+    """`Gemma4UnifiedImageProcessor` (gemma4_unified, the 12B) without torch:
+    the image resized (aspect kept) to fit `max_soft_tokens` patches of
+    (pooling_kernel_size * patch_size)^2 pixels, scaled to [0, 1], cut into
+    those patches row by row, each flattened height x width x RGB, and padded
+    to `max_soft_tokens` (positions (x, y), (-1, -1) for padding). HF's
+    16 px patches merged 3x3 come out in exactly this order and layout."""
+
+    def __init__(self, patch_size=16, max_soft_tokens=280, pooling_kernel_size=3, rescale_factor=1 / 255, **_):
+        self.side = patch_size * pooling_kernel_size
+        self.max_soft_tokens = max_soft_tokens
+        self.rescale = rescale_factor
+
+    def size(self, height: int, width: int) -> Tuple[int, int]:
+        """HF's get_aspect_ratio_preserving_size, in merged-patch units."""
+        side, n = self.side, self.max_soft_tokens
+        factor = math.sqrt(n * side * side / (height * width))
+        h, w = int(math.floor(factor * height / side)), int(math.floor(factor * width / side))
+        if h == 0 and w == 0:
+            raise ValueError(f"image {width}x{height} is too small to patch")
+        if h == 0:
+            h, w = 1, min(int(math.floor(width / height)), n)
+        elif w == 0:
+            w, h = 1, min(int(math.floor(height / width)), n)
+        return h * side, w * side
+
+    def __call__(self, images, return_tensors="np"):
+        from PIL import Image
+
+        pixels, positions, counts = [], [], []
+        for image in images:
+            h, w = self.size(image.height, image.width)
+            if (h, w) != (image.height, image.width):
+                image = image.resize((w, h), Image.BICUBIC)
+            a = np.asarray(image, dtype=np.float32) * self.rescale
+            s = self.side
+            gh, gw = h // s, w // s
+            patches = a.reshape(gh, s, gw, s, 3).transpose(0, 2, 1, 3, 4).reshape(gh * gw, s * s * 3)
+            pos = np.stack(np.meshgrid(np.arange(gw), np.arange(gh), indexing="xy"), -1).reshape(-1, 2)
+            pad = self.max_soft_tokens - len(patches)
+            pixels.append(np.pad(patches, ((0, pad), (0, 0))))
+            positions.append(np.pad(pos, ((0, pad), (0, 0)), constant_values=-1))
+            counts.append(len(patches))
+        return {
+            "pixel_values": np.stack(pixels),
+            "image_position_ids": np.stack(positions),
+            "num_soft_tokens_per_image": counts,
+        }
+
+
 class ImageInputs:
     """Gemma 4 image preprocessing + prompt expansion + fusion."""
 
     def __init__(self, model, processor_config: dict):
-        from transformers.models.gemma4.image_processing_pil_gemma4 import (
-            Gemma4ImageProcessorPil,
-        )
-
         cfg = processor_config.get("image_processor", processor_config)
         kwargs = {
             k: cfg[k]
             for k in ("patch_size", "max_soft_tokens", "pooling_kernel_size")
             if k in cfg
         }
-        self.processor = Gemma4ImageProcessorPil(**kwargs)
+        if getattr(model, "unified", False):
+            self.processor = UnifiedImageProcessor(**kwargs)
+        else:
+            from transformers.models.gemma4.image_processing_pil_gemma4 import (
+                Gemma4ImageProcessorPil,
+            )
+
+            self.processor = Gemma4ImageProcessorPil(**kwargs)
         self.model = model
         args = model.args
         self.image_token_id = args.image_token_id
@@ -440,9 +495,9 @@ def vision_spans(cache_key: List[int]) -> List[Tuple[int, int]]:
 
 def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
     """ImageInputs for a vision-capable Gemma 4 model, else None."""
-    if getattr(model, "model_type", None) != "gemma4":
+    if getattr(model, "model_type", None) not in ("gemma4", "gemma4_unified"):
         return None
-    if getattr(model, "vision_tower", None) is None:
+    if getattr(model, "embed_vision", None) is None:
         return None
     from .utils import _download
 

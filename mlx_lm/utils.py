@@ -54,7 +54,7 @@ MODEL_REMAPPING = {
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
     "xverse": "llama",
-    "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "gemma4_unified": "gemma4",  # encoder-free multimodal variant (the 12B): gemma4.Model with its vision_embedder
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
