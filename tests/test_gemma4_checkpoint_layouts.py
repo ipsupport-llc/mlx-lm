@@ -91,6 +91,8 @@ class TestGemma4CheckpointLayouts(unittest.TestCase):
             import json
             save_config(dict(CONFIG), Path(d) / "config.json")
             self.assertIn("vision_config", json.loads((Path(d) / "config.json").read_text()))
+            save_config({"model_type": "gemma4_unified", "vision_config": {}}, Path(d) / "c3.json")
+            self.assertIn("vision_config", json.loads((Path(d) / "c3.json").read_text()))
             save_config({"model_type": "llava", "vision_config": {}}, Path(d) / "c2.json")
             self.assertNotIn("vision_config", json.loads((Path(d) / "c2.json").read_text()))
 

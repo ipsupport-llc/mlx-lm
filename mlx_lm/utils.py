@@ -1091,7 +1091,7 @@ def save_config(
     # converted Gemma 4 silently lose its vision (the tower isn't built
     # without it, and its saved weights were then discarded on load).
     config.pop("_name_or_path", None)
-    if config.get("model_type") not in ("gemma4",):
+    if config.get("model_type") not in ("gemma4", "gemma4_unified"):
         config.pop("vision_config", None)
     if "quantization" in config:
         config["quantization_config"] = config["quantization"]
@@ -1125,7 +1125,9 @@ def save(
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 
-    for p in ["*.py", "generation_config.json"]:
+    # processor_config.json: what mlx_lm.multimodal builds a Gemma 4's image
+    # inputs from (without it the converted model takes no images).
+    for p in ["*.py", "generation_config.json", "processor_config.json"]:
         for file in glob.glob(str(src_path / p)):
             shutil.copy(file, dst_path)
 
