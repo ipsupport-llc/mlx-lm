@@ -1316,10 +1316,7 @@ class TestModels(unittest.TestCase):
         self.assertIn(mlx_norm_key, converted)
         self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
 
-    def test_gemma4_unified_loads_text_only(self):
-        # Encoder-free multimodal checkpoints (vision_embedder, no vision/
-        # audio towers) carry vision_config/audio_config for towers that
-        # don't exist in the weights -- building them failed every load.
+    def _gemma4_unified_model(self):
         from mlx_lm.models import gemma4
 
         text_config = {
@@ -1343,27 +1340,138 @@ class TestModels(unittest.TestCase):
             {
                 "model_type": "gemma4_unified",
                 "vocab_size": 32,
+                "image_token_id": 30,
+                "audio_token_id": 31,
                 "text_config": text_config,
-                "vision_config": {"model_type": "gemma4_unified_vision", "hidden_size": 8},
-                "audio_config": {"model_type": "gemma4_unified_audio", "hidden_size": 8},
+                "vision_config": {
+                    "model_type": "gemma4_unified_vision",
+                    "patch_size": 1,
+                    "pooling_kernel_size": 2,
+                    "mm_embed_dim": 6,
+                    "mm_posemb_size": 4,
+                    "output_proj_dims": 6,
+                },
+                "audio_config": {"model_type": "gemma4_unified_audio", "audio_embed_dim": 5},
             }
         )
-        model = gemma4.Model(args)
+        return gemma4.Model(args)
+
+    def test_gemma4_unified_media_modules(self):
+        # Encoder-free (the 12B): no towers; a vision_embedder for raw pixel
+        # patches and embed_vision / embed_audio projections.
+        model = self._gemma4_unified_model()
         self.assertIsNone(model.vision_tower)
         self.assertIsNone(model.audio_tower)
+        self.assertEqual(model.vision_embedder.patch_dense.weight.shape, (6, 12))
+        self.assertEqual(model.embed_vision.embedding_projection.weight.shape, (8, 6))
+        self.assertEqual(model.embed_audio.embedding_projection.weight.shape, (8, 5))
+
+        w = mx.ones((4,))
+        kept = model.sanitize(
+            {
+                "language_model.model.layers.0.input_layernorm.weight": w,
+                "model.vision_embedder.patch_dense.weight": w,
+                "model.embed_vision.embedding_projection.weight": w,
+                "model.embed_audio.embedding_projection.weight": w,
+            }
+        )
+        self.assertEqual(
+            sorted(kept),
+            [
+                "embed_audio.embedding_projection.weight",
+                "embed_vision.embedding_projection.weight",
+                "language_model.model.layers.0.input_layernorm.weight",
+                "vision_embedder.patch_dense.weight",
+            ],
+        )
+
+    def test_gemma4_unified_transformers_module_names(self):
+        # The same weights named as transformers' Gemma4UnifiedModel tree
+        # has them: embed_vision.patch_* / pos_* and embed_vision.multimodal_embedder.
+        model = self._gemma4_unified_model()
+        w = mx.ones((4,))
+        kept = model.sanitize(
+            {
+                "model.embed_vision.patch_dense.weight": w,
+                "model.embed_vision.pos_embedding": w,
+                "model.embed_vision.multimodal_embedder.embedding_projection.weight": w,
+                "model.embed_audio.embedding_projection.weight": w,
+            }
+        )
+        self.assertEqual(
+            sorted(kept),
+            [
+                "embed_audio.embedding_projection.weight",
+                "embed_vision.embedding_projection.weight",
+                "vision_embedder.patch_dense.weight",
+                "vision_embedder.pos_embedding",
+            ],
+        )
+        self.assertIsNotNone(model.vision_embedder)
+
+    def test_gemma4_unified_without_media_weights_loads_text_only(self):
+        # A conversion that dropped the media weights (an mlx-lm that loaded
+        # the 12B text-only): it still loads, without vision and audio.
+        model = self._gemma4_unified_model()
+        kept = model.sanitize({"language_model.model.layers.0.input_layernorm.weight": mx.ones((4,))})
+        self.assertEqual(list(kept), ["language_model.model.layers.0.input_layernorm.weight"])
+        self.assertIsNone(model.vision_embedder)
         self.assertIsNone(model.embed_vision)
         self.assertIsNone(model.embed_audio)
 
-        base = mx.arange(8, dtype=mx.float32)
-        converted = model.sanitize(
-            {
-                "language_model.model.layers.0.input_layernorm.weight": base,
-                "vision_embedder.patch_dense.weight": base,
-                "embed_vision.embedding_projection.weight": base,
-                "embed_audio.embedding_projection.weight": base,
-            }
-        )
-        self.assertEqual(list(converted), ["language_model.model.layers.0.input_layernorm.weight"])
+    def test_gemma4_unified_fuses_image_patches_and_audio_frames(self):
+        model = self._gemma4_unified_model()
+        # Two real patches and one padding patch; three waveform frames.
+        pixels = mx.random.uniform(shape=(1, 3, 12))
+        positions = mx.array([[[0, 0], [1, 0], [-1, -1]]])
+        frames = mx.random.uniform(shape=(1, 3, 5))
+        ids = mx.array([[1, 30, 30, 2, 31, 31, 31, 3]])
+        fused, _ = model._fuse_multimodal_inputs(ids, pixels, positions, frames, mx.ones((1, 3), dtype=mx.bool_))
+        scale = model.language_model.model.embed_scale
+        h, valid = model.vision_embedder(pixels, positions)
+        self.assertEqual(valid.tolist(), [[True, True, False]])
+        image = model.embed_vision(h)[0, :2] / scale
+        audio = model.embed_audio(frames)[0] / scale
+        self.assertTrue(mx.allclose(fused[0, 1:3], image.astype(fused.dtype), atol=1e-5))
+        self.assertTrue(mx.allclose(fused[0, 4:7], audio.astype(fused.dtype), atol=1e-5))
+        text = model.language_model.model.embed_tokens(mx.array([1, 2, 3]))
+        self.assertTrue(mx.allclose(fused[0, mx.array([0, 3, 7])], text))
+
+    def test_gemma4_unified_image_processor_matches_hf_patch_merge(self):
+        # HF's Gemma4UnifiedImageProcessor cuts 16 px patches and merges
+        # 3x3 of them (convert_image_to_patches + patches_merge, in numpy
+        # here): the same as 48 px patches row by row, flattened HWC.
+        import numpy as np
+        from PIL import Image
+
+        from mlx_lm.multimodal import UnifiedImageProcessor
+
+        def hf(img, p=16, k=3):
+            C, H, W = img.shape
+            ph, pw = H // p, W // p
+            t = img.reshape(C, ph, p, pw, p).transpose(1, 3, 2, 4, 0).reshape(ph * pw, -1)
+            gx, gy = np.meshgrid(np.arange(pw), np.arange(ph), indexing="xy")
+            pos = np.stack([gx, gy], -1).reshape(-1, 2)
+            L, max_x = len(t) // (k * k), pos[:, 0].max() + 1
+            kid, win = pos // k, pos % k
+            order = win[:, 0] + win[:, 1] * k + k * k * kid[:, 0] + k * max_x * kid[:, 1]
+            perm = np.argsort(order, kind="stable")
+            merged = t[perm].reshape(L, k, k, p, p, 3).transpose(0, 1, 3, 2, 4, 5).reshape(L, -1)
+            return merged, (pos[perm].reshape(L, k * k, 2) // k).min(1)
+
+        proc = UnifiedImageProcessor(patch_size=16, max_soft_tokens=280, pooling_kernel_size=3)
+        rng = np.random.default_rng(0)
+        for size in ((480, 640), (1000, 300), (37, 900)):
+            image = Image.fromarray(rng.integers(0, 256, (*size, 3), dtype=np.uint8))
+            out = proc([image])
+            n = out["num_soft_tokens_per_image"][0]
+            h, w = proc.size(*size)
+            ref = np.asarray(image.resize((w, h), Image.BICUBIC), dtype=np.float32) / 255
+            patches, positions = hf(ref.transpose(2, 0, 1))
+            np.testing.assert_allclose(out["pixel_values"][0, :n], patches, atol=1e-6)
+            np.testing.assert_array_equal(out["image_position_ids"][0, :n], positions)
+            self.assertTrue((out["image_position_ids"][0, n:] == -1).all())
+            self.assertTrue((out["pixel_values"][0, n:] == 0).all())
 
     def test_gemma4_raw_hf_moe_expert_weights_split_for_switch_glu(self):
         from mlx_lm.models import gemma4

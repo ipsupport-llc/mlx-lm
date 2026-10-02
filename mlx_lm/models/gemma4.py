@@ -192,6 +192,34 @@ def _compact_valid_rows(x: mx.array, valid: mx.array) -> mx.array:
     return mx.take(flat_x, mx.array(idx), axis=0)
 
 
+class UnifiedVisionEmbedder(nn.Module):
+    """gemma4_unified's encoder-free vision (`Gemma4UnifiedVisionEmbedder`):
+    raw 48x48 pixel patches -> LayerNorm -> Linear -> LayerNorm -> + the
+    factorized 2D position embedding -> LayerNorm. The result goes through
+    `embed_vision` (RMSNorm -> Linear) like a tower's pooled output."""
+
+    def __init__(self, vision_config: dict):
+        super().__init__()
+        patch = vision_config.get("patch_size", 16) * vision_config.get("pooling_kernel_size", 3)
+        dim = vision_config["mm_embed_dim"]
+        self.patch_ln1 = nn.LayerNorm(patch * patch * 3)
+        self.patch_dense = nn.Linear(patch * patch * 3, dim)
+        self.patch_ln2 = nn.LayerNorm(dim)
+        self.pos_embedding = mx.zeros((vision_config["mm_posemb_size"], 2, dim))
+        self.pos_norm = nn.LayerNorm(dim)
+
+    def __call__(self, pixel_values: mx.array, positions: mx.array):
+        """`pixel_values` (B, N, 6912) in [0, 1], `positions` (B, N, 2) as
+        (x, y), (-1, -1) for padding. Returns (B, N, dim) and the valid mask."""
+        # The norm's dtype: a quantized patch_dense's weight is uint32.
+        x = pixel_values.astype(self.patch_ln1.weight.dtype)
+        x = self.patch_ln2(self.patch_dense(self.patch_ln1(x)))
+        valid = positions != -1
+        clamped = mx.maximum(positions, 0)
+        pos = self.pos_embedding[clamped[..., 0], 0] * valid[..., 0:1] + self.pos_embedding[clamped[..., 1], 1] * valid[..., 1:2]
+        return self.pos_norm(x + pos.astype(x.dtype)), valid.all(axis=-1)
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -201,18 +229,23 @@ class Model(nn.Module):
             gemma4_text.ModelArgs.from_dict(args.text_config)
         )
         text_hidden_size = self.language_model.args.hidden_size
-        # gemma4_unified (remapped here in utils.MODEL_REMAPPING) is an
-        # encoder-free multimodal variant: its checkpoints carry a
-        # `vision_embedder` and no vision/audio towers, a layout this file
-        # doesn't implement. Its vision_config/audio_config describe those
-        # missing towers, so building them made every load fail with
-        # "Missing N parameters: audio_tower..., vision_tower...". Loaded
-        # text-only; sanitize() drops the unified media weights.
-        text_only = args.model_type == "gemma4_unified"
+        # gemma4_unified (remapped here in utils.MODEL_REMAPPING, the 12B) is
+        # encoder-free: no towers. Images are raw pixel patches through a
+        # `vision_embedder`, audio raw waveform frames, each projected by
+        # its embed_vision / embed_audio (Gemma4UnifiedModel).
+        self.unified = args.model_type == "gemma4_unified"
 
         self.vision_tower = None
+        self.vision_embedder = None
         self.embed_vision = None
-        if args.vision_config is not None and not text_only:
+        if args.vision_config is not None and self.unified:
+            self.vision_embedder = UnifiedVisionEmbedder(args.vision_config)
+            self.embed_vision = MultimodalEmbedder(
+                args.vision_config["output_proj_dims"],
+                text_hidden_size,
+                eps=args.vision_config.get("rms_norm_eps", 1e-6),
+            )
+        elif args.vision_config is not None:
             vision_args = gemma4_vision.ModelArgs.from_dict(args.vision_config)
             self.vision_tower = gemma4_vision.VisionModel(vision_args)
             self.embed_vision = MultimodalEmbedder(
@@ -223,7 +256,13 @@ class Model(nn.Module):
 
         self.audio_tower = None
         self.embed_audio = None
-        if args.audio_config is not None and not text_only:
+        if args.audio_config is not None and self.unified:
+            self.embed_audio = MultimodalEmbedder(
+                args.audio_config["audio_embed_dim"],
+                text_hidden_size,
+                eps=args.audio_config.get("rms_norm_eps", 1e-6),
+            )
+        elif args.audio_config is not None:
             audio_args = gemma4_audio.ModelArgs.from_dict(args.audio_config)
             self.audio_tower = gemma4_audio.AudioModel(audio_args)
             self.embed_audio = gemma4_audio.MultimodalEmbedder(
@@ -268,12 +307,13 @@ class Model(nn.Module):
             per_layer_inputs = text_model._get_per_layer_inputs(llm_input_ids)
 
         if pixel_values is not None:
-            if self.vision_tower is None or self.embed_vision is None:
+            if self.embed_vision is None:
                 raise ValueError(
                     "pixel_values was given but this model has no vision_config "
                     "(vision_tower/embed_vision were not initialized)."
                 )
-            pooled, valid_mask = self.vision_tower(pixel_values, pixel_position_ids)
+            encoder = self.vision_embedder if self.unified else self.vision_tower
+            pooled, valid_mask = encoder(pixel_values, pixel_position_ids)
             image_features = _compact_valid_rows(pooled, valid_mask)
             image_features = self.embed_vision(image_features)
 
@@ -289,14 +329,18 @@ class Model(nn.Module):
             )
 
         if input_features is not None:
-            if self.audio_tower is None or self.embed_audio is None:
+            if self.embed_audio is None:
                 raise ValueError(
                     "input_features was given but this model has no audio_config "
                     "(audio_tower/embed_audio were not initialized)."
                 )
-            audio_hidden, audio_valid_mask = self.audio_tower(
-                input_features, input_features_mask
-            )
+            if self.unified:
+                # The waveform frames are the soft tokens themselves.
+                audio_hidden, audio_valid_mask = input_features, input_features_mask
+            else:
+                audio_hidden, audio_valid_mask = self.audio_tower(
+                    input_features, input_features_mask
+                )
             if audio_valid_mask is None:
                 audio_valid_mask = mx.ones(audio_hidden.shape[:2], dtype=mx.bool_)
             audio_features = _compact_valid_rows(audio_hidden, audio_valid_mask)
@@ -421,6 +465,7 @@ class Model(nn.Module):
         audio_weights = {}
         embed_vision_weights = {}
         embed_audio_weights = {}
+        vision_embedder_weights = {}
 
         for k, v in weights.items():
             starts_w_model = k.startswith("model.")
@@ -432,18 +477,26 @@ class Model(nn.Module):
             if k.startswith("audio_tower."):
                 audio_weights[k] = v
                 continue
+            # gemma4_unified as transformers' module tree names it (Google's
+            # checkpoints are already in the vision_embedder layout below):
+            # embed_vision holds the patch layers and a multimodal_embedder.
+            if self.unified and k.startswith("embed_vision.multimodal_embedder."):
+                embed_vision_weights[k.removeprefix("embed_vision.multimodal_embedder.")] = v
+                continue
+            if self.unified and k.startswith(("embed_vision.patch_", "embed_vision.pos_")):
+                vision_embedder_weights["vision_embedder." + k.removeprefix("embed_vision.")] = v
+                continue
             if k.startswith("embed_vision."):
                 embed_vision_weights[k.removeprefix("embed_vision.")] = v
                 continue
             if k.startswith("embed_audio."):
                 embed_audio_weights[k.removeprefix("embed_audio.")] = v
                 continue
-            if k.startswith(
-                ("multi_modal_projector", "vision_embedder")
-            ):
-                # "vision_embedder": gemma4_unified encoder-free vision
-                # variant, a different checkpoint layout this file doesn't
-                # support. "multi_modal_projector": not present on the real
+            if k.startswith("vision_embedder."):
+                vision_embedder_weights[k] = v
+                continue
+            if k.startswith("multi_modal_projector"):
+                # "multi_modal_projector": not present on the real
                 # google/gemma-4-E4B-it checkpoint layout (embed_vision's
                 # own embedding_projection plays that role instead); dropped
                 # defensively in case some other checkpoint has it.
@@ -476,6 +529,13 @@ class Model(nn.Module):
             self.vision_tower = self.embed_vision = None
         if self.audio_tower is not None and not audio_weights:
             self.audio_tower = self.embed_audio = None
+        # gemma4_unified the same, per modality: a conversion by an mlx-lm
+        # that loaded it text-only dropped these.
+        if self.unified:
+            if not vision_embedder_weights or not embed_vision_weights:
+                self.vision_embedder = self.embed_vision = None
+            if not embed_audio_weights:
+                self.embed_audio = None
         # The other way round -- weights for a tower the config doesn't
         # describe -- is what a conversion by an older mlx-lm left (it dropped
         # vision_config on save): they can only be ignored, so say so.
@@ -492,6 +552,8 @@ class Model(nn.Module):
         if self.audio_tower is not None:
             for k, v in self.audio_tower.sanitize(audio_weights).items():
                 sanitized[f"audio_tower.{k}"] = v
+        if self.vision_embedder is not None:
+            sanitized.update(vision_embedder_weights)
         if self.embed_vision is not None:
             for k, v in embed_vision_weights.items():
                 sanitized[f"embed_vision.{k}"] = v
