@@ -411,7 +411,7 @@ class ImageInputs:
             if k in cfg
         }
         if getattr(model, "unified", False):
-            self.processor = UnifiedImageProcessor(**kwargs)
+            self.processor = UnifiedImageProcessor(rescale_factor=cfg.get("rescale_factor", 1 / 255), **kwargs)
         else:
             from transformers.models.gemma4.image_processing_pil_gemma4 import (
                 Gemma4ImageProcessorPil,

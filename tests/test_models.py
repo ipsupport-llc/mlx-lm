@@ -1385,6 +1385,30 @@ class TestModels(unittest.TestCase):
             ],
         )
 
+    def test_gemma4_unified_transformers_module_names(self):
+        # The same weights named as transformers' Gemma4UnifiedModel tree
+        # has them: embed_vision.patch_* / pos_* and embed_vision.multimodal_embedder.
+        model = self._gemma4_unified_model()
+        w = mx.ones((4,))
+        kept = model.sanitize(
+            {
+                "model.embed_vision.patch_dense.weight": w,
+                "model.embed_vision.pos_embedding": w,
+                "model.embed_vision.multimodal_embedder.embedding_projection.weight": w,
+                "model.embed_audio.embedding_projection.weight": w,
+            }
+        )
+        self.assertEqual(
+            sorted(kept),
+            [
+                "embed_audio.embedding_projection.weight",
+                "embed_vision.embedding_projection.weight",
+                "vision_embedder.patch_dense.weight",
+                "vision_embedder.pos_embedding",
+            ],
+        )
+        self.assertIsNotNone(model.vision_embedder)
+
     def test_gemma4_unified_without_media_weights_loads_text_only(self):
         # A conversion that dropped the media weights (an mlx-lm that loaded
         # the 12B text-only): it still loads, without vision and audio.

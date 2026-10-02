@@ -477,6 +477,15 @@ class Model(nn.Module):
             if k.startswith("audio_tower."):
                 audio_weights[k] = v
                 continue
+            # gemma4_unified as transformers' module tree names it (Google's
+            # checkpoints are already in the vision_embedder layout below):
+            # embed_vision holds the patch layers and a multimodal_embedder.
+            if self.unified and k.startswith("embed_vision.multimodal_embedder."):
+                embed_vision_weights[k.removeprefix("embed_vision.multimodal_embedder.")] = v
+                continue
+            if self.unified and k.startswith(("embed_vision.patch_", "embed_vision.pos_")):
+                vision_embedder_weights["vision_embedder." + k.removeprefix("embed_vision.")] = v
+                continue
             if k.startswith("embed_vision."):
                 embed_vision_weights[k.removeprefix("embed_vision.")] = v
                 continue
