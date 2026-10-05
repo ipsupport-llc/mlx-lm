@@ -1256,6 +1256,11 @@ class ResponseGenerator:
             set_vision_spans = getattr(model, "set_vision_spans", None)
             if input_embeddings is not None and set_vision_spans is not None:
                 set_vision_spans(multimodal_vision_spans(cache_prompt))
+            # Qwen3.5: the image prompt's mRoPE (t, h, w) positions, for this
+            # prefill and its answer only.
+            set_media_positions = getattr(model, "set_media_positions", None)
+            if input_embeddings is not None and set_media_positions is not None:
+                set_media_positions(getattr(image_inputs, "media_positions", None))
             try:
                 for gen in stream_generate(
                     model=model,
@@ -1306,6 +1311,8 @@ class ResponseGenerator:
             finally:
                 if set_vision_spans is not None:
                     set_vision_spans(None)
+                if set_media_positions is not None:
+                    set_media_positions(None)
 
             rqueue.put(None)
 

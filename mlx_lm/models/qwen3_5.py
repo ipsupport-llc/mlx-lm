@@ -20,6 +20,63 @@ from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
+from .qwen3_5_vision import VisionConfig, VisionModel
+
+
+class MRoPEState:
+    """The 3D (time, height, width) positions of the prompt being prefilled
+    when it carries images, set by the server around one request
+    (Model.set_media_positions) and read by every full-attention layer's
+    MRoPE. Without images (positions None) the layers use plain RoPE, which
+    is what mRoPE reduces to when the three axes agree."""
+
+    def __init__(self):
+        self.positions = None  # mx.array [3, N] int32
+        self.delta = 0  # position - index past the prompt (images use fewer positions than tokens)
+
+    def window(self, offset: int, length: int):
+        if self.positions is None:
+            return None
+        n = self.positions.shape[1]
+        if offset + length <= n:
+            return self.positions[:, offset : offset + length]
+        start = max(offset, n)
+        tail = mx.arange(start, offset + length, dtype=mx.int32) + self.delta
+        tail = mx.broadcast_to(tail[None], (3, tail.shape[0]))
+        if offset >= n:
+            return tail
+        return mx.concatenate([self.positions[:, offset:], tail], axis=1)
+
+
+class MRoPE(nn.Module):
+    """Interleaved multimodal RoPE (Qwen3-VL / Qwen3.5) on the first `dims`
+    channels of each head, rotate-half layout (traditional=False). Each
+    rotary frequency takes its angle from one axis: t, h, w interleaved per
+    `mrope_section` (HF's apply_interleaved_mrope)."""
+
+    def __init__(self, dims: int, base: float, mrope_section, state: MRoPEState):
+        super().__init__()
+        self.dims = dims
+        self.base = base
+        self.media = state
+        half = dims // 2
+        self._inv_freq = 1.0 / (base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims))
+        selector = [0] * half
+        for axis, start in ((1, 1), (2, 2)):
+            for idx in range(start, min(mrope_section[axis] * 3, half), 3):
+                selector[idx] = axis
+        self._selector = mx.array(selector, dtype=mx.int32)
+
+    def __call__(self, x, offset=0):
+        L = x.shape[-2]
+        pos = self.media.window(offset, L) if isinstance(offset, int) else None
+        if pos is None:
+            return mx.fast.rope(x, self.dims, traditional=False, base=self.base, scale=1.0, offset=offset)
+        angles = mx.take(pos, self._selector, axis=0).T.astype(mx.float32) * self._inv_freq  # [L, half]
+        cos, sin = mx.cos(angles).astype(x.dtype), mx.sin(angles).astype(x.dtype)
+        half = self.dims // 2
+        x1, x2, rest = x[..., :half], x[..., half : self.dims], x[..., self.dims :]
+        return mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rest], axis=-1)
 
 
 @dataclass
@@ -395,6 +452,10 @@ class TextModel(nn.Module):
 class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
+    vision_config: Optional[dict] = None
+    image_token_id: Optional[int] = None
+    vision_start_token_id: Optional[int] = None
+    vision_end_token_id: Optional[int] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -409,6 +470,42 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.language_model = TextModel(TextModelArgs.from_dict(args.text_config))
+        # Image inputs (Qwen3.5 VL checkpoints): the Qwen3-VL vision tower,
+        # and mRoPE in the full-attention layers for the image positions.
+        self.vision_tower = None
+        vision_config = getattr(args, "vision_config", None)  # qwen3_5_moe's args have none
+        if vision_config is not None and getattr(args, "image_token_id", None) is not None:
+            self.vision_tower = VisionModel(VisionConfig.from_dict({**vision_config, "model_type": "qwen3_5"}))
+            self.mrope = MRoPEState()
+            text = self.language_model.args
+            dims = int(text.head_dim * text.partial_rotary_factor)
+            section = (text.rope_parameters or {}).get("mrope_section", [11, 11, 10])
+            for layer in self.language_model.model.layers:
+                if not layer.is_linear:
+                    layer.self_attn.rope = MRoPE(dims, text.rope_theta, section, self.mrope)
+
+    def set_media_positions(self, media):
+        """(positions [3, N], delta) of the prompt with images, for the
+        prefill and the answer that follows; None after the request."""
+        if self.vision_tower is None:
+            return
+        if media is None:
+            self.mrope.positions, self.mrope.delta = None, 0
+        else:
+            self.mrope.positions, self.mrope.delta = media
+
+    def embed_with_images(self, input_ids: mx.array, pixel_values: mx.array, grid_thw: mx.array) -> mx.array:
+        """Token embeddings [1, L, H] with each image token's row replaced by
+        the vision tower's feature for it, in order."""
+        embeds = self.language_model.model.embed_tokens(input_ids)
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        features, _ = self.vision_tower(pixel_values.astype(dtype), grid_thw)
+        mask = (input_ids == self.args.image_token_id)[0]
+        positions = mx.array([i for i, m in enumerate(mask.tolist()) if m], dtype=mx.int32)
+        if positions.shape[0] != features.shape[0]:
+            raise ValueError(f"{positions.shape[0]} image tokens for {features.shape[0]} image features")
+        embeds = embeds.at[0, positions].add(features.astype(embeds.dtype) - embeds[0, positions])
+        return embeds
 
     def __call__(
         self,
@@ -426,10 +523,13 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         sanitized = {}
+        vision = {}
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):
-                continue
-            if key.startswith("model.visual"):
+                # Kept when this model has a vision tower (a VL checkpoint);
+                # dropped for a text-only load.
+                if self.vision_tower is not None:
+                    vision[key.replace("model.visual", "vision_tower", 1)] = value
                 continue
             if key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")
@@ -438,7 +538,11 @@ class Model(nn.Module):
             else:
                 key = "language_model." + key
             sanitized[key] = value
-        return self.language_model.sanitize(sanitized)
+        sanitized = self.language_model.sanitize(sanitized)
+        if vision:
+            stripped = {k[len("vision_tower."):]: v for k, v in vision.items()}
+            sanitized.update({"vision_tower." + k: v for k, v in self.vision_tower.sanitize(stripped).items()})
+        return sanitized
 
     def shard(self, group=None):
         group = group or mx.distributed.init()

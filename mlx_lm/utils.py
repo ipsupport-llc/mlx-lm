@@ -1091,7 +1091,7 @@ def save_config(
     # converted Gemma 4 silently lose its vision (the tower isn't built
     # without it, and its saved weights were then discarded on load).
     config.pop("_name_or_path", None)
-    if config.get("model_type") not in ("gemma4", "gemma4_unified"):
+    if config.get("model_type") not in ("gemma4", "gemma4_unified", "qwen3_5"):
         config.pop("vision_config", None)
     if "quantization" in config:
         config["quantization_config"] = config["quantization"]
