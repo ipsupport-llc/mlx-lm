@@ -406,6 +406,9 @@ class DecoderLayer(nn.Module):
 
 
 class Gemma4TextModel(nn.Module):
+    # Only indexed by token id: can stay in its file (mapped_embedding).
+    lookup_tables = ("embed_tokens_per_layer",)
+
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config

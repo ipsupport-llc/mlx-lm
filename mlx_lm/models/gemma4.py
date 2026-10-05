@@ -221,6 +221,9 @@ class UnifiedVisionEmbedder(nn.Module):
 
 
 class Model(nn.Module):
+    # Loaded on first use with lazy_towers.
+    lazy_modules = ("vision_tower", "embed_vision", "audio_tower", "embed_audio")
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args

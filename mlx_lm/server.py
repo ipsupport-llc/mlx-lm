@@ -450,6 +450,10 @@ class ModelProvider:
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
+                model_config={
+                    "mmap_lookup_tables": getattr(self.cli_args, "mmap_lookup_tables", False),
+                    "lazy_towers": getattr(self.cli_args, "lazy_towers", False),
+                },
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
 
@@ -2575,6 +2579,18 @@ def make_parser():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--mmap-lookup-tables",
+        action="store_true",
+        help="Read lookup-only tables (Gemma 4 per-layer embeddings, untied "
+        "token embeddings) by row from the weights files instead of loading "
+        "them. Less memory, a little slower decoding",
+    )
+    parser.add_argument(
+        "--lazy-towers",
+        action="store_true",
+        help="Load the image and audio towers on their first use",
     )
     return parser
 
