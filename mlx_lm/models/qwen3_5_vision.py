@@ -48,8 +48,9 @@ def ensure_fused_sdpa(q, k, v, scale, mask=None):
     if target != d:
         pad = [(0, 0)] * (q.ndim - 1) + [(0, target - d)]
         q, k, v = mx.pad(q, pad), mx.pad(k, pad), mx.pad(v, pad)
-    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)[..., :d]
-
+    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)[
+        ..., :d
+    ]
 
 
 def check_array_shape(arr):

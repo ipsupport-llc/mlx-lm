@@ -1127,7 +1127,13 @@ def save(
 
     # processor_config.json: what mlx_lm.multimodal builds a Gemma 4's image
     # inputs from (without it the converted model takes no images).
-    for p in ["*.py", "generation_config.json", "processor_config.json"]:
+    # preprocessor_config.json: the same for Qwen3.5.
+    for p in [
+        "*.py",
+        "generation_config.json",
+        "processor_config.json",
+        "preprocessor_config.json",
+    ]:
         for file in glob.glob(str(src_path / p)):
             shutil.copy(file, dst_path)
 

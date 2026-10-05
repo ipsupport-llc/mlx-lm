@@ -480,18 +480,10 @@ class ImageInputs:
 
 
 class Qwen35ImageInputs:
-    """Qwen3.5 (qwen3_5) image preprocessing, prompt expansion, fusion and
-    mRoPE positions. Preprocessing follows HF's Qwen2VLImageProcessor (no
-    torch): resize so each side is a multiple of patch * merge (32) with the
-    pixel count in [min_pixels, max_pixels], normalize, and cut into
-    temporal x patch x patch patches (a still image is its own 2 frames).
-    Each <|image_pad|> placeholder becomes h * w / merge^2 image tokens; their
-    positions are (t, h, w) on the merged grid, starting after the text
-    before them, and the text after an image continues from max + 1 (HF's
-    get_rope_index)."""
+    """Qwen3.5 image preprocessing (as HF Qwen2VLImageProcessor), prompt
+    expansion, fusion and mRoPE positions (as HF get_rope_index)."""
 
-    # The checkpoint allows up to 16.7 MP (16k tokens an image); a chat
-    # doesn't need that, and every token is prefill time.
+    # Lower than the checkpoint limit (16.7 MP) to keep prefill short.
     MAX_PIXELS = 1_048_576
 
     def __init__(self, model, processor_config: dict):
@@ -502,13 +494,21 @@ class Qwen35ImageInputs:
         self.temporal = int(cfg.get("temporal_patch_size", 2))
         size = cfg.get("size", {})
         self.min_pixels = int(size.get("shortest_edge", cfg.get("min_pixels", 65536)))
-        self.max_pixels = min(int(size.get("longest_edge", cfg.get("max_pixels", self.MAX_PIXELS))), self.MAX_PIXELS)
+        self.max_pixels = min(
+            int(size.get("longest_edge", cfg.get("max_pixels", self.MAX_PIXELS))),
+            self.MAX_PIXELS,
+        )
         self.mean = np.array(cfg.get("image_mean", [0.5, 0.5, 0.5]), dtype=np.float32)
         self.std = np.array(cfg.get("image_std", [0.5, 0.5, 0.5]), dtype=np.float32)
         self.image_token_id = model.args.image_token_id
 
     def _resize(self, h: int, w: int) -> Tuple[int, int]:
         factor = self.patch * self.merge
+        # Same limit as HF smart_resize. Thin images exceed the pixel cap.
+        if max(h, w) / max(1, min(h, w)) > 200:
+            raise ValueError(
+                f"Image aspect ratio {max(h, w) / max(1, min(h, w)):.0f}:1 is over 200:1."
+            )
         h_bar = max(factor, round(h / factor) * factor)
         w_bar = max(factor, round(w / factor) * factor)
         if h_bar * w_bar > self.max_pixels:
@@ -519,6 +519,11 @@ class Qwen35ImageInputs:
             beta = math.sqrt(self.min_pixels / (h * w))
             h_bar = math.ceil(h * beta / factor) * factor
             w_bar = math.ceil(w * beta / factor) * factor
+        while h_bar * w_bar > self.max_pixels and max(h_bar, w_bar) > factor:
+            if h_bar >= w_bar:
+                h_bar -= factor
+            else:
+                w_bar -= factor
         return h_bar, w_bar
 
     def _patches(self, image) -> Tuple[np.ndarray, Tuple[int, int, int]]:
@@ -526,7 +531,9 @@ class Qwen35ImageInputs:
 
         h, w = self._resize(image.height, image.width)
         image = image.convert("RGB").resize((w, h), Image.BICUBIC)
-        x = (np.asarray(image, dtype=np.float32) / 255.0 - self.mean) / self.std  # [H, W, C]
+        x = (
+            np.asarray(image, dtype=np.float32) / 255.0 - self.mean
+        ) / self.std  # [H, W, C]
         x = np.repeat(x.transpose(2, 0, 1)[None], self.temporal, axis=0)  # [T, C, H, W]
         gt, gh, gw = 1, h // self.patch, w // self.patch
         m, p, t, c = self.merge, self.patch, self.temporal, x.shape[1]

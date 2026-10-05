@@ -22,20 +22,40 @@ class TestMRoPE(unittest.TestCase):
         mx.random.seed(0)
         self.x = mx.random.normal((1, 4, 7, 256))
         self.state = MRoPEState()
-        self.rope = MRoPE(64, 1e7, [11, 11, 10], self.state)
+        import mlx.nn as nn
+
+        self.rope = MRoPE(
+            64, 1e7, [11, 11, 10], self.state, nn.RoPE(64, traditional=False, base=1e7)
+        )
 
     def reference(self, offset):
-        return mx.fast.rope(self.x, 64, traditional=False, base=1e7, scale=1.0, offset=offset)
+        return mx.fast.rope(
+            self.x, 64, traditional=False, base=1e7, scale=1.0, offset=offset
+        )
 
     def test_without_images_is_plain_rope(self):
-        self.assertTrue(mx.allclose(self.rope(self.x, offset=5), self.reference(5)).item())
+        self.assertTrue(
+            mx.allclose(self.rope(self.x, offset=5), self.reference(5)).item()
+        )
 
     def test_equal_axes_match_plain_rope(self):
         # Text-only positions (the same on t, h, w) must give plain RoPE: the
         # rotation and the channel layout are right.
         pos = mx.broadcast_to(mx.arange(20, dtype=mx.int32)[None], (3, 20))
         self.state.positions, self.state.delta = pos, 0
-        self.assertTrue(mx.allclose(self.rope(self.x, offset=3), self.reference(3), atol=1e-4).item())
+        # Exactly: a text chunk of an image prompt uses the text RoPE itself.
+        self.assertTrue(
+            mx.array_equal(self.rope(self.x, offset=3), self.reference(3)).item()
+        )
+
+    def test_image_positions_differ_from_plain_rope(self):
+        pos = mx.array([[0, 1, 1, 1], [0, 1, 1, 2], [0, 1, 2, 1]], dtype=mx.int32)
+        self.state.positions, self.state.delta = pos, 0
+        self.assertFalse(
+            mx.allclose(
+                self.rope(self.x[:, :, :4], offset=0), self.reference(0)[:, :, :4]
+            ).item()
+        )
 
     def test_positions_past_the_prompt_continue_with_delta(self):
         pos = mx.broadcast_to(mx.arange(4, dtype=mx.int32)[None], (3, 4))
@@ -69,9 +89,14 @@ def _png(w, h):
 
 class TestQwen35ImageInputs(unittest.TestCase):
     def setUp(self):
-        cfg = {"patch_size": 16, "merge_size": 2, "temporal_patch_size": 2,
-               "size": {"shortest_edge": 65536, "longest_edge": 16777216},
-               "image_mean": [0.5] * 3, "image_std": [0.5] * 3}
+        cfg = {
+            "patch_size": 16,
+            "merge_size": 2,
+            "temporal_patch_size": 2,
+            "size": {"shortest_edge": 65536, "longest_edge": 16777216},
+            "image_mean": [0.5] * 3,
+            "image_std": [0.5] * 3,
+        }
         self.model = _FakeModel()
         self.inputs = Qwen35ImageInputs(self.model, cfg)
 
@@ -104,6 +129,12 @@ class TestQwen35ImageInputs(unittest.TestCase):
         self.assertEqual(pos[:, -1].tolist(), [22] * 3)  # after the image: max + 1
         self.assertEqual(delta, 23 - len(ids))
         self.assertTrue(all(k >= 1 << 40 for k in key[2:302]))
+
+    def test_thin_images_are_refused_and_the_cap_holds(self):
+        with self.assertRaises(ValueError):
+            self.inputs._resize(1, 1_000_000)
+        h, w = self.inputs._resize(100, 19_000)
+        self.assertLessEqual(h * w, self.inputs.MAX_PIXELS)
 
     def test_placeholder_count_must_match(self):
         with self.assertRaises(ValueError):
