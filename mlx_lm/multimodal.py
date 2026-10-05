@@ -479,6 +479,120 @@ class ImageInputs:
         return gen_ids, embeddings, cache_key
 
 
+class Qwen35ImageInputs:
+    """Qwen3.5 image preprocessing (as HF Qwen2VLImageProcessor), prompt
+    expansion, fusion and mRoPE positions (as HF get_rope_index)."""
+
+    # Lower than the checkpoint limit (16.7 MP) to keep prefill short.
+    MAX_PIXELS = 1_048_576
+
+    def __init__(self, model, processor_config: dict):
+        cfg = processor_config.get("image_processor", processor_config)
+        self.model = model
+        self.patch = int(cfg.get("patch_size", 16))
+        self.merge = int(cfg.get("merge_size", 2))
+        self.temporal = int(cfg.get("temporal_patch_size", 2))
+        size = cfg.get("size", {})
+        self.min_pixels = int(size.get("shortest_edge", cfg.get("min_pixels", 65536)))
+        self.max_pixels = min(
+            int(size.get("longest_edge", cfg.get("max_pixels", self.MAX_PIXELS))),
+            self.MAX_PIXELS,
+        )
+        self.mean = np.array(cfg.get("image_mean", [0.5, 0.5, 0.5]), dtype=np.float32)
+        self.std = np.array(cfg.get("image_std", [0.5, 0.5, 0.5]), dtype=np.float32)
+        self.image_token_id = model.args.image_token_id
+
+    def _resize(self, h: int, w: int) -> Tuple[int, int]:
+        factor = self.patch * self.merge
+        # Same limit as HF smart_resize. Thin images exceed the pixel cap.
+        if max(h, w) / max(1, min(h, w)) > 200:
+            raise ValueError(
+                f"Image aspect ratio {max(h, w) / max(1, min(h, w)):.0f}:1 is over 200:1."
+            )
+        h_bar = max(factor, round(h / factor) * factor)
+        w_bar = max(factor, round(w / factor) * factor)
+        if h_bar * w_bar > self.max_pixels:
+            beta = math.sqrt((h * w) / self.max_pixels)
+            h_bar = max(factor, math.floor(h / beta / factor) * factor)
+            w_bar = max(factor, math.floor(w / beta / factor) * factor)
+        elif h_bar * w_bar < self.min_pixels:
+            beta = math.sqrt(self.min_pixels / (h * w))
+            h_bar = math.ceil(h * beta / factor) * factor
+            w_bar = math.ceil(w * beta / factor) * factor
+        while h_bar * w_bar > self.max_pixels and max(h_bar, w_bar) > factor:
+            if h_bar >= w_bar:
+                h_bar -= factor
+            else:
+                w_bar -= factor
+        return h_bar, w_bar
+
+    def _patches(self, image) -> Tuple[np.ndarray, Tuple[int, int, int]]:
+        from PIL import Image
+
+        h, w = self._resize(image.height, image.width)
+        image = image.convert("RGB").resize((w, h), Image.BICUBIC)
+        x = (
+            np.asarray(image, dtype=np.float32) / 255.0 - self.mean
+        ) / self.std  # [H, W, C]
+        x = np.repeat(x.transpose(2, 0, 1)[None], self.temporal, axis=0)  # [T, C, H, W]
+        gt, gh, gw = 1, h // self.patch, w // self.patch
+        m, p, t, c = self.merge, self.patch, self.temporal, x.shape[1]
+        x = x.reshape(gt, t, c, gh // m, m, p, gw // m, m, p)
+        x = x.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
+        return x.reshape(gt * gh * gw, c * t * p * p), (gt, gh, gw)
+
+    def build(
+        self, prompt: List[int], images: List[bytes]
+    ) -> Tuple[List[int], mx.array, List[int]]:
+        n_placeholders = sum(1 for t in prompt if t == self.image_token_id)
+        if n_placeholders != len(images):
+            raise ValueError(
+                f"Chat template produced {n_placeholders} image placeholder(s) "
+                f"for {len(images)} image(s)."
+            )
+        patches, grids = [], []
+        for blob in images:
+            pv, grid = self._patches(_decode(blob))
+            patches.append(pv)
+            grids.append(grid)
+        keys = [
+            _IMAGE_KEY_BASE + int.from_bytes(hashlib.sha256(b).digest()[:5], "big")
+            for b in images
+        ]
+
+        expanded, cache_key, axes = [], [], [[], [], []]
+        next_pos, img = 0, 0
+        for tok in prompt:
+            if tok != self.image_token_id:
+                expanded.append(tok)
+                cache_key.append(tok)
+                for a in axes:
+                    a.append(next_pos)
+                next_pos += 1
+                continue
+            _, gh, gw = grids[img]
+            lh, lw = gh // self.merge, gw // self.merge
+            expanded += [self.image_token_id] * (lh * lw)
+            cache_key += [keys[img]] * (lh * lw)
+            for i in range(lh):
+                for j in range(lw):
+                    axes[0].append(next_pos)
+                    axes[1].append(next_pos + i)
+                    axes[2].append(next_pos + j)
+            next_pos += max(lh, lw)
+            img += 1
+
+        embeddings = self.model.embed_with_images(
+            mx.array(expanded)[None],
+            mx.array(np.concatenate(patches)),
+            mx.array(grids, dtype=mx.int32),
+        )[0]
+        mx.eval(embeddings)
+        positions = mx.array(axes, dtype=mx.int32)
+        self.media_positions = (positions, next_pos - len(expanded))
+        return expanded, embeddings, cache_key
+
+
 def vision_spans(cache_key: List[int]) -> List[Tuple[int, int]]:
     """[start, end) of each image's soft tokens, from a cache key built by
     ImageInputs.build (its image positions hold pseudo ids >= _IMAGE_KEY_BASE;
@@ -494,7 +608,15 @@ def vision_spans(cache_key: List[int]) -> List[Tuple[int, int]]:
 
 
 def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
-    """ImageInputs for a vision-capable Gemma 4 model, else None."""
+    """ImageInputs for a vision-capable Gemma 4 or Qwen3.5 model, else None."""
+    if getattr(model, "model_type", None) == "qwen3_5":
+        if getattr(model, "vision_tower", None) is None:
+            return None
+        from .utils import _download
+
+        cfg_path = Path(_download(str(model_path))) / "preprocessor_config.json"
+        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+        return Qwen35ImageInputs(model, cfg)
     if getattr(model, "model_type", None) not in ("gemma4", "gemma4_unified"):
         return None
     if getattr(model, "embed_vision", None) is None:
