@@ -2583,9 +2583,9 @@ def make_parser():
     parser.add_argument(
         "--mmap-lookup-tables",
         action="store_true",
-        help="Read lookup-only tables (Gemma 4 per-layer embeddings, untied "
-        "token embeddings) by row from the weights files instead of loading "
-        "them. Less memory, a little slower decoding",
+        help="Read lookup-only tables (Gemma 4 per-layer embeddings) by row "
+        "from the weights files instead of loading them. Less memory, a "
+        "little slower decoding",
     )
     parser.add_argument(
         "--lazy-towers",

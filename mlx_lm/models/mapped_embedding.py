@@ -98,7 +98,7 @@ def map_lookup_tables(model: nn.Module, weights: dict, sources: dict) -> list:
         return []
     indexes = {}
     mapped = []
-    for path, module in model.named_modules():
+    for path, module in list(model.named_modules()):
         if path.rsplit(".", 1)[-1] not in names:
             continue
         if not isinstance(module, (nn.Embedding, nn.QuantizedEmbedding)):
@@ -122,7 +122,12 @@ def map_lookup_tables(model: nn.Module, weights: dict, sources: dict) -> list:
                 if file not in indexes:
                     indexes[file] = safetensors_index(file)
                 offset, dtype, shape = indexes[file][name]
+                if dtype not in _DTYPES:
+                    break
                 rows[part] = _Rows(file, offset, dtype, shape)
+            # A dtype it can't read: the table stays loaded.
+            if len(rows) != len(parts):
+                continue
             replacement = MappedEmbedding(
                 rows["weight"],
                 rows.get("scales"),
