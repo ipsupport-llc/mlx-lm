@@ -2211,10 +2211,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if max_val is not None and value > max_val:
             raise ValueError(f"{name} must be at most {max_val}")
 
-    def validate_model_parameters(self):
+    def validate_model_parameters(self) -> None:
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
-        self._validate("max_tokens", int, min_val=0)
+        self._validate("max_tokens", int, min_val=1)
         if self.thinking_budget is not None and (not isinstance(self.thinking_budget, int)
                                                  or isinstance(self.thinking_budget, bool) or self.thinking_budget < 0):
             raise ValueError("thinking_budget must be a non-negative integer")

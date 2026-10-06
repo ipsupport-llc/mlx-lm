@@ -524,6 +524,11 @@ class TestServer(unittest.TestCase):
         line = next(l for l in logs.output if "Request stats:" in l)
         self.assertIn("first_token_s=1.000 tokens=3 decode_s=1.000", line)
 
+    def test_max_tokens_zero_is_rejected(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})
+        self.assertEqual(response.status_code, 400)
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 
