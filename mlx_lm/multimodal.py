@@ -609,7 +609,7 @@ def vision_spans(cache_key: List[int]) -> List[Tuple[int, int]]:
 
 def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
     """ImageInputs for a vision-capable Gemma 4 or Qwen3.5 model, else None."""
-    if getattr(model, "model_type", None) == "qwen3_5":
+    if getattr(model, "model_type", None) in ("qwen3_5", "qwen3_5_moe"):
         if getattr(model, "vision_tower", None) is None:
             return None
         from .utils import _download
