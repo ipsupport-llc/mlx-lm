@@ -470,6 +470,9 @@ class ModelArgs(BaseModelArgs):
 
 
 class Model(nn.Module):
+    # Loaded on first use with lazy_towers.
+    lazy_modules = ("vision_tower",)
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args

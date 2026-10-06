@@ -5,6 +5,7 @@ import glob
 import importlib
 import inspect
 import json
+import logging
 import os
 import resource
 import shutil
@@ -469,8 +470,13 @@ def load_model(
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
+    # id(array) -> (array, file, name) for mmap_lookup_tables. The arrays are
+    # kept, so an id is not reused by a new array during sanitize.
+    sources = {}
     for wf in weight_files:
-        weights.update(mx.load(wf))
+        loaded = mx.load(wf)
+        sources.update({id(v): (v, wf, k) for k, v in loaded.items()})
+        weights.update(loaded)
 
     if (model_file := config.get("model_file")) is not None:
         if not trust_remote_code:
@@ -573,11 +579,33 @@ def load_model(
 
         model.update_modules(leaves)
 
+    if config.get("mmap_lookup_tables"):
+        from .models.mapped_embedding import map_lookup_tables
+
+        mapped = map_lookup_tables(model, weights, sources)
+        if mapped:
+            logging.info("Lookup tables read from their files: %s", ", ".join(mapped))
+    sources.clear()
+
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
-        mx.eval(model.parameters())
+        # Towers for images or audio load from the files on first use.
+        skip = set()
+        if config.get("lazy_towers"):
+            for _, m in model.named_modules():
+                skip.update(getattr(m, "lazy_modules", ()) or ())
+        if skip:
+            mx.eval(
+                [
+                    v
+                    for k, v in tree_flatten(model.parameters())
+                    if skip.isdisjoint(k.split("."))
+                ]
+            )
+        else:
+            mx.eval(model.parameters())
 
     return model, config
 
