@@ -470,12 +470,12 @@ def load_model(
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
-    # id(array) -> (file, name): which arrays are still the files' own after
-    # sanitize, for mmap_lookup_tables.
+    # id(array) -> (array, file, name) for mmap_lookup_tables. The arrays are
+    # kept, so an id is not reused by a new array during sanitize.
     sources = {}
     for wf in weight_files:
         loaded = mx.load(wf)
-        sources.update({id(v): (wf, k) for k, v in loaded.items()})
+        sources.update({id(v): (v, wf, k) for k, v in loaded.items()})
         weights.update(loaded)
 
     if (model_file := config.get("model_file")) is not None:

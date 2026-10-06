@@ -108,9 +108,9 @@ def map_lookup_tables(model: nn.Module, weights: dict, sources: dict) -> list:
             key = f"{path}.{part}"
             if key in weights:
                 src = sources.get(id(weights[key]))
-                if src is None:
+                if src is None or src[0] is not weights[key]:
                     break
-                parts[part] = src
+                parts[part] = src[1:]
         else:
             if "weight" not in parts:
                 continue
