@@ -11,7 +11,7 @@ class Model(Qwen3_5Model):
         # (prefixes, the vision tower, MTP, norms) is Qwen3.5's.
         weights = dict(weights)
         for l in range(self.language_model.args.num_hidden_layers):
-            for base in ("model.language_model", "language_model.model"):
+            for base in ("model.language_model", "language_model.model", "model"):
                 prefix = f"{base}.layers.{l}.mlp"
                 gate_up = weights.pop(f"{prefix}.experts.gate_up_proj", None)
                 if gate_up is None:

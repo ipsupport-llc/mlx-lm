@@ -480,9 +480,7 @@ class Model(nn.Module):
         self.language_model = TextModel(TextModelArgs.from_dict(args.text_config))
         # VL checkpoints: Qwen3-VL vision tower and mRoPE in full attention.
         self.vision_tower = None
-        vision_config = getattr(
-            args, "vision_config", None
-        )  # qwen3_5_moe's args have none
+        vision_config = getattr(args, "vision_config", None)
         if vision_config is not None and vision_config.get("deepstack_visual_indexes"):
             # Deepstack is not implemented. Qwen3.5 does not use it.
             print(
