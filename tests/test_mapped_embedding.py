@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 """Lookup tables read from the weights file (mmap_lookup_tables) and towers
 loaded on first use (lazy_towers) give the same outputs as a normal load."""
 

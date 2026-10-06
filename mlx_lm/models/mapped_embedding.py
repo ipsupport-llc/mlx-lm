@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 """Lookup-only embedding tables read by row from their safetensors file.
 
 The table stays a read-only memory map: only the used rows are in memory,

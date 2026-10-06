@@ -451,7 +451,9 @@ class ModelProvider:
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
                 model_config={
-                    "mmap_lookup_tables": getattr(self.cli_args, "mmap_lookup_tables", False),
+                    "mmap_lookup_tables": getattr(
+                        self.cli_args, "mmap_lookup_tables", False
+                    ),
                     "lazy_towers": getattr(self.cli_args, "lazy_towers", False),
                 },
                 trust_remote_code=self.cli_args.trust_remote_code,
