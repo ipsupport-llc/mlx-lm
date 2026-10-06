@@ -291,6 +291,64 @@ class TestServer(unittest.TestCase):
         status, _ = _complete(self.port, "Hello")
         self.assertEqual(status, 200)
 
+    def test_tool_call_keeps_stream_alive(self):
+        # A tool call is sent only once it closes; while a long one is being
+        # generated the stream carries keepalive comments, or a client's
+        # stall timeout cuts it off mid-call.
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        ctx = GenerationContext(
+            has_tool_calling=True,
+            has_thinking=False,
+            tool_parser=pythonic.parse_tool_call,
+            text_sm=sm,
+            initial_state="normal",
+            prompt=[1, 2, 3],
+        )
+        pieces = ["<tool_call>", "[get_weather(", 'city="Pa', 'ris"', ")]"]
+        pieces.append("</tool_call>")
+        gens = [
+            types.SimpleNamespace(
+                text=t, token=i, logprob=0.0, finish_reason=None, top_tokens=()
+            )
+            for i, t in enumerate(pieces)
+        ]
+        gens.append(
+            types.SimpleNamespace(
+                text="", token=99, logprob=0.0, finish_reason="stop", top_tokens=()
+            )
+        )
+        clock = iter(range(0, 1000, 3))
+        with mock.patch.object(
+            self.response_generator, "generate", return_value=(ctx, iter(gens))
+        ), mock.patch("mlx_lm.server.time.monotonic", lambda: next(clock)):
+            response = requests.post(
+                f"http://localhost:{self.port}/v1/chat/completions",
+                json={
+                    "model": "default_model",
+                    "messages": [{"role": "user", "content": "weather?"}],
+                    "stream": True,
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        events = response.text.split("\n\n")
+        self.assertIn(": keepalive tool", events)
+        data = [json.loads(e[6:]) for e in events if e.startswith("data: {")]
+        calls = [
+            call
+            for d in data
+            for choice in d["choices"]
+            for call in choice["delta"].get("tool_calls") or []
+        ]
+        self.assertEqual([c["function"]["name"] for c in calls], ["get_weather"])
+        # The keepalives come while the call is generated, before it's sent.
+        first_call = next(i for i, e in enumerate(events) if "get_weather" in e)
+        self.assertLess(events.index(": keepalive tool"), first_call)
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 

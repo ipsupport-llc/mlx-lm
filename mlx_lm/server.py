@@ -1998,6 +1998,9 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens = []
         token_logprobs = []
         top_tokens = []
+        # A tool call is held back until it closes: a long one (a big
+        # argument) sends nothing for minutes, so keep the stream alive.
+        tool_keepalive_at = time.monotonic()
 
         try:
             for gen in response:
@@ -2053,6 +2056,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning_text = ""
                     text = ""
                     tool_calls = []
+                elif self.stream and current_state == "tool":
+                    now = time.monotonic()
+                    if now - tool_keepalive_at >= 5:
+                        tool_keepalive_at = now
+                        self.wfile.write(b": keepalive tool\n\n")
+                        self.wfile.flush()
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
