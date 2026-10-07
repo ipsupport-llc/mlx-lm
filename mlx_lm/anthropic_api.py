@@ -54,6 +54,8 @@ def _user_messages(content) -> List[dict]:
             )
             # A tool message holds text only: its images go with the user part.
             if isinstance(result, list):
+                if any(b.get("type") not in ("text", "image") for b in result):
+                    raise ValueError("Only text and image tool results are supported.")
                 parts.extend(_image_part(b) for b in result if b.get("type") == "image")
         elif kind == "text":
             parts.append({"type": "text", "text": block.get("text", "")})
@@ -129,6 +131,8 @@ def to_chat_request(body: dict) -> dict:
     # Generation can't force a call: "tool" offers only that tool, "any" is "auto".
     if tool_choice.get("type") == "tool":
         tools = [t for t in tools if t.get("name") == tool_choice.get("name")]
+        if not tools:
+            raise ValueError(f"tool_choice names an unknown tool: {tool_choice.get('name')!r}")
     if tools and tool_choice.get("type") != "none":
         chat["tools"] = [
             {
@@ -198,6 +202,8 @@ def to_message(response: dict, model: str, stop_sequence: Optional[str] = None) 
     if out.get("content"):
         content.append({"type": "text", "text": out["content"]})
     content.extend(_tool_use(c) for c in out.get("tool_calls") or [])
+    if not content:
+        content.append({"type": "text", "text": ""})
     usage = response.get("usage", {})
     return {
         "id": message_id(),

@@ -104,6 +104,14 @@ class TestRequestConversion(unittest.TestCase):
         self.assertEqual(chat["messages"][0], {"role": "tool", "tool_call_id": "t", "content": "shot"})
         self.assertEqual(chat["messages"][1]["content"][0]["image_url"]["url"], "http://x/y.png")
 
+    def test_unknown_forced_tool_is_an_error(self):
+        with self.assertRaises(ValueError):
+            anthropic_api.to_chat_request({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "a", "input_schema": {}}],
+                "tool_choice": {"type": "tool", "name": "b"},
+            })
+
     def test_empty_messages_is_an_error(self):
         with self.assertRaises(ValueError):
             anthropic_api.to_chat_request({"messages": []})
@@ -242,6 +250,9 @@ class TestMessagesEndpoint(unittest.TestCase):
                           headers={"Content-Type": "application/json"})
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json()["error"]["type"], "invalid_request_error")
+        r = requests.post(f"http://localhost:{self.port}/v1/messages", json=self.body(max_tokens=-1))
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["type"], "error")
         # The OpenAI routes keep their own error shape.
         r = requests.post(f"http://localhost:{self.port}/v1/chat/completions", data=b"{nope")
         self.assertIsInstance(r.json()["error"], str)
