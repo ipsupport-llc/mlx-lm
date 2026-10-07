@@ -449,6 +449,41 @@ class TestQwen35MTP(unittest.TestCase):
                 self.assertEqual(offset, len(prompt) + n)
                 self.assertEqual(kv_cache_quantized(cache), offset >= start, f"{start} {n}")
 
+    def test_last_token_fed_on_a_quantized_cache_past_the_start(self):
+        from mlx_lm.generate import kv_cache_quantized
+
+        model = make_model()
+        prompt = mx.random.randint(0, VOCAB, (9,))
+        sequence = prompt.tolist() + greedy_plain(model, prompt, 20)
+        for start in range(10, 30):
+            m = make_model()
+            oracle = OracleHead(m, sequence, lambda p: True)
+            oracle.install()
+            seen = []
+            real = oracle.backbone
+
+            def backbone(inputs, cache=None, ssm_sink=None):
+                offset = next(c.offset for c in cache if c.is_trimmable())
+                seen.append((offset, kv_cache_quantized(cache)))
+                return real(inputs, cache=cache, ssm_sink=ssm_sink)
+
+            m.language_model.backbone = backbone
+            for _ in mtp_generate_step(prompt, m, num_draft_tokens=3, adaptive=False, max_tokens=20,
+                                       kv_bits=8, kv_group_size=32, quantized_kv_start=start):
+                pass
+            for offset, quantized in seen:
+                self.assertEqual(quantized, offset >= start, f"start={start} at {offset}")
+
+    def test_zero_drafts_never_run_the_head(self):
+        model = make_model()
+        calls = []
+        real = model.language_model.mtp_step
+        model.language_model.mtp_step = lambda *a: calls.append(1) or real(*a)
+        prompt = mx.random.randint(0, VOCAB, (9,))
+        out = [t for t, _, _ in mtp_generate_step(prompt, model, num_draft_tokens=0, max_tokens=8)]
+        self.assertEqual(out, greedy_plain(model, prompt, 8))
+        self.assertEqual(calls, [])
+
     def test_rows_sampled_one_call_each_unless_independent(self):
         model = make_model()
         prompt = mx.random.randint(0, VOCAB, (9,))

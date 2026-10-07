@@ -1182,7 +1182,8 @@ def mtp_generate_step(
 
     def _feed_head(hidden, tokens):
         # Only the head's cache is used (and evaluated): its logits aren't.
-        if hidden is not None and hidden.shape[1] > 0:
+        # No drafts at all: the head isn't run.
+        if num_draft_tokens > 0 and hidden is not None and hidden.shape[1] > 0:
             lm.mtp_step(hidden, tokens, mtp_cache)
             quantize_cache_fn(mtp_cache)
 
@@ -1320,6 +1321,7 @@ def mtp_generate_step(
                     _, sink, keep, held = fixup
                     lm.rollback_speculative_cache(cache, sink, keep, held)
                 else:
+                    quantize_cache_fn(cache)
                     lm.backbone(fixup[1].reshape(1, 1), cache=cache)
                 quantize_cache_fn(cache)
                 mx.eval([c.state for c in cache])
