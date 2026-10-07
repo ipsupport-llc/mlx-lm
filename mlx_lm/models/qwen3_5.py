@@ -545,7 +545,10 @@ class TextModel(nn.Module):
                 use_kernel=not self.training,
             )
 
-    def sanitize(self, weights):
+    def sanitize(self, weights, raw_mtp: Optional[bool] = None):
+        """`raw_mtp`: the head's tensors are a raw checkpoint's (zero-centered
+        norms), which the caller can tell by their names; None: as the
+        backbone's."""
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
@@ -569,17 +572,8 @@ class TextModel(nn.Module):
             ".pre_fc_norm_embedding.weight",
             "mtp.norm.weight",
         )
-        # The head can come from another conversion than the backbone (a
-        # weight file added next to it): its norms are judged by their own
-        # values. Raw ones are centered on 0, converted ones on 1.
-        mtp_norms = [
-            v
-            for k, v in weights.items()
-            if _is_mtp_key(k) and v.ndim == 1 and k.endswith(norm_keys)
-        ]
-        raw_mtp = bool(mtp_norms) and (
-            sum(mx.abs(v).mean().item() for v in mtp_norms) / len(mtp_norms) < 0.5
-        )
+        if raw_mtp is None:
+            raw_mtp = has_unsanitized_conv1d
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
@@ -711,6 +705,14 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized = {}
         vision = {}
+        # A raw checkpoint keeps the head at mtp.* (or model.mtp.*); a
+        # converted one at language_model.mtp.*. The head can come from
+        # another conversion than the backbone (a weight file added next to
+        # it), so its norms go by its own names.
+        raw_mtp = any(
+            k.startswith(("mtp.", "model.mtp.", "model.language_model.mtp."))
+            for k in weights
+        )
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):
                 # Keep only if the model has a vision tower.
@@ -728,7 +730,7 @@ class Model(nn.Module):
             else:
                 key = "language_model." + key
             sanitized[key] = value
-        sanitized = self.language_model.sanitize(sanitized)
+        sanitized = self.language_model.sanitize(sanitized, raw_mtp=raw_mtp)
         if vision:
             stripped = {k[len("vision_tower.") :]: v for k, v in vision.items()}
             sanitized.update(
