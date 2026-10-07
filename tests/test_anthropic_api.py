@@ -124,6 +124,9 @@ class TestRequestConversion(unittest.TestCase):
         with self.assertRaises(ValueError):
             anthropic_api.to_chat_request({"messages": msgs + [
                 {"role": "assistant", "content": [{"type": "document", "source": {}}]}]})
+        with self.assertRaises(ValueError):
+            anthropic_api.to_chat_request({"messages": [
+                {"role": "user", "content": [{"type": "web_search_tool_result", "content": []}]}]})
 
     def test_empty_stream_has_a_text_block(self):
         s = anthropic_api.MessageStream("m")

@@ -61,9 +61,8 @@ def _user_messages(content) -> List[dict]:
             parts.append({"type": "text", "text": block.get("text", "")})
         elif kind == "image":
             parts.append(_image_part(block))
-        elif kind == "document":
-            raise ValueError("Document content blocks are not supported.")
-        # Anything else (e.g. cache hints carried as blocks) carries no text.
+        else:
+            raise ValueError(f"Unsupported user content block: {kind!r}")
     if parts:
         if all(p["type"] == "text" for p in parts):
             out.append({"role": "user", "content": "".join(p["text"] for p in parts)})
