@@ -324,6 +324,8 @@ class GenerationContext:
 
     prompt: List[int]
     prompt_cache_count: int = -1
+    # The model that serves this request (for the next turn's warm).
+    model_key: Any = None
 
     _should_stop: bool = False
 
@@ -958,6 +960,7 @@ class ResponseGenerator:
                         initial_state=initial_state,
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
+                        model_key=self.model_provider.model_key,
                     )
                     rqueue.put(ctx)
 
@@ -1181,6 +1184,7 @@ class ResponseGenerator:
                 text_sm=text_sm,
                 initial_state=initial_state,
                 prompt=prompt,
+                model_key=self.model_provider.model_key,
             )
             rqueue.put(ctx)
 
@@ -1365,7 +1369,7 @@ class ResponseGenerator:
         except Exception as e:
             rqueue.put(e)
 
-    def warm_next_turn(self, request, args, content, tool_calls):
+    def warm_next_turn(self, model_key, request, args, content, tool_calls):
         """After a chat request: the conversation with this answer, as the
         client will send it back, gets prefilled while the server is idle
         and stored as a cache entry. A model whose cache can't be trimmed
@@ -1379,7 +1383,7 @@ class ResponseGenerator:
         message = {"role": "assistant", "content": content}
         if tool_calls:
             message["tool_calls"] = tool_calls
-        self._warm_jobs.append((self.model_provider.model_key, request, args, message))
+        self._warm_jobs.append((model_key, request, args, message))
 
     def _next_turn_tokens(self, tokenizer, request, args, message):
         """The tokens the client's next request starts with: the common
@@ -1466,6 +1470,12 @@ class ResponseGenerator:
             while done < len(rest):
                 if not self.requests.empty():
                     logging.info("Prompt cache: next turn not warmed (a request came in)")
+                    return
+                # The cache grows each chunk: still only into free memory.
+                nbytes = sum(c.nbytes for c in cache if c is not None)
+                short = self._memory_shortfall(nbytes, self._prefill_memory_budget())
+                if short is not None and short > 0:
+                    logging.info("Prompt cache: next turn not warmed (no free memory)")
                     return
                 step = prefill_step(reused + done, kv_cache_quantized(cache))
                 chunk = rest[done : done + step]
@@ -2363,6 +2373,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             if finish_reason in ("stop", "tool_calls"):
                 self.response_generator.warm_next_turn(
+                    ctx.model_key,
                     request,
                     args,
                     answer_text,

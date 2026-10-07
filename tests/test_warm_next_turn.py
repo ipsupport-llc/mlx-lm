@@ -99,7 +99,7 @@ class TestWarmNextTurn(unittest.TestCase):
 
         request = CompletionRequest("chat", "", json.loads(json.dumps(messages)), None, None)
         answer = "Once upon a time there was a small model."
-        self.rg.warm_next_turn(request, self.args(), answer, [])
+        self.rg.warm_next_turn(self.provider.model_key, request, self.args(), answer, [])
         warm = self.rg._next_turn_tokens(tok, request, self.args(), {"role": "assistant", "content": answer})
 
         deadline = time.time() + 30
