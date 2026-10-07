@@ -1,5 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
+import mlx.core as mx
+
 from .qwen3_5 import Model as Qwen3_5Model
 from .qwen3_5 import ModelArgs  # noqa: F401  (the loader reads module.ModelArgs)
 
@@ -22,4 +24,26 @@ class Model(Qwen3_5Model):
                 weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
                     f"{prefix}.experts.down_proj"
                 )
+        # The MTP head's experts come one tensor per expert.
+        n = self.language_model.args.num_experts
+        for l in range(self.language_model.args.mtp_num_hidden_layers):
+            for base in (
+                "mtp",
+                "model.mtp",
+                "model.language_model.mtp",
+                "language_model.mtp",
+            ):
+                prefix = f"{base}.layers.{l}.mlp"
+                if f"{prefix}.experts.0.gate_proj.weight" not in weights:
+                    continue
+                for m in ("gate_proj", "up_proj", "down_proj"):
+                    for part in ("weight", "scales", "biases"):
+                        if f"{prefix}.experts.0.{m}.{part}" not in weights:
+                            continue
+                        weights[f"{prefix}.switch_mlp.{m}.{part}"] = mx.stack(
+                            [
+                                weights.pop(f"{prefix}.experts.{e}.{m}.{part}")
+                                for e in range(n)
+                            ]
+                        )
         return super().sanitize(weights)

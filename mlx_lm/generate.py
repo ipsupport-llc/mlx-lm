@@ -1020,6 +1020,313 @@ def nemotron_h_mtp_generate_step(
                 quantize_cache_fn(model_cache)
                 mx.eval([c.state for c in model_cache if c is not None])
 
+def _mtp_language_model(model: nn.Module) -> Optional[nn.Module]:
+    """The language model whose MTP head mtp_generate_step drafts with
+    (Qwen3.5 / 3.5-MoE, a VL checkpoint's or a text-only one), or None."""
+    lm = getattr(model, "language_model", model)
+    if getattr(lm, "mtp", None) is None:
+        return None
+    if not all(
+        hasattr(lm, a)
+        for a in ("backbone", "logits_from_backbone", "mtp_step", "make_mtp_cache")
+    ):
+        return None
+    return lm
+
+
+class DraftLength:
+    """Picks the number of drafts for each MTP iteration, 0 (plain
+    decoding) to `max_drafts`, by the expected tokens per second. Measured
+    as generation goes: how often the i-th draft is accepted once the ones
+    before it were (a chained draft is accepted less often than the first),
+    and each length's iteration time. Every `probe_every` iterations a
+    neighbour of the best length is tried, so the estimates stay current."""
+
+    def __init__(self, max_drafts: int, probe_every: int = 16, decay: float = 0.95):
+        self.max_drafts = max(0, max_drafts)
+        self.probe_every = probe_every
+        self.decay = decay
+        # Per draft position: accepted and tried (decayed), from a 50% prior.
+        self.accepted = [1.0] * self.max_drafts
+        self.tried = [2.0] * self.max_drafts
+        self.seconds = {}
+        self.n = 0
+
+    def expected_tokens(self, k: int) -> float:
+        total, reach = 1.0, 1.0
+        for i in range(k):
+            reach *= self.accepted[i] / self.tried[i]
+            total += reach
+        return total
+
+    def _time(self, k):
+        if k in self.seconds:
+            return self.seconds[k]
+        if not self.seconds:
+            return 1.0 + 0.25 * k
+        # Each draft adds a head step, about a quarter of an iteration.
+        k0, t0 = min(self.seconds.items(), key=lambda kv: abs(kv[0] - k))
+        return t0 * (1.0 + 0.25 * k) / (1.0 + 0.25 * k0)
+
+    def best(self) -> int:
+        return max(
+            range(self.max_drafts + 1),
+            key=lambda k: self.expected_tokens(k) / self._time(k),
+        )
+
+    def choose(self) -> int:
+        if self.max_drafts == 0:
+            return 0
+        self.n += 1
+        k = self.best()
+        if self.n % self.probe_every == 0:
+            up = (self.n // self.probe_every) % 2 == 1 or k == 0
+            k = min(k + 1, self.max_drafts) if up else k - 1
+        return k
+
+    def update(self, k: int, n_accepted: int, seconds: float):
+        for i in range(k):
+            if n_accepted < i:
+                break
+            self.tried[i] = self.tried[i] * self.decay + 1
+            self.accepted[i] = self.accepted[i] * self.decay + (n_accepted > i)
+        old = self.seconds.get(k)
+        self.seconds[k] = seconds if old is None else 0.7 * old + 0.3 * seconds
+
+
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    num_draft_tokens: int = 1,
+    adaptive: bool = True,
+    max_tokens: int = 256,
+    sampler: Optional[Sampler] = None,
+    prompt_cache: Optional[Any] = None,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
+    prefill_step_size: int = 2048,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
+    prefill_memory_budget: Union[None, int, PrefillBudget] = None,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """Self-speculative decoding with the model's own MTP head (Qwen3.5).
+
+    One iteration drafts ``num_draft_tokens`` tokens greedily with the head
+    (chained on its own hidden states after the first; ``adaptive``: 0 to
+    that many, as DraftLength expects to be fastest), runs the backbone
+    once over ``[last token, drafts...]``, samples the backbone's own token
+    at every position and accepts the longest prefix of drafts equal to
+    those samples, then emits the backbone's sample right after it. Every
+    emitted token is the backbone's own sample, so the output distribution
+    is exactly plain decoding's (greedy: the same tokens), with any sampler.
+
+    The rejected drafts are rolled back: attention caches trim, the
+    GatedDeltaNet states are recomputed over the kept tokens from what the
+    verify pass captured (rollback_speculative_cache).
+
+    The head's KV cache is quantized like the backbone's (``kv_bits``).
+    The head attends over its own cache of (hidden state, next token)
+    pairs, filled during the prefill as well (one extra layer over the
+    uncached prompt): it was trained on whole sequences, not on the last
+    position alone.
+
+    Single sequence only; no logits processors or input embeddings
+    (stream_generate falls back to plain decoding for those).
+
+    Yields:
+        Tuple[int, mx.array, bool]: (token, log-probabilities, from_draft).
+    """
+    lm = _mtp_language_model(model)
+    if lm is None:
+        raise ValueError("The model has no usable MTP head.")
+    if prompt.ndim != 1:
+        raise ValueError("mtp_generate_step supports a single sequence only.")
+
+    sampler = sampler or greedy_sampler
+    # The caller's own list (the server stores it after the request).
+    cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
+    mtp_cache = lm.make_mtp_cache()
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+    if prompt_progress_callback is None:
+        prompt_progress_callback = lambda *_: None
+
+    # One sampler call per row unless the rows are independent in one call
+    # (XTC draws one coin per call).
+    rows_together = sampler is greedy_sampler or getattr(
+        sampler, "rows_independent", False
+    )
+
+    def _sample(logits):
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if rows_together or logprobs.ndim == 1 or logprobs.shape[0] == 1:
+            return sampler(logprobs), logprobs
+        return (
+            mx.concatenate([sampler(logprobs[i : i + 1]) for i in range(logprobs.shape[0])]),
+            logprobs,
+        )
+
+    def _kv_room():
+        # Drafts that keep the verify block short of the point where plain
+        # decoding quantizes the KV cache: it quantizes there exactly.
+        if kv_bits is None or kv_cache_quantized(cache):
+            return None
+        offset = next(c.offset for c in cache if c.is_trimmable())
+        return max(0, quantized_kv_start - offset - 1)
+
+    def _feed_head(hidden, tokens):
+        # Only the head's cache is used (and evaluated): its logits aren't.
+        # No drafts at all: the head isn't run.
+        if num_draft_tokens > 0 and hidden is not None and hidden.shape[1] > 0:
+            lm.mtp_step(hidden, tokens, mtp_cache)
+            quantize_cache_fn(mtp_cache)
+
+    def _append_pair(hs, ts, h, t):
+        if hs is None:
+            return h, t
+        return mx.concatenate([hs, h], axis=1), mx.concatenate([ts, t], axis=1)
+
+    total = len(prompt)
+    base = _cache_offset(cache)
+    prefill_step = make_prefill_step(model, prefill_step_size, prefill_memory_budget)
+    with mx.stream(stream):
+        done = 0
+        prompt_progress_callback(done, total)
+        # The last hidden state of the chunk before: its pair's token is the
+        # first one of the next chunk.
+        prev = None
+        while total - done > 1:
+            step = prefill_step(base + done, kv_cache_quantized(cache))
+            n = min(step, total - done - 1)
+            h = lm.backbone(prompt[done : done + n][None], cache=cache)
+            quantize_cache_fn(cache)
+            hs = h[:, :-1] if prev is None else mx.concatenate([prev, h[:, :-1]], axis=1)
+            _feed_head(hs, prompt[done + (prev is None) : done + n][None])
+            prev = h[:, -1:]
+            mx.eval([c.state for c in cache] + [c.state for c in mtp_cache])
+            done += n
+            prompt_progress_callback(done, total)
+            mx.clear_cache()
+        h = lm.backbone(prompt[done:][None], cache=cache)
+        quantize_cache_fn(cache)
+        hs = h[:, :-1] if prev is None else mx.concatenate([prev, h[:, :-1]], axis=1)
+        _feed_head(hs, prompt[done + (prev is None) :][None])
+        tok, logprobs = _sample(lm.logits_from_backbone(h[:, -1, :]))
+        hidden = h[:, -1:, :]
+        mx.eval(tok, logprobs)
+        prompt_progress_callback(total, total)
+
+    # On exit the cache must hold exactly prompt + every token yielded so
+    # far, like plain generate_step leaves it (the server stores it keyed by
+    # those tokens). `fixup` says how to get there from the most recent
+    # yield: feed the backbone's own token (not in the cache yet), or keep
+    # only part of the accepted drafts (rolled back with that verify pass's
+    # capture).
+    fixup = ("feed", tok)
+    # Pairs the head hasn't seen yet: the accepted drafts' true hidden
+    # states (the drafting saw the head's own), fed with the next draft.
+    pending_h, pending_t = None, None
+    n_out = 1
+    try:
+        yield tok.item(), logprobs.squeeze(0), False
+
+        limit = max_tokens if max_tokens >= 0 else float("inf")
+        lengths = DraftLength(num_draft_tokens) if adaptive else None
+        while n_out < limit:
+            k = lengths.choose() if lengths else num_draft_tokens
+            k = int(min(k, limit - n_out))
+            room = _kv_room()
+            if room is not None:
+                k = min(k, room) if room > 0 else 0
+            started = time.perf_counter()
+            fixup = None  # mid-iteration: cache state not well defined
+            with mx.stream(stream):
+                drafts = []
+                if k > 0:
+                    hs, ts = hidden, tok.reshape(1, 1)
+                    if pending_h is not None:
+                        hs = mx.concatenate([pending_h, hs], axis=1)
+                        ts = mx.concatenate([pending_t, ts], axis=1)
+                    for _ in range(k):
+                        logits, h = lm.mtp_step(hs, ts, mtp_cache)
+                        quantize_cache_fn(mtp_cache)
+                        d = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
+                        drafts.append(d)
+                        hs, ts = h[:, -1:], d
+                # Quantized here, on the accepted tokens only (like plain
+                # decoding's cache before this forward), not after a verify
+                # pass or a rollback the consumer may still cut short.
+                quantize_cache_fn(cache)
+                block = mx.concatenate([tok.reshape(1, 1)] + drafts, axis=1)
+                sink = []
+                hid = lm.backbone(block, cache=cache, ssm_sink=sink)
+                toks, lps = _sample(lm.logits_from_backbone(hid[0]))
+                draft_ids = (
+                    mx.concatenate(drafts, axis=1)[0]
+                    if drafts
+                    else mx.array([], mx.uint32)
+                )
+                mx.eval(toks, lps, draft_ids)
+            toks_l = toks.tolist()
+            draft_l = draft_ids.tolist()
+            n_acc = 0
+            while n_acc < k and draft_l[n_acc] == toks_l[n_acc]:
+                n_acc += 1
+            if lengths:
+                lengths.update(k, n_acc, time.perf_counter() - started)
+
+            with mx.stream(stream):
+                lm.rollback_speculative_cache(cache, sink, n_acc + 1, k + 1)
+                # The chained drafts' pairs held the head's own hidden
+                # states: replaced by the backbone's for the accepted ones.
+                if k > 1:
+                    for c in mtp_cache:
+                        c.trim(k - 1)
+                if k == 0:
+                    # Plain step: the head missed this pair.
+                    pending_h, pending_t = _append_pair(
+                        pending_h, pending_t, hidden, tok.reshape(1, 1)
+                    )
+                    if pending_h.shape[1] >= 32:
+                        _feed_head(pending_h, pending_t)
+                        pending_h = pending_t = None
+                elif n_acc > 0:
+                    pending_h = hid[:, :n_acc]
+                    pending_t = draft_ids[None, :n_acc]
+                else:
+                    pending_h = pending_t = None
+            tok = toks[n_acc]
+            hidden = hid[:, n_acc : n_acc + 1, :]
+
+            for i in range(n_acc):
+                # Stopping here keeps tok + the first i + 1 drafts.
+                fixup = ("keep", sink, i + 2, n_acc + 1)
+                yield toks_l[i], lps[i], True
+                n_out += 1
+                if n_out >= limit:
+                    return
+            fixup = ("feed", tok)
+            yield toks_l[n_acc], lps[n_acc], False
+            n_out += 1
+    finally:
+        if fixup is not None:
+            with mx.stream(stream):
+                if fixup[0] == "keep":
+                    _, sink, keep, held = fixup
+                    lm.rollback_speculative_cache(cache, sink, keep, held)
+                else:
+                    quantize_cache_fn(cache)
+                    lm.backbone(fixup[1].reshape(1, 1), cache=cache)
+                quantize_cache_fn(cache)
+                mx.eval([c.state for c in cache])
+
+
 def _is_gemma4_assistant(draft_model: Optional[nn.Module]) -> bool:
     return getattr(draft_model, "model_type", None) == "gemma4_assistant"
 
@@ -1328,7 +1635,7 @@ def stream_generate(
     kwargs["max_tokens"] = max_tokens
 
     if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
+        num_head_drafts = kwargs.pop("num_draft_tokens", None)
         # Auto-dispatch to the in-checkpoint MTP head instead of plain
         # decoding when the model has one: same output (bit-exact, see
         # tests/test_nemotron_h_mtp_generate.py), just faster. Only for the
@@ -1338,15 +1645,44 @@ def stream_generate(
         # generate_step rather than ignoring the request. KV-bit
         # quantization IS supported (see nemotron_h_mtp_generate_step's
         # docstring for why rollback needs no quantization-aware branch).
+        # A Qwen3.5 MTP head: any sampler (the drafts are checked against
+        # the backbone's own samples).
+        use_head = (
+            _mtp_language_model(model) is not None
+            and num_head_drafts != 0
+            and prompt.ndim == 1
+            and not kwargs.get("logits_processors")
+            and kwargs.get("max_kv_size") is None
+            and kwargs.get("input_embeddings") is None
+        )
         use_mtp = (
-            _model_supports_nemotron_h_mtp(model)
+            not use_head
+            and _model_supports_nemotron_h_mtp(model)
             and prompt.ndim == 1
             and kwargs.get("sampler") in (None, greedy_sampler)
             and not kwargs.get("logits_processors")
             and kwargs.get("max_kv_size") is None
             and kwargs.get("input_embeddings") is None
         )
-        if use_mtp:
+        if use_head:
+            token_generator = mtp_generate_step(
+                prompt,
+                model,
+                num_draft_tokens=1 if num_head_drafts is None else num_head_drafts,
+                max_tokens=kwargs["max_tokens"],
+                sampler=kwargs.get("sampler"),
+                prompt_cache=kwargs.get("prompt_cache"),
+                kv_bits=kwargs.get("kv_bits"),
+                kv_group_size=kwargs.get("kv_group_size", 64),
+                quantized_kv_start=kwargs.get(
+                    "quantized_kv_start", DEFAULT_QUANTIZED_KV_START
+                ),
+                prefill_step_size=kwargs.get("prefill_step_size", 2048),
+                prompt_progress_callback=kwargs.get("prompt_progress_callback"),
+                stream=stream,
+                prefill_memory_budget=kwargs.get("prefill_memory_budget"),
+            )
+        elif use_mtp:
             token_generator = nemotron_h_mtp_generate_step(
                 prompt,
                 model,
