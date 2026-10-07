@@ -86,6 +86,28 @@ class TestRequestConversion(unittest.TestCase):
         self.assertEqual(parts[0]["image_url"]["url"], "data:image/png;base64,QUJD")
         self.assertEqual(parts[1], {"type": "text", "text": "What is it?"})
 
+    def test_tool_choice_tool_offers_only_that_tool(self):
+        chat = anthropic_api.to_chat_request({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "a", "input_schema": {}}, {"name": "b", "input_schema": {}}],
+            "tool_choice": {"type": "tool", "name": "b"},
+        })
+        self.assertEqual([t["function"]["name"] for t in chat["tools"]], ["b"])
+
+    def test_tool_result_image_goes_to_the_user_part(self):
+        chat = anthropic_api.to_chat_request({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "text", "text": "shot"},
+                {"type": "image", "source": {"type": "url", "url": "http://x/y.png"}},
+            ]},
+        ]}]})
+        self.assertEqual(chat["messages"][0], {"role": "tool", "tool_call_id": "t", "content": "shot"})
+        self.assertEqual(chat["messages"][1]["content"][0]["image_url"]["url"], "http://x/y.png")
+
+    def test_empty_messages_is_an_error(self):
+        with self.assertRaises(ValueError):
+            anthropic_api.to_chat_request({"messages": []})
+
     def test_bad_role_is_an_error(self):
         with self.assertRaises(ValueError):
             anthropic_api.to_chat_request({"messages": [{"role": "system", "content": "x"}]})
@@ -106,6 +128,7 @@ class TestResponseConversion(unittest.TestCase):
         }
         msg = anthropic_api.to_message(response, "m")
         self.assertEqual([b["type"] for b in msg["content"]], ["thinking", "text", "tool_use"])
+        self.assertEqual(msg["content"][2]["id"], "toolu_c1")
         self.assertEqual(msg["content"][2]["input"], {"path": "a"})
         self.assertEqual(msg["stop_reason"], "tool_use")
         self.assertEqual(msg["usage"]["input_tokens"], 20)
@@ -139,6 +162,22 @@ class TestResponseConversion(unittest.TestCase):
         self.assertEqual(final["usage"]["output_tokens"], 5)
 
 
+    def test_stop_reasons(self):
+        def stop(finish, seq=None, calls=None):
+            r = {"choices": [{"finish_reason": finish, "message": {"content": "x", "tool_calls": calls}}], "usage": {}}
+            return anthropic_api.to_message(r, "m", seq)
+        self.assertEqual(stop("stop")["stop_reason"], "end_turn")
+        m = stop("stop", "END")
+        self.assertEqual((m["stop_reason"], m["stop_sequence"]), ("stop_sequence", "END"))
+        self.assertEqual(stop("length")["stop_reason"], "max_tokens")
+        # A call that didn't parse leaves no tool_use block to answer.
+        self.assertEqual(stop("tool_calls")["stop_reason"], "end_turn")
+        s = anthropic_api.MessageStream("m")
+        s.chunk({"choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}]})
+        final = events(s.stop(3, "END"))[-2][1]
+        self.assertEqual(final["delta"], {"stop_reason": "stop_sequence", "stop_sequence": "END"})
+
+
 class TestMessagesEndpoint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -159,8 +198,8 @@ class TestMessagesEndpoint(unittest.TestCase):
         cls.response_generator.stop_and_join()
 
     def body(self, **kw):
-        return dict(model="chat_model", max_tokens=8,
-                    messages=[{"role": "user", "content": "Hello!"}], **kw)
+        return {"model": "chat_model", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Hello!"}], **kw}
 
     def test_message(self):
         r = requests.post(f"http://localhost:{self.port}/v1/messages", json=self.body())
@@ -185,10 +224,27 @@ class TestMessagesEndpoint(unittest.TestCase):
                        if n == "content_block_delta" and d["delta"]["type"] == "text_delta")
         self.assertTrue(text)
 
+    def test_stop_sequence(self):
+        plain = requests.post(f"http://localhost:{self.port}/v1/messages", json=self.body(max_tokens=16)).json()
+        first = plain["content"][0]["text"]
+        word = next(w for w in ("!", ".", ",", "?") if w in first)
+        r = requests.post(f"http://localhost:{self.port}/v1/messages",
+                          json=self.body(max_tokens=16, stop_sequences=[word]))
+        msg = r.json()
+        self.assertEqual((msg["stop_reason"], msg["stop_sequence"]), ("stop_sequence", word))
+        self.assertNotIn(word, msg["content"][0]["text"] if msg["content"] else "")
+
     def test_bad_request(self):
         r = requests.post(f"http://localhost:{self.port}/v1/messages", json={"max_tokens": 8})
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json()["type"], "error")
+        r = requests.post(f"http://localhost:{self.port}/v1/messages", data=b"{nope",
+                          headers={"Content-Type": "application/json"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"]["type"], "invalid_request_error")
+        # The OpenAI routes keep their own error shape.
+        r = requests.post(f"http://localhost:{self.port}/v1/chat/completions", data=b"{nope")
+        self.assertIsInstance(r.json()["error"], str)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,9 @@ def _user_messages(content) -> List[dict]:
             out.append(
                 {"role": "tool", "tool_call_id": block.get("tool_use_id", ""), "content": text}
             )
+            # A tool message holds text only: its images go with the user part.
+            if isinstance(result, list):
+                parts.extend(_image_part(b) for b in result if b.get("type") == "image")
         elif kind == "text":
             parts.append({"type": "text", "text": block.get("text", "")})
         elif kind == "image":
@@ -64,6 +67,8 @@ def _user_messages(content) -> List[dict]:
             out.append({"role": "user", "content": "".join(p["text"] for p in parts)})
         else:
             out.append({"role": "user", "content": parts})
+    if not out:
+        out.append({"role": "user", "content": ""})
     return out
 
 
@@ -98,7 +103,7 @@ def _assistant_message(content) -> dict:
 
 def to_chat_request(body: dict) -> dict:
     """An Anthropic messages request body as a chat completions body."""
-    if not isinstance(body.get("messages"), list):
+    if not isinstance(body.get("messages"), list) or not body["messages"]:
         raise ValueError("Request did not contain messages")
     messages = []
     system = body.get("system")
@@ -121,6 +126,9 @@ def to_chat_request(body: dict) -> dict:
 
     tools = body.get("tools") or []
     tool_choice = body.get("tool_choice") or {}
+    # Generation can't force a call: "tool" offers only that tool, "any" is "auto".
+    if tool_choice.get("type") == "tool":
+        tools = [t for t in tools if t.get("name") == tool_choice.get("name")]
     if tools and tool_choice.get("type") != "none":
         chat["tools"] = [
             {
@@ -161,14 +169,26 @@ def _tool_use(call: dict) -> dict:
         arguments = json.loads(fn.get("arguments") or "{}")
     except json.JSONDecodeError:
         arguments = {}
-    return {"type": "tool_use", "id": call.get("id", ""), "name": fn.get("name", ""), "input": arguments}
+    tool_id = call.get("id") or uuid.uuid4().hex[:24]
+    if not tool_id.startswith("toolu_"):
+        tool_id = f"toolu_{tool_id}"
+    return {"type": "tool_use", "id": tool_id, "name": fn.get("name", ""), "input": arguments}
+
+
+def _stop_reason(finish_reason, stop_sequence, made_tool_call) -> str:
+    if finish_reason == "stop" and stop_sequence is not None:
+        return "stop_sequence"
+    if finish_reason == "tool_calls" and not made_tool_call:
+        # The call didn't parse; the client has no tool_use block to answer.
+        return "end_turn"
+    return STOP_REASONS.get(finish_reason, "end_turn")
 
 
 def message_id() -> str:
     return f"msg_{uuid.uuid4().hex[:24]}"
 
 
-def to_message(response: dict, model: str) -> dict:
+def to_message(response: dict, model: str, stop_sequence: Optional[str] = None) -> dict:
     """A whole chat completion response as an Anthropic message."""
     choice = response["choices"][0]
     out = choice.get("message", {})
@@ -185,8 +205,12 @@ def to_message(response: dict, model: str) -> dict:
         "role": "assistant",
         "model": model,
         "content": content,
-        "stop_reason": STOP_REASONS.get(choice.get("finish_reason"), "end_turn"),
-        "stop_sequence": None,
+        "stop_reason": _stop_reason(
+            choice.get("finish_reason"),
+            stop_sequence,
+            any(b["type"] == "tool_use" for b in content),
+        ),
+        "stop_sequence": stop_sequence,
         "usage": _usage(
             usage.get("prompt_tokens", 0),
             usage.get("completion_tokens", 0),
@@ -209,7 +233,8 @@ class MessageStream:
         self.model = model
         self.index = -1
         self.open: Optional[str] = None  # the open block's type
-        self.stop_reason = "end_turn"
+        self.finish_reason = None
+        self.made_tool_call = False
 
     def start(self, prompt_tokens: int, cached: Optional[int]) -> bytes:
         message = {
@@ -254,7 +279,7 @@ class MessageStream:
         out = b""
         if delta.get("reasoning"):
             if self.open != "thinking":
-                out += self._begin({"type": "thinking", "thinking": ""})
+                out += self._begin({"type": "thinking", "thinking": "", "signature": ""})
             out += self._delta({"type": "thinking_delta", "thinking": delta["reasoning"]})
         if delta.get("content"):
             if self.open != "text":
@@ -267,18 +292,20 @@ class MessageStream:
             out += self._begin(dict(block, input={}))
             out += self._delta({"type": "input_json_delta", "partial_json": arguments})
             out += self._close()
+            self.made_tool_call = True
         if choice.get("finish_reason"):
-            self.stop_reason = STOP_REASONS.get(choice["finish_reason"], "end_turn")
+            self.finish_reason = choice["finish_reason"]
         return out
 
-    def stop(self, output_tokens: int) -> bytes:
+    def stop(self, output_tokens: int, stop_sequence: Optional[str] = None) -> bytes:
+        reason = _stop_reason(self.finish_reason, stop_sequence, self.made_tool_call)
         return (
             self._close()
             + _event(
                 "message_delta",
                 {
                     "type": "message_delta",
-                    "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
+                    "delta": {"stop_reason": reason, "stop_sequence": stop_sequence},
                     "usage": {"output_tokens": output_tokens},
                 },
             )
@@ -287,7 +314,12 @@ class MessageStream:
 
 
 def error_body(status: int, message: str) -> dict:
-    kind = {400: "invalid_request_error", 404: "not_found_error", 413: "request_too_large"}.get(
+    kind = {
+        400: "invalid_request_error",
+        404: "not_found_error",
+        411: "invalid_request_error",
+        413: "request_too_large",
+    }.get(
         status, "api_error"
     )
     return {"type": "error", "error": {"type": kind, "message": message}}

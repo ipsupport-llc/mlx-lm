@@ -1677,7 +1677,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(411)
             self.end_headers()
             self.wfile.write(
-                json.dumps({"error": "Content-Length header is required"}).encode()
+                self._error(411, "Content-Length header is required")
             )
             return
         try:
@@ -1686,7 +1686,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(400)
             self.end_headers()
             self.wfile.write(
-                json.dumps({"error": "Invalid Content-Length header"}).encode()
+                self._error(400, "Invalid Content-Length header")
             )
             return
         raw_body = self.rfile.read(content_length)
@@ -1697,7 +1697,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(400)
             self.end_headers()
             self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+                self._error(400, f"Invalid JSON in request body: {e}")
             )
             return
 
@@ -1710,7 +1710,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(400)
             self.end_headers()
             self.wfile.write(
-                json.dumps({"error": "Request should be a JSON dictionary"}).encode()
+                self._error(400, "Request should be a JSON dictionary")
             )
             return
 
@@ -1778,7 +1778,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # dropping the connection.
             self._set_completion_headers(400)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(self._error(400, str(e)))
             return
         self.handle_completion(request, stop_words)
 
@@ -1949,6 +1949,22 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def _matched_stop(self, finish_reason, tokens, stop_words) -> Optional[str]:
+        """The stop word the generation ended on, if any (not an EOS token)."""
+        if finish_reason != "stop":
+            return None
+        tokenizer = self.response_generator.model_provider.tokenizer
+        for word in stop_words:
+            ids = tokenizer.encode(word, add_special_tokens=False)
+            if ids and tokens[-len(ids) :] == ids:
+                return word
+        return None
+
+    def _error(self, status: int, message: str) -> bytes:
+        if self.path == "/v1/messages":
+            return json.dumps(anthropic_api.error_body(status, message)).encode()
+        return json.dumps({"error": message}).encode()
+
     def _write_chunk(self, resp: dict):
         if self.anthropic is not None:
             self.wfile.write(self.anthropic.chunk(resp))
@@ -2015,7 +2031,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(self._error(404, str(e)))
             return
 
         # Prepare the headers
@@ -2143,7 +2159,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 self._write_chunk(resp)
                 self.wfile.flush()
                 if self.anthropic is not None:
-                    self.wfile.write(self.anthropic.stop(len(tokens)))
+                    self.wfile.write(
+                        self.anthropic.stop(
+                            len(tokens), self._matched_stop(finish_reason, tokens, stop_words)
+                        )
+                    )
                 elif (
                     self.stream_options is not None
                     and self.stream_options["include_usage"]
@@ -2172,7 +2192,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_calls=tool_formatter(tool_calls),
                 )
                 if self.anthropic is not None:
-                    resp = anthropic_api.to_message(resp, self.anthropic.model)
+                    resp = anthropic_api.to_message(
+                        resp,
+                        self.anthropic.model,
+                        self._matched_stop(finish_reason, tokens, stop_words),
+                    )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
                     logging.debug(f"Outgoing Response: {response_debug}")
