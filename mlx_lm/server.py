@@ -31,6 +31,7 @@ from urllib.parse import unquote
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
+from . import anthropic_api
 from ._version import __version__
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
@@ -1610,6 +1611,8 @@ class ResponseGenerator:
 
 
 class APIHandler(BaseHTTPRequestHandler):
+    anthropic: Optional[anthropic_api.MessageStream] = None
+
     def __init__(
         self,
         response_generator: ResponseGenerator,
@@ -1659,6 +1662,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+            "/v1/messages": self.handle_chat_completions,
         }
 
         if self.path not in request_factories:
@@ -1673,7 +1677,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(411)
             self.end_headers()
             self.wfile.write(
-                json.dumps({"error": "Content-Length header is required"}).encode()
+                self._error(411, "Content-Length header is required")
             )
             return
         try:
@@ -1682,7 +1686,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(400)
             self.end_headers()
             self.wfile.write(
-                json.dumps({"error": "Invalid Content-Length header"}).encode()
+                self._error(400, "Invalid Content-Length header")
             )
             return
         raw_body = self.rfile.read(content_length)
@@ -1693,7 +1697,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(400)
             self.end_headers()
             self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+                self._error(400, f"Invalid JSON in request body: {e}")
             )
             return
 
@@ -1706,9 +1710,25 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(400)
             self.end_headers()
             self.wfile.write(
-                json.dumps({"error": "Request should be a JSON dictionary"}).encode()
+                self._error(400, "Request should be a JSON dictionary")
             )
             return
+
+        # Anthropic Messages API: run as a chat request, answer in its format.
+        self.anthropic = None
+        if self.path == "/v1/messages":
+            try:
+                self.body = anthropic_api.to_chat_request(self.body)
+            except (ValueError, KeyError, TypeError, AttributeError) as e:
+                self._set_completion_headers(400)
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(anthropic_api.error_body(400, str(e))).encode()
+                )
+                return
+            self.anthropic = anthropic_api.MessageStream(
+                self.body.get("model", "default_model")
+            )
 
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
@@ -1743,7 +1763,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            self.validate_model_parameters()
+        except ValueError as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(self._error(400, str(e)))
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -1758,7 +1784,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # dropping the connection.
             self._set_completion_headers(400)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(self._error(400, str(e)))
             return
         self.handle_completion(request, stop_words)
 
@@ -1929,6 +1955,28 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def _matched_stop(self, finish_reason, tokens, stop_words) -> Optional[str]:
+        """The stop word the generation ended on, if any (not an EOS token)."""
+        if finish_reason != "stop":
+            return None
+        tokenizer = self.response_generator.model_provider.tokenizer
+        for word in stop_words:
+            ids = tokenizer.encode(word, add_special_tokens=False)
+            if ids and tokens[-len(ids) :] == ids:
+                return word
+        return None
+
+    def _error(self, status: int, message: str) -> bytes:
+        if self.path == "/v1/messages":
+            return json.dumps(anthropic_api.error_body(status, message)).encode()
+        return json.dumps({"error": message}).encode()
+
+    def _write_chunk(self, resp: dict):
+        if self.anthropic is not None:
+            self.wfile.write(self.anthropic.chunk(resp))
+        else:
+            self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
@@ -1989,13 +2037,18 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(self._error(404, str(e)))
             return
 
         # Prepare the headers
         if self.stream:
             self._set_stream_headers(200)
             self.end_headers()
+            if self.anthropic is not None:
+                self.wfile.write(
+                    self.anthropic.start(len(ctx.prompt), ctx.prompt_cache_count)
+                )
+                self.wfile.flush()
             logging.debug("Starting stream:")
         else:
             self._set_completion_headers(200)
@@ -2078,7 +2131,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         tool_calls=tool_formatter(tool_calls),
                         reasoning_text=reasoning_text,
                     )
-                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                    self._write_chunk(resp)
                     self.wfile.flush()
                     reasoning_text = ""
                     text = ""
@@ -2109,9 +2162,15 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_calls=tool_formatter(tool_calls),
                     reasoning_text=reasoning_text,
                 )
-                self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                self._write_chunk(resp)
                 self.wfile.flush()
-                if (
+                if self.anthropic is not None:
+                    self.wfile.write(
+                        self.anthropic.stop(
+                            len(tokens), self._matched_stop(finish_reason, tokens, stop_words)
+                        )
+                    )
+                elif (
                     self.stream_options is not None
                     and self.stream_options["include_usage"]
                 ):
@@ -2120,9 +2179,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         len(tokens),
                         ctx.prompt_cache_count,
                     )
-                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                    self._write_chunk(resp)
                     self.wfile.flush()
-                self.wfile.write("data: [DONE]\n\n".encode())
+                if self.anthropic is None:
+                    self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
             else:
                 resp = self.generate_response(
@@ -2137,6 +2197,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning_text=reasoning_text,
                     tool_calls=tool_formatter(tool_calls),
                 )
+                if self.anthropic is not None:
+                    resp = anthropic_api.to_message(
+                        resp,
+                        self.anthropic.model,
+                        self._matched_stop(finish_reason, tokens, stop_words),
+                    )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
                     logging.debug(f"Outgoing Response: {response_debug}")
