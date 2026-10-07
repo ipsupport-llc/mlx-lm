@@ -373,8 +373,8 @@ class TestServer(unittest.TestCase):
                 from_draft=False,
             )
         )
-        # started, the first token, the end.
-        clock = iter([10.0, 12.0, 15.5])
+        # started, then each of the four tokens.
+        clock = iter([10.0, 12.0, 13.0, 14.0, 15.5])
         with mock.patch.object(
             self.response_generator, "generate", return_value=(ctx, iter(gens))
         ), mock.patch("mlx_lm.server._now", lambda: next(clock)), \

@@ -2018,14 +2018,15 @@ class APIHandler(BaseHTTPRequestHandler):
         # A tool call is held back until it closes: a long one (a big
         # argument) sends nothing for minutes, so keep the stream alive.
         tool_keepalive_at = time.monotonic()
-        first_token_at = None
+        first_token_at = last_token_at = None
         n_tokens = n_drafted = 0
 
         try:
             for gen in response:
                 logging.debug(gen.text)
+                last_token_at = _now()
                 if first_token_at is None:
-                    first_token_at = _now()
+                    first_token_at = last_token_at
                 n_tokens += 1
                 n_drafted += bool(getattr(gen, "from_draft", False))
 
@@ -2149,16 +2150,16 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.debug(f"Client disconnected mid-response, stopping generation: {e!r}")
         finally:
             ctx.stop()
-            # One line per request, for clients that keep speed statistics
-            # (LLMTray): the first token's wait covers the queue and the
-            # prompt's uncached part.
+            # One line per request that produced a token, for clients that
+            # keep speed statistics (LLMTray): the first token's wait covers
+            # the queue and the prompt's uncached part; decoding ends at the
+            # last token, not when the client has the response.
             if first_token_at is not None:
-                ended = _now()
                 logging.info(
                     f"Request stats: prompt={len(ctx.prompt)} "
                     f"cached={max(ctx.prompt_cache_count, 0)} "
                     f"first_token_s={first_token_at - started:.3f} "
-                    f"tokens={n_tokens} decode_s={ended - first_token_at:.3f} "
+                    f"tokens={n_tokens} decode_s={last_token_at - first_token_at:.3f} "
                     f"drafted={n_drafted}"
                 )
 
