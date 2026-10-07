@@ -112,6 +112,24 @@ class TestRequestConversion(unittest.TestCase):
                 "tool_choice": {"type": "tool", "name": "b"},
             })
 
+    def test_unusable_tools_are_errors(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        for body in (
+            {"tools": [{"description": "no name"}]},
+            {"tools": [{"type": "web_search_20250305", "name": "ws"}], "tool_choice": {"type": "tool", "name": "ws"}},
+        ):
+            with self.assertRaises(ValueError):
+                anthropic_api.to_chat_request(dict(body, messages=msgs))
+        with self.assertRaises(ValueError):
+            anthropic_api.to_chat_request({"messages": msgs + [
+                {"role": "assistant", "content": [{"type": "document", "source": {}}]}]})
+
+    def test_empty_stream_has_a_text_block(self):
+        s = anthropic_api.MessageStream("m")
+        got = events(s.start(1, None) + s.stop(0))
+        self.assertEqual([d["content_block"]["type"] for n, d in got if n == "content_block_start"], ["text"])
+        self.assertEqual([n for n, _ in got].count("content_block_stop"), 1)
+
     def test_empty_messages_is_an_error(self):
         with self.assertRaises(ValueError):
             anthropic_api.to_chat_request({"messages": []})

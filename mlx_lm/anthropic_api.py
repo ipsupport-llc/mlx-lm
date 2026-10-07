@@ -95,6 +95,8 @@ def _assistant_message(content) -> dict:
                     },
                 }
             )
+        elif kind != "redacted_thinking":
+            raise ValueError(f"Unsupported assistant content block: {kind!r}")
     message = {"role": "assistant", "content": text}
     if reasoning:
         message["reasoning_content"] = reasoning
@@ -127,12 +129,19 @@ def to_chat_request(body: dict) -> dict:
         chat["stop"] = body["stop_sequences"]
 
     tools = body.get("tools") or []
+    if any(not isinstance(t, dict) or "name" not in t for t in tools):
+        raise ValueError("Every tool needs a name.")
+    # Server tools (web search etc., they carry a "type") run on Anthropic's
+    # side; a local model can't call them.
+    tools = [t for t in tools if t.get("type") in (None, "custom")]
     tool_choice = body.get("tool_choice") or {}
     # Generation can't force a call: "tool" offers only that tool, "any" is "auto".
     if tool_choice.get("type") == "tool":
         tools = [t for t in tools if t.get("name") == tool_choice.get("name")]
         if not tools:
-            raise ValueError(f"tool_choice names an unknown tool: {tool_choice.get('name')!r}")
+            raise ValueError(
+                f"tool_choice names a tool this server can't run: {tool_choice.get('name')!r}"
+            )
     if tools and tool_choice.get("type") != "none":
         chat["tools"] = [
             {
@@ -144,9 +153,6 @@ def to_chat_request(body: dict) -> dict:
                 },
             }
             for t in tools
-            # Server tools (web search etc., they carry a "type") run on
-            # Anthropic's side; a local model can't call them.
-            if "name" in t and t.get("type") in (None, "custom")
         ]
 
     thinking = body.get("thinking") or {}
@@ -305,8 +311,11 @@ class MessageStream:
 
     def stop(self, output_tokens: int, stop_sequence: Optional[str] = None) -> bytes:
         reason = _stop_reason(self.finish_reason, stop_sequence, self.made_tool_call)
+        # An empty answer still has a text block, as a whole message does.
+        empty = self._begin({"type": "text", "text": ""}) if self.index == -1 else b""
         return (
-            self._close()
+            empty
+            + self._close()
             + _event(
                 "message_delta",
                 {
