@@ -31,6 +31,7 @@ from urllib.parse import unquote
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
+from . import anthropic_api
 from ._version import __version__
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
@@ -1610,6 +1611,8 @@ class ResponseGenerator:
 
 
 class APIHandler(BaseHTTPRequestHandler):
+    anthropic: Optional[anthropic_api.MessageStream] = None
+
     def __init__(
         self,
         response_generator: ResponseGenerator,
@@ -1659,6 +1662,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+            "/v1/messages": self.handle_chat_completions,
         }
 
         if self.path not in request_factories:
@@ -1709,6 +1713,22 @@ class APIHandler(BaseHTTPRequestHandler):
                 json.dumps({"error": "Request should be a JSON dictionary"}).encode()
             )
             return
+
+        # Anthropic Messages API: run as a chat request, answer in its format.
+        self.anthropic = None
+        if self.path == "/v1/messages":
+            try:
+                self.body = anthropic_api.to_chat_request(self.body)
+            except (ValueError, KeyError, TypeError, AttributeError) as e:
+                self._set_completion_headers(400)
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(anthropic_api.error_body(400, str(e))).encode()
+                )
+                return
+            self.anthropic = anthropic_api.MessageStream(
+                self.body.get("model", "default_model")
+            )
 
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
@@ -1929,6 +1949,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def _write_chunk(self, resp: dict):
+        if self.anthropic is not None:
+            self.wfile.write(self.anthropic.chunk(resp))
+        else:
+            self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
@@ -1996,6 +2022,11 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.stream:
             self._set_stream_headers(200)
             self.end_headers()
+            if self.anthropic is not None:
+                self.wfile.write(
+                    self.anthropic.start(len(ctx.prompt), ctx.prompt_cache_count)
+                )
+                self.wfile.flush()
             logging.debug("Starting stream:")
         else:
             self._set_completion_headers(200)
@@ -2078,7 +2109,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         tool_calls=tool_formatter(tool_calls),
                         reasoning_text=reasoning_text,
                     )
-                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                    self._write_chunk(resp)
                     self.wfile.flush()
                     reasoning_text = ""
                     text = ""
@@ -2109,9 +2140,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     tool_calls=tool_formatter(tool_calls),
                     reasoning_text=reasoning_text,
                 )
-                self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                self._write_chunk(resp)
                 self.wfile.flush()
-                if (
+                if self.anthropic is not None:
+                    self.wfile.write(self.anthropic.stop(len(tokens)))
+                elif (
                     self.stream_options is not None
                     and self.stream_options["include_usage"]
                 ):
@@ -2120,9 +2153,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         len(tokens),
                         ctx.prompt_cache_count,
                     )
-                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                    self._write_chunk(resp)
                     self.wfile.flush()
-                self.wfile.write("data: [DONE]\n\n".encode())
+                if self.anthropic is None:
+                    self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
             else:
                 resp = self.generate_response(
@@ -2137,6 +2171,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning_text=reasoning_text,
                     tool_calls=tool_formatter(tool_calls),
                 )
+                if self.anthropic is not None:
+                    resp = anthropic_api.to_message(resp, self.anthropic.model)
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
                     logging.debug(f"Outgoing Response: {response_debug}")
