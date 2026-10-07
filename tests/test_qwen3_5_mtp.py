@@ -424,6 +424,31 @@ class TestQwen35MTP(unittest.TestCase):
                 for offset, quantized in seen:
                     self.assertEqual(quantized, offset >= start, f"start={start} at {offset}")
 
+    def test_kv_cache_left_unquantized_below_the_start_at_any_stop(self):
+        from mlx_lm.generate import kv_cache_quantized
+
+        model = make_model()
+        prompt = mx.random.randint(0, VOCAB, (9,))
+        plain = greedy_plain(model, prompt, 16)
+        sequence = prompt.tolist() + plain
+        for start in range(10, 18):
+            kw = dict(kv_bits=8, kv_group_size=32, quantized_kv_start=start)
+            for n in range(1, 14):
+                m = make_model()
+                OracleHead(m, sequence, lambda p: p % 4 == 0).install()
+                cache = m.make_cache()
+                # Stopped by the consumer (EOS, a stop sequence): it can be
+                # inside a block of accepted drafts.
+                gen = mtp_generate_step(prompt, m, num_draft_tokens=3, adaptive=False,
+                                        max_tokens=100, prompt_cache=cache, **kw)
+                for i, _ in enumerate(gen):
+                    if i + 1 == n:
+                        break
+                gen.close()
+                offset = next(c.offset for c in cache if c.is_trimmable())
+                self.assertEqual(offset, len(prompt) + n)
+                self.assertEqual(kv_cache_quantized(cache), offset >= start, f"{start} {n}")
+
     def test_rows_sampled_one_call_each_unless_independent(self):
         model = make_model()
         prompt = mx.random.randint(0, VOCAB, (9,))
@@ -464,7 +489,8 @@ class TestQwen35MTP(unittest.TestCase):
         finally:
             gen.mtp_generate_step = real
         self.assertEqual(out, greedy_plain(model, prompt, 6))
-        self.assertEqual(calls, [0])
+        # Plain decoding: the head isn't run at all.
+        self.assertEqual(calls, [])
 
     def test_quantized_moe_head_experts_are_stacked(self):
         import mlx.nn as nn

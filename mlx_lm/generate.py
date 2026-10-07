@@ -1258,6 +1258,10 @@ def mtp_generate_step(
                         d = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
                         drafts.append(d)
                         hs, ts = h[:, -1:], d
+                # Quantized here, on the accepted tokens only (like plain
+                # decoding's cache before this forward), not after a verify
+                # pass or a rollback the consumer may still cut short.
+                quantize_cache_fn(cache)
                 block = mx.concatenate([tok.reshape(1, 1)] + drafts, axis=1)
                 sink = []
                 hid = lm.backbone(block, cache=cache, ssm_sink=sink)
@@ -1278,7 +1282,6 @@ def mtp_generate_step(
 
             with mx.stream(stream):
                 lm.rollback_speculative_cache(cache, sink, n_acc + 1, k + 1)
-                quantize_cache_fn(cache)
                 # The chained drafts' pairs held the head's own hidden
                 # states: replaced by the backbone's for the accepted ones.
                 if k > 1:
@@ -1318,7 +1321,7 @@ def mtp_generate_step(
                     lm.rollback_speculative_cache(cache, sink, keep, held)
                 else:
                     lm.backbone(fixup[1].reshape(1, 1), cache=cache)
-                    quantize_cache_fn(cache)
+                quantize_cache_fn(cache)
                 mx.eval([c.state for c in cache])
 
 
@@ -1644,6 +1647,7 @@ def stream_generate(
         # the backbone's own samples).
         use_head = (
             _mtp_language_model(model) is not None
+            and num_head_drafts != 0
             and prompt.ndim == 1
             and not kwargs.get("logits_processors")
             and kwargs.get("max_kv_size") is None

@@ -830,7 +830,7 @@ class ResponseGenerator:
         if not getattr(self.model_provider, "supports_mtp", False) or getattr(self.cli_args, "max_kv_size", None) is not None:
             return False
         if getattr(self.model_provider, "head_mtp", False):
-            return not _make_logits_processors(args)
+            return args.num_draft_tokens != 0 and not _make_logits_processors(args)
         sampler = _make_sampler(args, self.model_provider.tokenizer)
         return sampler is greedy_sampler and not _make_logits_processors(args)
 
