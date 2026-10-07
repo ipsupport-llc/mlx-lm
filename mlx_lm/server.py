@@ -1379,7 +1379,7 @@ class ResponseGenerator:
         message = {"role": "assistant", "content": content}
         if tool_calls:
             message["tool_calls"] = tool_calls
-        self._warm_jobs.append((request, args, message))
+        self._warm_jobs.append((self.model_provider.model_key, request, args, message))
 
     def _next_turn_tokens(self, tokenizer, request, args, message):
         """The tokens the client's next request starts with: the common
@@ -1424,10 +1424,22 @@ class ResponseGenerator:
         return list(a[:n])
 
     def _warm_next(self, job, stream):
-        request, args, message = job
+        # Best effort: a failure (e.g. out of memory) loses this entry, never
+        # the generation thread.
+        try:
+            self._warm_next_job(job, stream)
+        except Exception as e:
+            logging.warning(f"Prompt cache: next turn not warmed: {e!r}")
+        finally:
+            mx.clear_cache()
+
+    def _warm_next_job(self, job, stream):
+        key, request, args, message = job
         model = self.model_provider.model
         if model is None or self.model_provider.draft_model is not None:
             return
+        if key != self.model_provider.model_key:
+            return   # another model is loaded now
         try:
             if stays_trimmable(make_prompt_cache(model)):
                 return   # a trimmable cache reuses a longer entry anyway
@@ -1435,16 +1447,21 @@ class ResponseGenerator:
         except Exception as e:
             logging.debug(f"Prompt cache: next turn not warmed: {e!r}")
             return
-        key = self.model_provider.model_key
         cache, rest = self.prompt_cache.fetch_nearest_cache(key, tokens)
         reused = len(tokens) - len(rest)
         limit = getattr(self.cli_args, "warm_next_turn_max_tokens", 16384)
         if cache is None or reused == 0 or not rest or len(rest) > limit:
             return
+        # Only into free memory: stored entries aren't evicted for a guess.
+        nbytes = sum(c.nbytes for c in cache if c is not None)
+        short = self._memory_shortfall(nbytes, self._prefill_memory_budget())
+        if short is not None and short > 0:
+            logging.info("Prompt cache: next turn not warmed (no free memory)")
+            return
         prefill_step = make_prefill_step(
             model, self.cli_args.prefill_step_size, self._prefill_memory_budget()
         )
-        with mx.stream(stream):
+        with wired_limit(model, [stream]), mx.stream(stream):
             done = 0
             while done < len(rest):
                 if not self.requests.empty():
@@ -1459,8 +1476,9 @@ class ResponseGenerator:
                     kv_group_size=self.cli_args.kv_group_size,
                     kv_bits=self.cli_args.kv_bits,
                 )
-                mx.eval([c.state for c in cache])
+                mx.eval([c.state for c in cache if c is not None])
                 done += len(chunk)
+                mx.clear_cache()
         self.prompt_cache.insert_cache(key, tokens, cache, cache_type="user")
         cap = getattr(self.cli_args, "prompt_cache_bytes", None)
         if cap is not None:
@@ -2086,6 +2104,13 @@ class APIHandler(BaseHTTPRequestHandler):
             return json.dumps(anthropic_api.error_body(status, message)).encode()
         return json.dumps({"error": message}).encode()
 
+    def _as_client_has_it(self, call: dict) -> dict:
+        """A sent tool call as the client will send it back."""
+        call = {k: v for k, v in call.items() if k != "index"}
+        if self.anthropic is not None:
+            call["id"] = anthropic_api.tool_use_id(call.get("id"))
+        return call
+
     def _write_chunk(self, resp: dict):
         if self.anthropic is not None:
             self.wfile.write(self.anthropic.chunk(resp))
@@ -2191,7 +2216,12 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_keepalive_at = time.monotonic()
         # The whole answer (the stream sends and resets text / tool_calls).
         answer_text = ""
-        answer_tool_calls = []
+        answer_calls = []   # as sent to the client, with their ids
+
+        def send_calls(calls):
+            formatted = tool_formatter(calls)
+            answer_calls.extend(formatted)
+            return formatted
         first_token_at = last_token_at = None
         n_tokens = n_drafted = 0
 
@@ -2227,7 +2257,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 elif current_state == "normal":
                     if prev_state == "tool":
                         tool_calls.append(tool_text)
-                        answer_tool_calls.append(tool_text)
                         tool_text = ""
                         made_tool_call = True
                     text += clean_text
@@ -2248,7 +2277,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     resp = self.generate_response(
                         text,
                         None,
-                        tool_calls=tool_formatter(tool_calls),
+                        tool_calls=send_calls(tool_calls),
                         reasoning_text=reasoning_text,
                     )
                     self._write_chunk(resp)
@@ -2270,7 +2299,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
-                answer_tool_calls.append(tool_text)
                 made_tool_call = True
 
             if finish_reason == "stop" and made_tool_call:
@@ -2280,7 +2308,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 resp = self.generate_response(
                     text,
                     finish_reason,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=send_calls(tool_calls),
                     reasoning_text=reasoning_text,
                 )
                 self._write_chunk(resp)
@@ -2316,7 +2344,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens=top_tokens,
                     tokens=tokens,
                     reasoning_text=reasoning_text,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=send_calls(tool_calls),
                 )
                 if self.anthropic is not None:
                     resp = anthropic_api.to_message(
@@ -2338,7 +2366,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     request,
                     args,
                     answer_text,
-                    ToolCallFormatter(ctx.tool_parser, request.tools)(answer_tool_calls),
+                    [self._as_client_has_it(c) for c in answer_calls],
                 )
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # Client disconnected mid-stream (Ctrl-C, timeout, navigated

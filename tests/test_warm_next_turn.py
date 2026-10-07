@@ -116,5 +116,42 @@ class TestWarmNextTurn(unittest.TestCase):
             self.assertTrue(mx.allclose(a, b, rtol=1e-2, atol=5e-3))
 
 
+    def test_a_failing_warm_leaves_the_server_running(self):
+        tok, model = self.provider.tokenizer, self.provider.model
+        messages = [{"role": "user", "content": "a failing warm"}]
+        prompt = tok.apply_chat_template(messages, add_generation_prompt=True)
+        cache = make_prompt_cache(model)
+        model(mx.array(prompt)[None], cache=cache)
+        mx.eval([c.state for c in cache])
+        self.rg.prompt_cache.insert_cache(self.provider.model_key, list(prompt), cache, cache_type="user")
+        request = CompletionRequest("chat", "", messages, None, None)
+        job = (self.provider.model_key, request, self.args(), {"role": "assistant", "content": "a long enough answer"})
+
+        class Broken:
+            def __getattr__(self, name):
+                return getattr(model, name)
+
+            def __call__(self, *a, **k):
+                raise RuntimeError("out of memory")
+
+        self.provider.model = Broken()
+        try:
+            with self.assertLogs(level="WARNING") as logs:
+                self.rg._warm_next(job, mx.default_stream(mx.default_device()))   # no exception
+        finally:
+            self.provider.model = model
+        self.assertIn("out of memory", "\n".join(logs.output))
+
+    def test_a_job_for_another_model_is_dropped(self):
+        tok = self.provider.tokenizer
+        messages = [{"role": "user", "content": "another model"}]
+        request = CompletionRequest("chat", "", messages, None, None)
+        answer = {"role": "assistant", "content": "ok"}
+        warm = self.rg._next_turn_tokens(tok, request, self.args(), answer)
+        self.rg._warm_next((("other", None), request, self.args(), answer), mx.default_stream(mx.default_device()))
+        got, rest = self.rg.prompt_cache.fetch_nearest_cache(self.provider.model_key, warm + [0])
+        self.assertTrue(got is None or len(rest) > 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -192,6 +192,11 @@ class TestResponseConversion(unittest.TestCase):
         self.assertEqual(final["usage"]["output_tokens"], 5)
 
 
+    def test_tool_use_id(self):
+        self.assertEqual(anthropic_api.tool_use_id("abc"), "toolu_abc")
+        self.assertEqual(anthropic_api.tool_use_id("toolu_x"), "toolu_x")
+        self.assertTrue(anthropic_api.tool_use_id(None).startswith("toolu_"))
+
     def test_stop_reasons(self):
         def stop(finish, seq=None, calls=None):
             r = {"choices": [{"finish_reason": finish, "message": {"content": "x", "tool_calls": calls}}], "usage": {}}
