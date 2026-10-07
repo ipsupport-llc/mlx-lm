@@ -540,7 +540,8 @@ class TestQwen35MTP(unittest.TestCase):
                 for e in range(v.shape[0]):
                     raw[f"model.{prefix[len('language_model.'):]}.experts.{e}.{rest}"] = v[e]
             elif ".mtp." in k:
-                raw["model." + k[len("language_model."):]] = v
+                # Raw names, raw (zero-centered) norms.
+                raw["model." + k[len("language_model."):]] = v - 1.0 if k.endswith(("norm.weight", "norm_hidden.weight", "norm_embedding.weight")) and v.ndim == 1 else v
             else:
                 raw[k] = v
         out = model.sanitize(raw)
@@ -549,24 +550,33 @@ class TestQwen35MTP(unittest.TestCase):
             self.assertTrue(mx.array_equal(out[k], v), k)
 
     def test_raw_head_norms_shifted_next_to_a_converted_backbone(self):
+        """Raw norms are zero-centered but a trained head's aren't near 0
+        (FrogNano's mtp.norm averages 2.6): told apart by the tensor names."""
         model = make_model()
         weights = dict(tree_flatten(model.parameters()))
-        raw = dict(weights)
         norm_suffixes = ("layernorm.weight", "norm.weight", "pre_fc_norm_hidden.weight",
                          "pre_fc_norm_embedding.weight")
         head_norms = [k for k, v in weights.items() if ".mtp." in k and v.ndim == 1
                       and k.endswith(norm_suffixes)]
         self.assertTrue(head_norms)
         for k in head_norms:
-            raw[k] = weights[k] - 1.0  # zero-centered, as in a raw checkpoint
+            weights[k] = weights[k] * 2.5  # a trained head's, converted (1 + w)
+        mx.eval(weights)
+        # Raw: the head at mtp.*, its norms without the 1.
+        raw = {}
+        for k, v in weights.items():
+            if k.startswith("language_model.mtp."):
+                k2 = k[len("language_model."):]
+                raw[k2] = v - 1.0 if k in head_norms else v
+            else:
+                raw[k] = v
         out = make_model().sanitize(raw)
         for k, v in weights.items():
-            self.assertTrue(mx.allclose(out[k], v, atol=1e-6), k)
-        # Converted head norms are left alone.
+            self.assertTrue(mx.allclose(out[k], v, atol=1e-5), k)
+        # Converted (language_model.mtp.*): left alone.
         out = make_model().sanitize(dict(weights))
         for k in head_norms:
             self.assertTrue(mx.array_equal(out[k], weights[k]), k)
-
 
 class TestDraftLength(unittest.TestCase):
     def feed(self, lengths, p, seconds, n=200):
