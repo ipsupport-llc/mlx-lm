@@ -349,6 +349,50 @@ class TestServer(unittest.TestCase):
         first_call = next(i for i, e in enumerate(events) if "get_weather" in e)
         self.assertLess(events.index(": keepalive tool"), first_call)
 
+    def test_request_stats_line(self):
+        # One log line per request: what a client needs for speed statistics.
+        ctx = GenerationContext(
+            has_tool_calling=False,
+            has_thinking=False,
+            tool_parser=None,
+            text_sm=TextStateMachine({}),
+            initial_state="normal",
+            prompt=[1, 2, 3, 4, 5],
+            prompt_cache_count=2,
+        )
+        gens = [
+            types.SimpleNamespace(
+                text=t, token=i, logprob=0.0, finish_reason=None, top_tokens=(),
+                from_draft=d,
+            )
+            for i, (t, d) in enumerate([("a", False), ("b", True), ("c", True)])
+        ]
+        gens.append(
+            types.SimpleNamespace(
+                text="", token=99, logprob=0.0, finish_reason="stop", top_tokens=(),
+                from_draft=False,
+            )
+        )
+        # started, the first token, the end.
+        clock = iter([10.0, 12.0, 15.5])
+        with mock.patch.object(
+            self.response_generator, "generate", return_value=(ctx, iter(gens))
+        ), mock.patch("mlx_lm.server._now", lambda: next(clock)), \
+                self.assertLogs(level="INFO") as logs:
+            response = requests.post(
+                f"http://localhost:{self.port}/v1/chat/completions",
+                json={
+                    "model": "default_model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        lines = [l for l in logs.output if "Request stats:" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("prompt=5 cached=2 first_token_s=2.000 tokens=4", lines[0])
+        self.assertIn("decode_s=3.500 drafted=2", lines[0])
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 
