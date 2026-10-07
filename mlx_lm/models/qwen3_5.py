@@ -104,6 +104,9 @@ class TextModelArgs(BaseModelArgs):
     attention_bias: bool = False
     head_dim: Optional[int] = None
     full_attention_interval: int = 4
+    # Layers of the multi-token-prediction head (mtp.*); it's loaded only
+    # when the checkpoint carries its weights (see TextModel.sanitize).
+    mtp_num_hidden_layers: int = 0
 
     # MoE fields (optional, for Qwen3_5MoeForConditionalGeneration)
     num_experts: int = 0
@@ -197,6 +200,7 @@ class GatedDeltaNet(nn.Module):
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        ssm_sink: Optional[list] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
 
@@ -242,6 +246,14 @@ class GatedDeltaNet(nn.Module):
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+
+        if ssm_sink is not None:
+            # What a speculative rollback needs to replay this update on an
+            # accepted prefix (TextModel.rollback_speculative_cache): the
+            # recurrence's inputs and the state before this update.
+            ssm_sink.append(
+                (q, k, v, a, b, self.A_log, self.dt_bias, state, mask, conv_input)
+            )
 
         out, state = gated_delta_update(
             q,
@@ -293,9 +305,10 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        ssm_sink: Optional[list] = None,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(self.input_layernorm(x), mask, cache, ssm_sink)
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -331,6 +344,8 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        ssm_sink: Optional[list] = None,
+        pre_norm: bool = False,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -356,7 +371,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
 
         for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(hidden_states, mask=mask, cache=c, ssm_sink=ssm_sink)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -375,7 +390,58 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
                 : hidden_states.shape[0]
             ]
 
-        return self.norm(hidden_states)
+        return hidden_states if pre_norm else self.norm(hidden_states)
+
+
+def _is_mtp_key(key: str) -> bool:
+    return key.startswith("mtp.") or ".mtp." in key
+
+
+class MTPDecoderLayer(nn.Module):
+    """The MTP head's layer: full attention, the backbone's MLP / MoE."""
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.self_attn = Attention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        if args.num_experts > 0:
+            self.mlp = SparseMoeBlock(args)
+        else:
+            self.mlp = MLP(args.hidden_size, args.intermediate_size)
+
+    def __call__(self, x, mask=None, cache=None):
+        h = x + self.self_attn(self.input_layernorm(x), mask, cache)
+        return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class MTP(nn.Module):
+    """Qwen3.5's multi-token-prediction head: from the backbone's hidden
+    state at position t (before its final norm) and the token at t+1, the
+    logits for t+2."""
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        eps = args.rms_norm_eps
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=eps)
+        self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
+        self.layers = [MTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=eps)
+
+    def __call__(self, hidden, embeddings, cache):
+        x = self.fc(
+            mx.concatenate(
+                [self.pre_fc_norm_embedding(embeddings), self.pre_fc_norm_hidden(hidden)],
+                axis=-1,
+            )
+        )
+        mask = create_attention_mask(x, cache[0])
+        for layer, c in zip(self.layers, cache):
+            x = layer(x, mask, c)
+        return x
 
 
 class TextModel(nn.Module):
@@ -386,6 +452,8 @@ class TextModel(nn.Module):
         self.model = Qwen3_5TextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = MTP(args)
 
     def __call__(
         self,
@@ -407,11 +475,89 @@ class TextModel(nn.Module):
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
+    # Self-speculative decoding with the MTP head (generate.mtp_generate_step).
+
+    def backbone(self, inputs, cache=None, ssm_sink=None):
+        """The hidden states the MTP head reads: before the final norm."""
+        return self.model(inputs, cache, ssm_sink=ssm_sink, pre_norm=True)
+
+    def logits_from_backbone(self, hidden):
+        return self._lm_head(self.model.norm(hidden))
+
+    def _lm_head(self, normed):
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(normed)
+        return self.lm_head(normed)
+
+    def make_mtp_cache(self):
+        return [KVCache() for _ in self.mtp.layers]
+
+    def mtp_step(self, hidden, tokens, mtp_cache):
+        """One MTP forward over S positions. hidden: [B, S, H], the
+        backbone's (or a previous mtp_step's) hidden states at positions
+        p..p+S-1; tokens: [B, S], the tokens at p+1..p+S. Returns the logits
+        for p+2..p+S+1 and the hidden states to chain another step from.
+        The head's cache counts its own positions; its attention only sees
+        that cache, and RoPE is relative, so the offset from the backbone's
+        positions doesn't matter."""
+        x = self.mtp(hidden, self.model.embed_tokens(tokens), mtp_cache)
+        return self._lm_head(self.mtp.norm(x)), x
+
+    def rollback_speculative_cache(self, caches, ssm_states, keep, block_size):
+        """Rewind the caches after a verify forward over `block_size` tokens
+        of which the first `keep` are kept. Attention caches trim; a
+        GatedDeltaNet state can't, so it's recomputed from the state before
+        the verify forward over the kept tokens, from the inputs captured
+        by `ssm_sink` (the projections aren't recomputed). One sequence."""
+        trim = block_size - keep
+        linear = []
+        for c in caches:
+            if c.is_trimmable():
+                if trim > 0:
+                    c.trim(trim)
+            else:
+                if c.lengths is not None or c.left_padding is not None:
+                    raise ValueError(
+                        "rollback_speculative_cache supports single-sequence caches only"
+                    )
+                linear.append(c)
+        if trim == 0 or not linear:
+            return
+        if len(linear) != len(ssm_states):
+            raise ValueError(
+                f"{len(ssm_states)} captured updates for {len(linear)} linear-attention caches"
+            )
+        n_keep = self.args.linear_conv_kernel_dim - 1
+        for c, (q, k, v, a, b, A_log, dt_bias, state, mask, conv_input) in zip(
+            linear, ssm_states
+        ):
+            c[0] = mx.contiguous(conv_input[:, keep : keep + n_keep, :])
+            if keep == 0:
+                c[1] = state
+                continue
+            _, c[1] = gated_delta_update(
+                q[:, :keep],
+                k[:, :keep],
+                v[:, :keep],
+                a[:, :keep],
+                b[:, :keep],
+                A_log,
+                dt_bias,
+                state,
+                None if mask is None else mask[:, :keep],
+                use_kernel=not self.training,
+            )
+
     def sanitize(self, weights):
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        if getattr(self, "mtp", None) is None or not any(map(_is_mtp_key, weights)):
+            # No head in the checkpoint (most conversions dropped it): no
+            # module either, so loading stays strict.
+            weights = {k: v for k, v in weights.items() if not _is_mtp_key(k)}
+            if hasattr(self, "mtp"):
+                self.mtp = None
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -422,6 +568,9 @@ class TextModel(nn.Module):
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         )
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
@@ -546,6 +695,10 @@ class Model(nn.Module):
     @property
     def model(self):
         return self.language_model.model
+
+    @property
+    def mtp(self):
+        return getattr(self.language_model, "mtp", None)
 
     def sanitize(self, weights):
         sanitized = {}

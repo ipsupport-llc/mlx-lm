@@ -37,6 +37,7 @@ from .generate import (
     BatchGenerator,
     TextStateMachine,
     _model_supports_nemotron_h_mtp,
+    _mtp_language_model,
     kv_cache_quantized,
     DEFAULT_PREFILL_SCORE_BYTES,
     MIN_PREFILL_STEP,
@@ -382,6 +383,7 @@ class ModelProvider:
         self.draft_model = None
         self.is_batchable = False
         self.supports_mtp = False
+        self.head_mtp = False
         self.image_inputs = None
 
         group = mx.distributed.init()
@@ -419,6 +421,7 @@ class ModelProvider:
         self.draft_model = None
         self.is_batchable = False
         self.supports_mtp = False
+        self.head_mtp = False
         self.image_inputs = None
 
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
@@ -490,7 +493,9 @@ class ModelProvider:
         # is per request (_is_batchable): only one MTP would serve -- greedy,
         # no logits processors -- is kept out of batching; a sampled or
         # penalized request never uses MTP and batches as before.
-        supports_mtp = _model_supports_nemotron_h_mtp(model)
+        # A Qwen3.5 MTP head (mtp_generate_step) serves any sampler.
+        head_mtp = _mtp_language_model(model) is not None
+        supports_mtp = head_mtp or _model_supports_nemotron_h_mtp(model)
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -499,6 +504,7 @@ class ModelProvider:
         self.draft_model = draft_model
         self.is_batchable = is_batchable
         self.supports_mtp = supports_mtp
+        self.head_mtp = head_mtp
 
         # Image preprocessing for vision-capable models (None otherwise).
         # Built at load time so a malformed processor config fails loudly
@@ -820,9 +826,11 @@ class ResponseGenerator:
 
     def _uses_mtp(self, args):
         """Whether stream_generate would serve this request with the
-        Nemotron-H MTP head (the same conditions it checks)."""
+        model's MTP head (the same conditions it checks)."""
         if not getattr(self.model_provider, "supports_mtp", False) or getattr(self.cli_args, "max_kv_size", None) is not None:
             return False
+        if getattr(self.model_provider, "head_mtp", False):
+            return not _make_logits_processors(args)
         sampler = _make_sampler(args, self.model_provider.tokenizer)
         return sampler is greedy_sampler and not _make_logits_processors(args)
 
