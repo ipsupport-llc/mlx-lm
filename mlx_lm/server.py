@@ -10,7 +10,7 @@ import socket
 import time
 import uuid
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -338,6 +338,9 @@ class Response:
     top_tokens: Tuple[Dict[str, Any]]
     # Drafted (speculative decoding) and accepted, not sampled one by one.
     from_draft: bool = False
+    # When the generation thread made it: the statistics' decode time, free
+    # of the handler's writes to a slow client.
+    made_at: float = field(default_factory=lambda: _now())
 
 
 class TimeBudget:
@@ -2024,7 +2027,7 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             for gen in response:
                 logging.debug(gen.text)
-                last_token_at = _now()
+                last_token_at = getattr(gen, "made_at", None) or _now()
                 if first_token_at is None:
                     first_token_at = last_token_at
                 n_tokens += 1
