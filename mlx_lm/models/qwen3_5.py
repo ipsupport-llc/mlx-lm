@@ -569,11 +569,22 @@ class TextModel(nn.Module):
             ".pre_fc_norm_embedding.weight",
             "mtp.norm.weight",
         )
+        # The head can come from another conversion than the backbone (a
+        # weight file added next to it): its norms are judged by their own
+        # values. Raw ones are centered on 0, converted ones on 1.
+        mtp_norms = [
+            v
+            for k, v in weights.items()
+            if _is_mtp_key(k) and v.ndim == 1 and k.endswith(norm_keys)
+        ]
+        raw_mtp = bool(mtp_norms) and (
+            sum(mx.abs(v).mean().item() for v in mtp_norms) / len(mtp_norms) < 0.5
+        )
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if has_unsanitized_conv1d and any(k.endswith(sfx) for sfx in norm_keys):
-                if v.ndim == 1:
+            if v.ndim == 1 and k.endswith(norm_keys):
+                if raw_mtp if _is_mtp_key(k) else has_unsanitized_conv1d:
                     weights[k] = v + 1.0
         return weights
 
@@ -706,7 +717,11 @@ class Model(nn.Module):
                 if self.vision_tower is not None:
                     vision[key.replace("model.visual", "vision_tower", 1)] = value
                 continue
-            if key.startswith("model.language_model"):
+            if key.startswith("model.mtp."):
+                key = "language_model." + key[len("model.") :]
+            elif key.startswith("model.language_model.mtp."):
+                key = "language_model." + key[len("model.language_model.") :]
+            elif key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")
             elif key.startswith("language_model."):
                 pass

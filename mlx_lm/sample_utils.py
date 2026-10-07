@@ -70,6 +70,8 @@ def make_sampler(
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
 
+    # Rows of one call are sampled independently (XTC draws one coin a call).
+    sampler.rows_independent = xtc_probability <= 0.0
     return sampler
 
 

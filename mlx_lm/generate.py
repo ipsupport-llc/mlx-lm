@@ -1157,9 +1157,28 @@ def mtp_generate_step(
     if prompt_progress_callback is None:
         prompt_progress_callback = lambda *_: None
 
+    # One sampler call per row unless the rows are independent in one call
+    # (XTC draws one coin per call).
+    rows_together = sampler is greedy_sampler or getattr(
+        sampler, "rows_independent", False
+    )
+
     def _sample(logits):
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        return sampler(logprobs), logprobs
+        if rows_together or logprobs.ndim == 1 or logprobs.shape[0] == 1:
+            return sampler(logprobs), logprobs
+        return (
+            mx.concatenate([sampler(logprobs[i : i + 1]) for i in range(logprobs.shape[0])]),
+            logprobs,
+        )
+
+    def _kv_room():
+        # Drafts that keep the verify block short of the point where plain
+        # decoding quantizes the KV cache: it quantizes there exactly.
+        if kv_bits is None or kv_cache_quantized(cache):
+            return None
+        offset = next(c.offset for c in cache if c.is_trimmable())
+        return max(0, quantized_kv_start - offset - 1)
 
     def _feed_head(hidden, tokens):
         # Only the head's cache is used (and evaluated): its logits aren't.
@@ -1221,6 +1240,9 @@ def mtp_generate_step(
         while n_out < limit:
             k = lengths.choose() if lengths else num_draft_tokens
             k = int(min(k, limit - n_out))
+            room = _kv_room()
+            if room is not None:
+                k = min(k, room) if room > 0 else 0
             started = time.perf_counter()
             fixup = None  # mid-iteration: cache state not well defined
             with mx.stream(stream):
@@ -1239,7 +1261,6 @@ def mtp_generate_step(
                 block = mx.concatenate([tok.reshape(1, 1)] + drafts, axis=1)
                 sink = []
                 hid = lm.backbone(block, cache=cache, ssm_sink=sink)
-                quantize_cache_fn(cache)
                 toks, lps = _sample(lm.logits_from_backbone(hid[0]))
                 draft_ids = (
                     mx.concatenate(drafts, axis=1)[0]
@@ -1257,6 +1278,7 @@ def mtp_generate_step(
 
             with mx.stream(stream):
                 lm.rollback_speculative_cache(cache, sink, n_acc + 1, k + 1)
+                quantize_cache_fn(cache)
                 # The chained drafts' pairs held the head's own hidden
                 # states: replaced by the backbone's for the accepted ones.
                 if k > 1:
@@ -1640,7 +1662,7 @@ def stream_generate(
             token_generator = mtp_generate_step(
                 prompt,
                 model,
-                num_draft_tokens=num_head_drafts or 1,
+                num_draft_tokens=1 if num_head_drafts is None else num_head_drafts,
                 max_tokens=kwargs["max_tokens"],
                 sampler=kwargs.get("sampler"),
                 prompt_cache=kwargs.get("prompt_cache"),

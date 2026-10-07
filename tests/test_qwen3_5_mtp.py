@@ -391,6 +391,121 @@ class TestQwen35MTP(unittest.TestCase):
             for a, b in zip(cache_state(cache), cache_state(ref)):
                 self.assertTrue(close(a, b))
 
+    def test_kv_quantization_starts_where_plain_decoding_starts(self):
+        """Plain decoding quantizes the KV cache once a forward leaves it at
+        `quantized_kv_start` tokens: every forward from a shorter cache
+        reads it unquantized. A verify pass runs past the accepted tokens,
+        so quantizing right after it would start that earlier."""
+        from mlx_lm.generate import kv_cache_quantized
+
+        model = make_model()
+        prompt = mx.random.randint(0, VOCAB, (9,))
+        plain = greedy_plain(model, prompt, 20)
+        sequence = prompt.tolist() + plain
+        for start in range(10, 20):
+            kw = dict(kv_bits=8, kv_group_size=32, quantized_kv_start=start)
+            for wrong in (lambda p: True, lambda p: p % 2 == 0):
+                m = make_model()
+                oracle = OracleHead(m, sequence, wrong)
+                oracle.install()
+                seen = []
+                real = oracle.backbone
+
+                def backbone(inputs, cache=None, ssm_sink=None):
+                    offset = next(c.offset for c in cache if c.is_trimmable())
+                    seen.append((offset, kv_cache_quantized(cache)))
+                    return real(inputs, cache=cache, ssm_sink=ssm_sink)
+
+                m.language_model.backbone = backbone
+                for _ in mtp_generate_step(
+                    prompt, m, num_draft_tokens=3, adaptive=False, max_tokens=20, **kw
+                ):
+                    pass
+                for offset, quantized in seen:
+                    self.assertEqual(quantized, offset >= start, f"start={start} at {offset}")
+
+    def test_rows_sampled_one_call_each_unless_independent(self):
+        model = make_model()
+        prompt = mx.random.randint(0, VOCAB, (9,))
+        shapes = []
+
+        def sampler(logprobs):
+            shapes.append(logprobs.shape[0])
+            return mx.argmax(logprobs, axis=-1)
+
+        list(mtp_generate_step(prompt, model, num_draft_tokens=2, adaptive=False,
+                               max_tokens=8, sampler=sampler))
+        self.assertEqual(set(shapes), {1})
+        shapes.clear()
+        sampler.rows_independent = True
+        list(mtp_generate_step(prompt, model, num_draft_tokens=2, adaptive=False,
+                               max_tokens=8, sampler=sampler))
+        self.assertIn(3, shapes)
+        self.assertTrue(make_sampler(temp=1.0, top_p=0.9).rows_independent)
+        self.assertFalse(make_sampler(temp=1.0, xtc_probability=0.5).rows_independent)
+
+    def test_zero_drafts_through_stream_generate(self):
+        import sys
+
+        gen = sys.modules["mlx_lm.generate"]
+        model = make_model()
+        prompt = mx.random.randint(0, VOCAB, (9,))
+        calls = []
+        real = gen.mtp_generate_step
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs["num_draft_tokens"])
+            return real(*args, **kwargs)
+
+        gen.mtp_generate_step = spy
+        try:
+            out = [r.token for r in stream_generate(model, Tokenizer(), prompt,
+                                                    max_tokens=6, num_draft_tokens=0)]
+        finally:
+            gen.mtp_generate_step = real
+        self.assertEqual(out, greedy_plain(model, prompt, 6))
+        self.assertEqual(calls, [0])
+
+    def test_quantized_moe_head_experts_are_stacked(self):
+        import mlx.nn as nn
+
+        model = make_model(moe=True)
+        nn.quantize(model.language_model.mtp, group_size=32, bits=4)
+        weights = dict(tree_flatten(model.parameters()))
+        raw = {}
+        for k, v in weights.items():
+            if ".mtp." in k and ".switch_mlp." in k:
+                prefix, rest = k.split(".switch_mlp.")
+                for e in range(v.shape[0]):
+                    raw[f"model.{prefix[len('language_model.'):]}.experts.{e}.{rest}"] = v[e]
+            elif ".mtp." in k:
+                raw["model." + k[len("language_model."):]] = v
+            else:
+                raw[k] = v
+        out = model.sanitize(raw)
+        self.assertEqual(set(out), set(weights))
+        for k, v in weights.items():
+            self.assertTrue(mx.array_equal(out[k], v), k)
+
+    def test_raw_head_norms_shifted_next_to_a_converted_backbone(self):
+        model = make_model()
+        weights = dict(tree_flatten(model.parameters()))
+        raw = dict(weights)
+        norm_suffixes = ("layernorm.weight", "norm.weight", "pre_fc_norm_hidden.weight",
+                         "pre_fc_norm_embedding.weight")
+        head_norms = [k for k, v in weights.items() if ".mtp." in k and v.ndim == 1
+                      and k.endswith(norm_suffixes)]
+        self.assertTrue(head_norms)
+        for k in head_norms:
+            raw[k] = weights[k] - 1.0  # zero-centered, as in a raw checkpoint
+        out = make_model().sanitize(raw)
+        for k, v in weights.items():
+            self.assertTrue(mx.allclose(out[k], v, atol=1e-6), k)
+        # Converted head norms are left alone.
+        out = make_model().sanitize(dict(weights))
+        for k in head_norms:
+            self.assertTrue(mx.array_equal(out[k], weights[k]), k)
+
 
 class TestDraftLength(unittest.TestCase):
     def feed(self, lengths, p, seconds, n=200):
