@@ -10,7 +10,7 @@ import socket
 import time
 import uuid
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -306,6 +306,11 @@ class CompletionRequest:
     images: Optional[List[bytes]] = None
 
 
+def _now() -> float:
+    """The clock of the per-request statistics (a test replaces it)."""
+    return time.monotonic()
+
+
 @dataclass
 class GenerationContext:
     has_tool_calling: bool
@@ -331,6 +336,11 @@ class Response:
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
+    # Drafted (speculative decoding) and accepted, not sampled one by one.
+    from_draft: bool = False
+    # When the generation thread made it: the statistics' decode time, free
+    # of the handler's writes to a slow client.
+    made_at: float = field(default_factory=lambda: _now())
 
 
 class TimeBudget:
@@ -1310,6 +1320,7 @@ class ResponseGenerator:
                             _format_top_logprobs(
                                 gen.logprobs, args.top_logprobs, tokenizer
                             ),
+                            from_draft=gen.from_draft,
                         )
                     )
                     cache_key.append(gen.token)
@@ -1968,6 +1979,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
 
         # Create the token generator
+        started = _now()
         try:
             ctx, response = self.response_generator.generate(
                 request,
@@ -2009,10 +2021,17 @@ class APIHandler(BaseHTTPRequestHandler):
         # A tool call is held back until it closes: a long one (a big
         # argument) sends nothing for minutes, so keep the stream alive.
         tool_keepalive_at = time.monotonic()
+        first_token_at = last_token_at = None
+        n_tokens = n_drafted = 0
 
         try:
             for gen in response:
                 logging.debug(gen.text)
+                last_token_at = getattr(gen, "made_at", None) or _now()
+                if first_token_at is None:
+                    first_token_at = last_token_at
+                n_tokens += 1
+                n_drafted += bool(getattr(gen, "from_draft", False))
 
                 # Advance the text state machine to strip control sequences
                 if gen.finish_reason == "stop":
@@ -2134,6 +2153,18 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.debug(f"Client disconnected mid-response, stopping generation: {e!r}")
         finally:
             ctx.stop()
+            # One line per request that produced a token, for clients that
+            # keep speed statistics (LLMTray): the first token's wait covers
+            # the queue and the prompt's uncached part; decoding ends at the
+            # last token, not when the client has the response.
+            if first_token_at is not None:
+                logging.info(
+                    f"Request stats: prompt={len(ctx.prompt)} "
+                    f"cached={max(ctx.prompt_cache_count, 0)} "
+                    f"first_token_s={first_token_at - started:.3f} "
+                    f"tokens={n_tokens} decode_s={last_token_at - first_token_at:.3f} "
+                    f"drafted={n_drafted}"
+                )
 
     def completion_usage_response(
         self,
