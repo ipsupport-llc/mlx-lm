@@ -1,6 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
+from collections import deque
 import gc
 import json
 import logging
@@ -323,6 +324,8 @@ class GenerationContext:
 
     prompt: List[int]
     prompt_cache_count: int = -1
+    # The model that serves this request (for the next turn's warm).
+    model_key: Any = None
 
     _should_stop: bool = False
 
@@ -581,6 +584,8 @@ class ResponseGenerator:
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
+        # Next turns to prefill while idle (warm_next_turn): the latest few.
+        self._warm_jobs = deque(maxlen=2)
         self._state_machine_cache = {}
 
         self._time_budget = TimeBudget()
@@ -895,6 +900,16 @@ class ResponseGenerator:
                 )
                 request = get_next_request(timeout=timeout)
 
+            # Idle: prefill a finished request's next turn (warm_next_turn).
+            if (
+                request is None
+                and self._warm_jobs
+                and not drain_batch
+                and (batch_generator is None or len(batch_results) == 0)
+            ):
+                self._warm_next(self._warm_jobs.popleft(), generation_stream)
+                continue
+
             # We got a request
             if request is not None:
                 rqueue, request, args = request
@@ -945,6 +960,7 @@ class ResponseGenerator:
                         initial_state=initial_state,
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
+                        model_key=self.model_provider.model_key,
                     )
                     rqueue.put(ctx)
 
@@ -1168,6 +1184,7 @@ class ResponseGenerator:
                 text_sm=text_sm,
                 initial_state=initial_state,
                 prompt=prompt,
+                model_key=self.model_provider.model_key,
             )
             rqueue.put(ctx)
 
@@ -1351,6 +1368,132 @@ class ResponseGenerator:
 
         except Exception as e:
             rqueue.put(e)
+
+    def warm_next_turn(self, model_key, request, args, content, tool_calls):
+        """After a chat request: the conversation with this answer, as the
+        client will send it back, gets prefilled while the server is idle
+        and stored as a cache entry. A model whose cache can't be trimmed
+        back (an SSM / delta-rule layer) otherwise reuses only up to where
+        the answer starts: the client's copy of it (no reasoning, the tool
+        calls re-rendered) differs from what was generated."""
+        if not getattr(self.cli_args, "warm_next_turn", True) or self._is_distributed:
+            return
+        if request.request_type != "chat" or getattr(request, "images", None):
+            return
+        message = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        self._warm_jobs.append((model_key, request, args, message))
+
+    def _next_turn_tokens(self, tokenizer, request, args, message):
+        """The tokens the client's next request starts with: the common
+        prefix of two renders of the conversation + this answer + a next
+        message (tool results after tool calls, else a user message) with
+        different contents -- whatever the template does to earlier turns."""
+        chat_template_args = self.model_provider.cli_args.chat_template_args
+        if args.chat_template_kwargs:
+            chat_template_args = {**chat_template_args, **args.chat_template_kwargs}
+
+        def render(filler):
+            messages = json.loads(json.dumps(request.messages)) + [json.loads(json.dumps(message))]
+            for m in messages:
+                content = m.get("content")
+                if isinstance(content, list):
+                    m["content"] = "".join(f.get("text", "") for f in content if f.get("type") == "text")
+                elif content is None:
+                    m["content"] = ""
+                for tc in m.get("tool_calls") or []:
+                    func = tc.get("function") or {}
+                    if isinstance(func.get("arguments"), str):
+                        func["arguments"] = json.loads(func["arguments"] or "{}")
+            if message.get("tool_calls"):
+                messages += [
+                    {"role": "tool", "tool_call_id": tc.get("id", ""), "content": filler}
+                    for tc in message["tool_calls"]
+                ]
+            else:
+                messages.append({"role": "user", "content": filler})
+            return tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=False,
+                tools=request.tools,
+                tokenize=True,
+                **chat_template_args,
+            )
+
+        a, b = render("\u2581a1"), render("\u2582b2")
+        n = 0
+        while n < min(len(a), len(b)) and a[n] == b[n]:
+            n += 1
+        return list(a[:n])
+
+    def _warm_next(self, job, stream):
+        # Best effort: a failure (e.g. out of memory) loses this entry, never
+        # the generation thread.
+        try:
+            self._warm_next_job(job, stream)
+        except Exception as e:
+            logging.warning(f"Prompt cache: next turn not warmed: {e!r}")
+        finally:
+            mx.clear_cache()
+
+    def _warm_next_job(self, job, stream):
+        key, request, args, message = job
+        model = self.model_provider.model
+        if model is None or self.model_provider.draft_model is not None:
+            return
+        if key != self.model_provider.model_key:
+            return   # another model is loaded now
+        try:
+            if stays_trimmable(make_prompt_cache(model)):
+                return   # a trimmable cache reuses a longer entry anyway
+            tokens = self._next_turn_tokens(self.model_provider.tokenizer, request, args, message)
+        except Exception as e:
+            logging.debug(f"Prompt cache: next turn not warmed: {e!r}")
+            return
+        cache, rest = self.prompt_cache.fetch_nearest_cache(key, tokens)
+        reused = len(tokens) - len(rest)
+        limit = getattr(self.cli_args, "warm_next_turn_max_tokens", 16384)
+        if cache is None or reused == 0 or not rest or len(rest) > limit:
+            return
+        # Only into free memory: stored entries aren't evicted for a guess.
+        nbytes = sum(c.nbytes for c in cache if c is not None)
+        short = self._memory_shortfall(nbytes, self._prefill_memory_budget())
+        if short is not None and short > 0:
+            logging.info("Prompt cache: next turn not warmed (no free memory)")
+            return
+        prefill_step = make_prefill_step(
+            model, self.cli_args.prefill_step_size, self._prefill_memory_budget()
+        )
+        with wired_limit(model, [stream]), mx.stream(stream):
+            done = 0
+            while done < len(rest):
+                if not self.requests.empty():
+                    logging.info("Prompt cache: next turn not warmed (a request came in)")
+                    return
+                # The cache grows each chunk: still only into free memory.
+                nbytes = sum(c.nbytes for c in cache if c is not None)
+                short = self._memory_shortfall(nbytes, self._prefill_memory_budget())
+                if short is not None and short > 0:
+                    logging.info("Prompt cache: next turn not warmed (no free memory)")
+                    return
+                step = prefill_step(reused + done, kv_cache_quantized(cache))
+                chunk = rest[done : done + step]
+                model(mx.array(chunk)[None], cache=cache)
+                maybe_quantize_kv_cache(
+                    cache,
+                    quantized_kv_start=self.cli_args.quantized_kv_start,
+                    kv_group_size=self.cli_args.kv_group_size,
+                    kv_bits=self.cli_args.kv_bits,
+                )
+                mx.eval([c.state for c in cache if c is not None])
+                done += len(chunk)
+                mx.clear_cache()
+        self.prompt_cache.insert_cache(key, tokens, cache, cache_type="user")
+        cap = getattr(self.cli_args, "prompt_cache_bytes", None)
+        if cap is not None:
+            self.prompt_cache.trim_to(n_bytes=cap)
+        logging.info(f"Prompt cache: warmed the next turn: {len(rest)} tokens on top of {reused}")
 
     def _memory_shortfall(self, nbytes, budget):
         """checkpoint_room with the current memory in use, or None if the
@@ -1971,6 +2114,13 @@ class APIHandler(BaseHTTPRequestHandler):
             return json.dumps(anthropic_api.error_body(status, message)).encode()
         return json.dumps({"error": message}).encode()
 
+    def _as_client_has_it(self, call: dict) -> dict:
+        """A sent tool call as the client will send it back."""
+        call = {k: v for k, v in call.items() if k != "index"}
+        if self.anthropic is not None:
+            call["id"] = anthropic_api.tool_use_id(call.get("id"))
+        return call
+
     def _write_chunk(self, resp: dict):
         if self.anthropic is not None:
             self.wfile.write(self.anthropic.chunk(resp))
@@ -2074,6 +2224,14 @@ class APIHandler(BaseHTTPRequestHandler):
         # A tool call is held back until it closes: a long one (a big
         # argument) sends nothing for minutes, so keep the stream alive.
         tool_keepalive_at = time.monotonic()
+        # The whole answer (the stream sends and resets text / tool_calls).
+        answer_text = ""
+        answer_calls = []   # as sent to the client, with their ids
+
+        def send_calls(calls):
+            formatted = tool_formatter(calls)
+            answer_calls.extend(formatted)
+            return formatted
         first_token_at = last_token_at = None
         n_tokens = n_drafted = 0
 
@@ -2112,6 +2270,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         tool_text = ""
                         made_tool_call = True
                     text += clean_text
+                    answer_text += clean_text
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -2128,7 +2287,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     resp = self.generate_response(
                         text,
                         None,
-                        tool_calls=tool_formatter(tool_calls),
+                        tool_calls=send_calls(tool_calls),
                         reasoning_text=reasoning_text,
                     )
                     self._write_chunk(resp)
@@ -2159,7 +2318,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 resp = self.generate_response(
                     text,
                     finish_reason,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=send_calls(tool_calls),
                     reasoning_text=reasoning_text,
                 )
                 self._write_chunk(resp)
@@ -2195,7 +2354,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens=top_tokens,
                     tokens=tokens,
                     reasoning_text=reasoning_text,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=send_calls(tool_calls),
                 )
                 if self.anthropic is not None:
                     resp = anthropic_api.to_message(
@@ -2212,6 +2371,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(response_json)
                 self.wfile.flush()
+            if finish_reason in ("stop", "tool_calls"):
+                self.response_generator.warm_next_turn(
+                    ctx.model_key,
+                    request,
+                    args,
+                    answer_text,
+                    [self._as_client_has_it(c) for c in answer_calls],
+                )
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # Client disconnected mid-stream (Ctrl-C, timeout, navigated
             # away) -- the generation already did its useful work, so just
@@ -2664,6 +2831,21 @@ def make_parser():
         type=int,
         default=10,
         help="Maximum number of distinct KV caches to hold in the prompt cache",
+    )
+    parser.add_argument(
+        "--warm-next-turn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="While idle, prefill a finished chat request's next turn (the "
+        "conversation with the answer as the client sends it back) and cache "
+        "it. For models whose cache can't be trimmed back (SSM / delta-rule "
+        "layers); others skip it. Default: on.",
+    )
+    parser.add_argument(
+        "--warm-next-turn-max-tokens",
+        type=int,
+        default=16384,
+        help="Longest prefill --warm-next-turn does for one turn (default 16384).",
     )
     parser.add_argument(
         "--prompt-cache-bytes",

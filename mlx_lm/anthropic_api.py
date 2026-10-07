@@ -178,10 +178,13 @@ def _tool_use(call: dict) -> dict:
         arguments = json.loads(fn.get("arguments") or "{}")
     except json.JSONDecodeError:
         arguments = {}
-    tool_id = call.get("id") or uuid.uuid4().hex[:24]
-    if not tool_id.startswith("toolu_"):
-        tool_id = f"toolu_{tool_id}"
-    return {"type": "tool_use", "id": tool_id, "name": fn.get("name", ""), "input": arguments}
+    return {"type": "tool_use", "id": tool_use_id(call.get("id")), "name": fn.get("name", ""), "input": arguments}
+
+
+def tool_use_id(call_id: Optional[str]) -> str:
+    """A tool call's id as an Anthropic tool_use block carries it."""
+    tool_id = call_id or uuid.uuid4().hex[:24]
+    return tool_id if tool_id.startswith("toolu_") else f"toolu_{tool_id}"
 
 
 def _stop_reason(finish_reason, stop_sequence, made_tool_call) -> str:
