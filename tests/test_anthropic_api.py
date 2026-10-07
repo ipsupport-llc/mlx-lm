@@ -116,6 +116,7 @@ class TestRequestConversion(unittest.TestCase):
         msgs = [{"role": "user", "content": "hi"}]
         for body in (
             {"tools": [{"description": "no name"}]},
+            {"tools": [{"name": "", "input_schema": {}}]},
             {"tools": [{"type": "web_search_20250305", "name": "ws"}], "tool_choice": {"type": "tool", "name": "ws"}},
         ):
             with self.assertRaises(ValueError):

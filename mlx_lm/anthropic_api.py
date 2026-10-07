@@ -129,7 +129,7 @@ def to_chat_request(body: dict) -> dict:
         chat["stop"] = body["stop_sequences"]
 
     tools = body.get("tools") or []
-    if any(not isinstance(t, dict) or "name" not in t for t in tools):
+    if any(not isinstance(t, dict) or not isinstance(t.get("name"), str) or not t["name"] for t in tools):
         raise ValueError("Every tool needs a name.")
     # Server tools (web search etc., they carry a "type") run on Anthropic's
     # side; a local model can't call them.
