@@ -1126,6 +1126,7 @@ def mtp_generate_step(
     GatedDeltaNet states are recomputed over the kept tokens from what the
     verify pass captured (rollback_speculative_cache).
 
+    The head's KV cache is quantized like the backbone's (``kv_bits``).
     The head attends over its own cache of (hidden state, next token)
     pairs, filled during the prefill as well (one extra layer over the
     uncached prompt): it was trained on whole sequences, not on the last
@@ -1164,6 +1165,7 @@ def mtp_generate_step(
         # Only the head's cache is used (and evaluated): its logits aren't.
         if hidden is not None and hidden.shape[1] > 0:
             lm.mtp_step(hidden, tokens, mtp_cache)
+            quantize_cache_fn(mtp_cache)
 
     def _append_pair(hs, ts, h, t):
         if hs is None:
@@ -1230,6 +1232,7 @@ def mtp_generate_step(
                         ts = mx.concatenate([pending_t, ts], axis=1)
                     for _ in range(k):
                         logits, h = lm.mtp_step(hs, ts, mtp_cache)
+                        quantize_cache_fn(mtp_cache)
                         d = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
                         drafts.append(d)
                         hs, ts = h[:, -1:], d

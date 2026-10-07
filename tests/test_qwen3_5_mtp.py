@@ -300,7 +300,11 @@ class TestQwen35MTP(unittest.TestCase):
         ]
         sequence = prompt.tolist() + plain
         m = make_model()
-        OracleHead(m, sequence, lambda p: p % 3 == 0).install()
+        oracle = OracleHead(m, sequence, lambda p: p % 3 == 0)
+        oracle.install()
+        caches = []
+        real_make = m.language_model.make_mtp_cache
+        m.language_model.make_mtp_cache = lambda: caches.append(real_make()) or caches[-1]
         out = [
             t
             for t, _, _ in mtp_generate_step(
@@ -314,6 +318,8 @@ class TestQwen35MTP(unittest.TestCase):
             )
         ]
         self.assertEqual(out, plain)
+        # The head's cache is quantized too.
+        self.assertTrue(all(hasattr(c, "bits") for c in caches[0]))
 
     def test_sampling_with_temperature(self):
         model = make_model()
