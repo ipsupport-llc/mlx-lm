@@ -5,7 +5,12 @@ import unittest
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
-from mlx_lm.generate import generate_step, mtp_generate_step, stream_generate
+from mlx_lm.generate import (
+    DraftLength,
+    generate_step,
+    mtp_generate_step,
+    stream_generate,
+)
 from mlx_lm.models import qwen3_5, qwen3_5_moe
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -358,6 +363,58 @@ class TestQwen35MTP(unittest.TestCase):
             gen.mtp_generate_step = real
         self.assertEqual(out, plain)
         self.assertEqual(calls, [2])
+
+    def test_adaptive_matches_plain_greedy_decoding(self):
+        model = make_model()
+        prompt = mx.random.randint(0, VOCAB, (9,))
+        plain = greedy_plain(model, prompt, 40)
+        sequence = prompt.tolist() + plain
+        for wrong in (lambda p: False, lambda p: p % 2 == 0, lambda p: True):
+            m = make_model()
+            OracleHead(m, sequence, wrong).install()
+            cache = m.make_cache()
+            out = [
+                t
+                for t, _, _ in mtp_generate_step(
+                    prompt, m, num_draft_tokens=3, max_tokens=40, prompt_cache=cache
+                )
+            ]
+            self.assertEqual(out, plain)
+            ref = model.make_cache()
+            model.language_model.backbone(mx.array(sequence[: len(prompt) + 40])[None], cache=ref)
+            for a, b in zip(cache_state(cache), cache_state(ref)):
+                self.assertTrue(close(a, b))
+
+
+class TestDraftLength(unittest.TestCase):
+    def feed(self, lengths, p, seconds, n=200):
+        # Each draft accepted with probability p (deterministic pattern).
+        for i in range(n):
+            k = lengths.choose()
+            n_acc = 0
+            while n_acc < k and ((i * 7 + n_acc * 3) % 100) < p * 100:
+                n_acc += 1
+            lengths.update(k, n_acc, seconds(k))
+
+    def test_good_drafts_use_the_longest(self):
+        lengths = DraftLength(3)
+        self.feed(lengths, 0.9, lambda k: 1.0 + 0.1 * k)
+        self.assertEqual(lengths.best(), 3)
+
+    def test_bad_drafts_fall_back_to_plain_decoding(self):
+        lengths = DraftLength(3)
+        self.feed(lengths, 0.1, lambda k: 1.0 + 0.3 * k)
+        self.assertEqual(lengths.best(), 0)
+
+    def test_probes_keep_measuring_after_falling_back(self):
+        lengths = DraftLength(3, probe_every=4)
+        self.feed(lengths, 0.0, lambda k: 1.0 + 0.3 * k, n=40)
+        self.assertEqual(lengths.best(), 0)
+        chosen = [lengths.choose() for _ in range(8)]
+        self.assertIn(1, chosen)
+
+    def test_no_drafts(self):
+        self.assertEqual(DraftLength(0).choose(), 0)
 
 
 if __name__ == "__main__":

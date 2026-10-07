@@ -423,6 +423,28 @@ def _adapt_prism_hadamard_repack(config: dict, model_path: Path) -> None:
         config["zero_centered_norms"] = layout.get("language_norms") == "zero-centered-runtime-plus-one"
 
 
+def _shape_quantization(module, weights, path, default):
+    """True (the default bits / group size) or the bits and group size the
+    weights at `path` were quantized with, when they differ: a weight file
+    added next to a model (e.g. an MTP head) can use other ones."""
+    weight = getattr(module, "weight", None)
+    if (
+        default.get("mode", "affine") != "affine"
+        or weight is None
+        or f"{path}.weight" not in weights
+    ):
+        return True
+    n_in = weight.shape[-1]
+    n_groups = weights[f"{path}.scales"].shape[-1]
+    n_packed = weights[f"{path}.weight"].shape[-1]
+    if n_groups == 0 or n_in % n_groups or (n_packed * 32) % n_in:
+        return True
+    group_size, bits = n_in // n_groups, n_packed * 32 // n_in
+    if (group_size, bits) == (default["group_size"], default["bits"]):
+        return True
+    return {"group_size": group_size, "bits": bits, "mode": "affine"}
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -520,7 +542,9 @@ def load_model(
                 return _layer_quantization(p, config["quantization"][p])
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            return _shape_quantization(m, weights, p, quantization)
 
         nn.quantize(
             model,

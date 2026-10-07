@@ -1034,11 +1034,72 @@ def _mtp_language_model(model: nn.Module) -> Optional[nn.Module]:
     return lm
 
 
+class DraftLength:
+    """Picks the number of drafts for each MTP iteration, 0 (plain
+    decoding) to `max_drafts`, by the expected tokens per second. Measured
+    as generation goes: how often the i-th draft is accepted once the ones
+    before it were (a chained draft is accepted less often than the first),
+    and each length's iteration time. Every `probe_every` iterations a
+    neighbour of the best length is tried, so the estimates stay current."""
+
+    def __init__(self, max_drafts: int, probe_every: int = 16, decay: float = 0.95):
+        self.max_drafts = max(0, max_drafts)
+        self.probe_every = probe_every
+        self.decay = decay
+        # Per draft position: accepted and tried (decayed), from a 50% prior.
+        self.accepted = [1.0] * self.max_drafts
+        self.tried = [2.0] * self.max_drafts
+        self.seconds = {}
+        self.n = 0
+
+    def expected_tokens(self, k: int) -> float:
+        total, reach = 1.0, 1.0
+        for i in range(k):
+            reach *= self.accepted[i] / self.tried[i]
+            total += reach
+        return total
+
+    def _time(self, k):
+        if k in self.seconds:
+            return self.seconds[k]
+        if not self.seconds:
+            return 1.0 + 0.25 * k
+        # Each draft adds a head step, about a quarter of an iteration.
+        k0, t0 = min(self.seconds.items(), key=lambda kv: abs(kv[0] - k))
+        return t0 * (1.0 + 0.25 * k) / (1.0 + 0.25 * k0)
+
+    def best(self) -> int:
+        return max(
+            range(self.max_drafts + 1),
+            key=lambda k: self.expected_tokens(k) / self._time(k),
+        )
+
+    def choose(self) -> int:
+        if self.max_drafts == 0:
+            return 0
+        self.n += 1
+        k = self.best()
+        if self.n % self.probe_every == 0:
+            up = (self.n // self.probe_every) % 2 == 1 or k == 0
+            k = min(k + 1, self.max_drafts) if up else k - 1
+        return k
+
+    def update(self, k: int, n_accepted: int, seconds: float):
+        for i in range(k):
+            if n_accepted < i:
+                break
+            self.tried[i] = self.tried[i] * self.decay + 1
+            self.accepted[i] = self.accepted[i] * self.decay + (n_accepted > i)
+        old = self.seconds.get(k)
+        self.seconds[k] = seconds if old is None else 0.7 * old + 0.3 * seconds
+
+
 def mtp_generate_step(
     prompt: mx.array,
     model: nn.Module,
     *,
     num_draft_tokens: int = 1,
+    adaptive: bool = True,
     max_tokens: int = 256,
     sampler: Optional[Sampler] = None,
     prompt_cache: Optional[Any] = None,
@@ -1053,7 +1114,8 @@ def mtp_generate_step(
     """Self-speculative decoding with the model's own MTP head (Qwen3.5).
 
     One iteration drafts ``num_draft_tokens`` tokens greedily with the head
-    (chained on its own hidden states after the first), runs the backbone
+    (chained on its own hidden states after the first; ``adaptive``: 0 to
+    that many, as DraftLength expects to be fastest), runs the backbone
     once over ``[last token, drafts...]``, samples the backbone's own token
     at every position and accepts the longest prefix of drafts equal to
     those samples, then emits the backbone's sample right after it. Every
@@ -1099,8 +1161,14 @@ def mtp_generate_step(
         return sampler(logprobs), logprobs
 
     def _feed_head(hidden, tokens):
+        # Only the head's cache is used (and evaluated): its logits aren't.
         if hidden is not None and hidden.shape[1] > 0:
             lm.mtp_step(hidden, tokens, mtp_cache)
+
+    def _append_pair(hs, ts, h, t):
+        if hs is None:
+            return h, t
+        return mx.concatenate([hs, h], axis=1), mx.concatenate([ts, t], axis=1)
 
     total = len(prompt)
     base = _cache_offset(cache)
@@ -1147,8 +1215,11 @@ def mtp_generate_step(
         yield tok.item(), logprobs.squeeze(0), False
 
         limit = max_tokens if max_tokens >= 0 else float("inf")
+        lengths = DraftLength(num_draft_tokens) if adaptive else None
         while n_out < limit:
-            k = int(min(num_draft_tokens, limit - n_out))
+            k = lengths.choose() if lengths else num_draft_tokens
+            k = int(min(k, limit - n_out))
+            started = time.perf_counter()
             fixup = None  # mid-iteration: cache state not well defined
             with mx.stream(stream):
                 drafts = []
@@ -1178,6 +1249,8 @@ def mtp_generate_step(
             n_acc = 0
             while n_acc < k and draft_l[n_acc] == toks_l[n_acc]:
                 n_acc += 1
+            if lengths:
+                lengths.update(k, n_acc, time.perf_counter() - started)
 
             with mx.stream(stream):
                 lm.rollback_speculative_cache(cache, sink, n_acc + 1, k + 1)
@@ -1186,7 +1259,15 @@ def mtp_generate_step(
                 if k > 1:
                     for c in mtp_cache:
                         c.trim(k - 1)
-                if n_acc > 0:
+                if k == 0:
+                    # Plain step: the head missed this pair.
+                    pending_h, pending_t = _append_pair(
+                        pending_h, pending_t, hidden, tok.reshape(1, 1)
+                    )
+                    if pending_h.shape[1] >= 32:
+                        _feed_head(pending_h, pending_t)
+                        pending_h = pending_t = None
+                elif n_acc > 0:
                     pending_h = hid[:, :n_acc]
                     pending_t = draft_ids[None, :n_acc]
                 else:

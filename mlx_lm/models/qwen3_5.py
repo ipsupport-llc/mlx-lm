@@ -345,7 +345,6 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
         ssm_sink: Optional[list] = None,
-        pre_norm: bool = False,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -390,7 +389,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
                 : hidden_states.shape[0]
             ]
 
-        return hidden_states if pre_norm else self.norm(hidden_states)
+        return self.norm(hidden_states)
 
 
 def _is_mtp_key(key: str) -> bool:
@@ -418,9 +417,8 @@ class MTPDecoderLayer(nn.Module):
 
 
 class MTP(nn.Module):
-    """Qwen3.5's multi-token-prediction head: from the backbone's hidden
-    state at position t (before its final norm) and the token at t+1, the
-    logits for t+2."""
+    """Qwen3.5's multi-token-prediction head: from the backbone's final
+    hidden state at position t and the token at t+1, the logits for t+2."""
 
     def __init__(self, args: TextModelArgs):
         super().__init__()
@@ -478,11 +476,11 @@ class TextModel(nn.Module):
     # Self-speculative decoding with the MTP head (generate.mtp_generate_step).
 
     def backbone(self, inputs, cache=None, ssm_sink=None):
-        """The hidden states the MTP head reads: before the final norm."""
-        return self.model(inputs, cache, ssm_sink=ssm_sink, pre_norm=True)
+        """The final hidden states, which the MTP head reads too."""
+        return self.model(inputs, cache, ssm_sink=ssm_sink)
 
     def logits_from_backbone(self, hidden):
-        return self._lm_head(self.model.norm(hidden))
+        return self._lm_head(hidden)
 
     def _lm_head(self, normed):
         if self.args.tie_word_embeddings:
@@ -497,11 +495,10 @@ class TextModel(nn.Module):
         backbone's (or a previous mtp_step's) hidden states at positions
         p..p+S-1; tokens: [B, S], the tokens at p+1..p+S. Returns the logits
         for p+2..p+S+1 and the hidden states to chain another step from.
-        The head's cache counts its own positions; its attention only sees
-        that cache, and RoPE is relative, so the offset from the backbone's
-        positions doesn't matter."""
-        x = self.mtp(hidden, self.model.embed_tokens(tokens), mtp_cache)
-        return self._lm_head(self.mtp.norm(x)), x
+        The head's cache counts its own positions; RoPE is relative, so the
+        offset from the backbone's positions doesn't matter."""
+        x = self.mtp.norm(self.mtp(hidden, self.model.embed_tokens(tokens), mtp_cache))
+        return self._lm_head(x), x
 
     def rollback_speculative_cache(self, caches, ssm_states, keep, block_size):
         """Rewind the caches after a verify forward over `block_size` tokens
