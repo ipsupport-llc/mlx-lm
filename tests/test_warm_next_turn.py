@@ -96,10 +96,34 @@ class TestWarmNextTurn(unittest.TestCase):
         answer = {"role": "assistant", "content": "Hello there"}
         warm = self.rg._next_turn_tokens(tok, request, self.args(), answer)
         for text in ["And you?", "\u2581a", "\u2582b", "\u0441\u043f\u0430\u0441\u0438\u0431\u043e",
-                     "\u4e2d\u6587", " leading space", "\n\nblank line", "7 items", "\U0001f44d"]:
+                     "\u4e2d\u6587", " leading space", "\n\nblank line", "7 items", "\U0001f44d",
+                     "?", "\"quoted\"", '{"k": 1}', "[1, 2]", ""]:
             nxt = tok.apply_chat_template(messages + [answer, {"role": "user", "content": text}],
                                           add_generation_prompt=True)
             self.assertEqual(list(nxt[: len(warm)]), warm, repr(text))
+
+    def test_next_turn_tokens_after_tool_calls(self):
+        # The client sends the tool results back, text or structured.
+        tok = self.provider.tokenizer
+        messages = [{"role": "user", "content": "weather?"}]
+        request = CompletionRequest("chat", "", messages, None, None)
+        call = {"id": "call_1", "type": "function", "function": {"name": "weather", "arguments": {"city": "Kyiv"}}}
+        answer = {"role": "assistant", "content": "", "tool_calls": [call]}
+        warm = self.rg._next_turn_tokens(tok, request, self.args(), answer)
+        self.assertGreater(len(warm), len(tok.apply_chat_template(messages, add_generation_prompt=True)))
+        for nxt_msg in [{"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 21 C"},
+                        {"role": "tool", "tool_call_id": "call_1", "content": '{"t": 21}'},
+                        {"role": "tool", "tool_call_id": "call_1", "content": ""}]:
+            nxt = tok.apply_chat_template(messages + [answer, nxt_msg], add_generation_prompt=True)
+            self.assertEqual(list(nxt[: len(warm)]), warm, repr(nxt_msg))
+
+    def test_next_turn_tokens_end_at_a_special_token(self):
+        # Nothing the client's message starts with can merge into it.
+        tok = self.provider.tokenizer
+        messages = [{"role": "user", "content": "hi"}]
+        request = CompletionRequest("chat", "", messages, None, None)
+        warm = self.rg._next_turn_tokens(tok, request, self.args(), {"role": "assistant", "content": "Hello"})
+        self.assertIn(warm[-1], set(tok.all_special_ids) | set(tok.added_tokens_encoder.values()))
 
     def test_warmed_entry_is_the_conversation_so_far(self):
         tok, model = self.provider.tokenizer, self.provider.model
