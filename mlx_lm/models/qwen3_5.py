@@ -12,6 +12,7 @@ from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
+    gather_last_axis,
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update, normalize_qk
@@ -450,6 +451,7 @@ class TextModel(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         if args.mtp_num_hidden_layers > 0:
             self.mtp = MTP(args)
+        self.sharding_group = None
 
     def __call__(
         self,
@@ -462,6 +464,8 @@ class TextModel(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+            if self.sharding_group is not None:
+                out = gather_last_axis(out, self.sharding_group)
         return out
 
     @property
@@ -743,6 +747,14 @@ class Model(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
         rank = group.rank()
+
+        # Each rank computes a slice of the vocabulary
+        lm = self.language_model
+        if not lm.args.tie_word_embeddings:
+            vocab = lm.args.vocab_size
+            assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
+            lm.lm_head = shard_linear(lm.lm_head, "all-to-sharded", group=group)
+            lm.sharding_group = group
 
         # A sharding factory for the convolution in gated delta net
         def conv_sharding(key_dim):
