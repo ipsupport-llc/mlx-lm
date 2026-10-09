@@ -1387,7 +1387,7 @@ class ResponseGenerator:
 
     def _next_turn_tokens(self, tokenizer, request, args, message):
         """The tokens the client's next request starts with: the common
-        prefix of two renders of the conversation + this answer + a next
+        prefix of renders of the conversation + this answer + a next
         message (tool results after tool calls, else a user message) with
         different contents -- whatever the template does to earlier turns."""
         chat_template_args = self.model_provider.cli_args.chat_template_args
@@ -1421,11 +1421,16 @@ class ResponseGenerator:
                 **chat_template_args,
             )
 
-        a, b = render("\u2581a1"), render("\u2582b2")
+        # Contents that start with different bytes, so no token of theirs is
+        # shared ("\u2581" and "\u2582" share a byte-level token: the warmed
+        # entry ran one token into the message and the next request, which
+        # can't trim it back, never reused it), and with whitespace, which
+        # can merge with the template's own text before the message.
+        renders = [render(f) for f in ("a1", "7", "\u4e2d", " x", "\nx")]
         n = 0
-        while n < min(len(a), len(b)) and a[n] == b[n]:
+        while all(n < len(r) for r in renders) and all(r[n] == renders[0][n] for r in renders):
             n += 1
-        return list(a[:n])
+        return list(renders[0][:n])
 
     def _warm_next(self, job, stream):
         # Best effort: a failure (e.g. out of memory) loses this entry, never

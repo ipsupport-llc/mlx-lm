@@ -87,6 +87,20 @@ class TestWarmNextTurn(unittest.TestCase):
         self.assertEqual(list(nxt[: len(warm)]), warm)
         self.assertGreater(len(warm), len(prompt))
 
+    def test_next_turn_tokens_stop_before_the_next_message(self):
+        # The warmed entry can't be trimmed back: one token of the next
+        # message in it, and the next request doesn't reuse it at all.
+        tok = self.provider.tokenizer
+        messages = [{"role": "user", "content": "hi"}]
+        request = CompletionRequest("chat", "", messages, None, None)
+        answer = {"role": "assistant", "content": "Hello there"}
+        warm = self.rg._next_turn_tokens(tok, request, self.args(), answer)
+        for text in ["And you?", "\u2581a", "\u2582b", "\u0441\u043f\u0430\u0441\u0438\u0431\u043e",
+                     "\u4e2d\u6587", " leading space", "\n\nblank line", "7 items", "\U0001f44d"]:
+            nxt = tok.apply_chat_template(messages + [answer, {"role": "user", "content": text}],
+                                          add_generation_prompt=True)
+            self.assertEqual(list(nxt[: len(warm)]), warm, repr(text))
+
     def test_warmed_entry_is_the_conversation_so_far(self):
         tok, model = self.provider.tokenizer, self.provider.model
         messages = [{"role": "user", "content": "tell me a story"}]
