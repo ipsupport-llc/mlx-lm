@@ -168,6 +168,17 @@ class TestWarmNextTurn(unittest.TestCase):
                                       add_generation_prompt=True)
         self.assertEqual(list(nxt[: len(warm)]), warm)
 
+    def test_empty_arguments_of_the_answers_own_call(self):
+        tok = self.provider.tokenizer
+        messages = [{"role": "user", "content": "time?"}]
+        request = CompletionRequest("chat", "", messages, None, None)
+        call = {"id": "call_1", "type": "function", "function": {"name": "now", "arguments": ""}}
+        answer = {"role": "assistant", "content": "", "tool_calls": [call]}
+        warm = self.rg._next_turn_tokens(tok, request, self.args(), answer)
+        nxt = tok.apply_chat_template(messages + [answer, {"role": "tool", "tool_call_id": "call_1", "content": "noon"}],
+                                      add_generation_prompt=True)
+        self.assertEqual(list(nxt[: len(warm)]), warm)
+
     def test_warmed_entry_is_the_conversation_so_far(self):
         tok, model = self.provider.tokenizer, self.provider.model
         messages = [{"role": "user", "content": "tell me a story"}]

@@ -1374,8 +1374,12 @@ class ResponseGenerator:
         client will send it back, gets prefilled while the server is idle
         and stored as a cache entry. A model whose cache can't be trimmed
         back (an SSM / delta-rule layer) otherwise reuses only up to where
-        the answer starts: the client's copy of it (no reasoning, the tool
-        calls re-rendered) differs from what was generated."""
+        the answer starts: the client's copy of it (its reasoning only if
+        the client sends that back, the tool calls re-rendered) differs
+        from what was generated. Whether it does is a guess (an Anthropic
+        client, or reasoning in its earlier answers); a wrong one leaves
+        the entry unused, as does a next request with other template
+        options or tools."""
         if not getattr(self.cli_args, "warm_next_turn", True) or self._is_distributed:
             return
         if request.request_type != "chat" or getattr(request, "images", None):
