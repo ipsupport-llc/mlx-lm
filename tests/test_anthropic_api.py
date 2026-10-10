@@ -140,6 +140,57 @@ class TestRequestConversion(unittest.TestCase):
 
     def test_bad_role_is_an_error(self):
         with self.assertRaises(ValueError):
+            anthropic_api.to_chat_request({"messages": [{"role": "developer", "content": "x"}]})
+
+    def test_system_messages_among_the_messages(self):
+        # Claude Code sends its environment as a system message after the
+        # user's: it joins that user turn. Before any other message it
+        # joins the system prompt.
+        chat = anthropic_api.to_chat_request({
+            "system": [{"type": "text", "text": "Top."}],
+            "messages": [
+                {"role": "system", "content": "Early."},
+                {"role": "user", "content": [{"type": "text", "text": "Read it"}]},
+                {"role": "system", "content": [{"type": "text", "text": "Env.", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": "ok"},
+                {"role": "system", "content": "After answer."},
+            ]})
+        self.assertEqual(chat["messages"], [
+            {"role": "system", "content": "Top.\n\nEarly."},
+            {"role": "user", "content": "Read it\n\nEnv."},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "After answer."},
+        ])
+        # After tool results: with the last one (a user turn would be a new
+        # question to a thinking template).
+        chat = anthropic_api.to_chat_request({"messages": [
+            {"role": "user", "content": "Read it"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "text"}]},
+            {"role": "system", "content": "<total_tokens>9</total_tokens>"}]})
+        self.assertEqual(chat["messages"][-1], {"role": "tool", "tool_call_id": "toolu_1",
+                                                "content": "text\n\n<total_tokens>9</total_tokens>"})
+        # Between tool calls and their results: with the results.
+        chat = anthropic_api.to_chat_request({"messages": [
+            {"role": "user", "content": "Read it"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}]},
+            {"role": "system", "content": "Between."},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "text"}]}]})
+        self.assertEqual([m["role"] for m in chat["messages"]], ["user", "assistant", "tool"])
+        self.assertEqual(chat["messages"][-1]["content"], "text\n\nBetween.")
+        # A system message holds text only.
+        with self.assertRaises(ValueError):
+            anthropic_api.to_chat_request({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [{"type": "image", "source": {"type": "url", "url": "http://x/i.png"}}]}]})
+        # With an image the user turn stays a list of parts.
+        chat = anthropic_api.to_chat_request({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "See"},
+                                         {"type": "image", "source": {"type": "url", "url": "http://x/i.png"}}]},
+            {"role": "system", "content": "Env."}]})
+        self.assertEqual(chat["messages"][-1]["content"][-1], {"type": "text", "text": "\n\nEnv."})
+        # Only a system message: no conversation.
+        with self.assertRaises(ValueError):
             anthropic_api.to_chat_request({"messages": [{"role": "system", "content": "x"}]})
 
 
@@ -246,6 +297,18 @@ class TestMessagesEndpoint(unittest.TestCase):
         self.assertIn(msg["stop_reason"], ("end_turn", "max_tokens"))
         self.assertGreater(msg["usage"]["input_tokens"] + msg["usage"]["cache_read_input_tokens"], 0)
         self.assertGreater(msg["usage"]["output_tokens"], 0)
+
+    def test_beta_query(self):
+        # Claude Code and the SDK's client.beta.messages post here.
+        r = requests.post(f"http://localhost:{self.port}/v1/messages?beta=true", json=self.body())
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["type"], "message")
+        r = requests.post(f"http://localhost:{self.port}/v1/messages?beta=true", json={"max_tokens": 8})
+        self.assertEqual((r.status_code, r.json()["type"]), (400, "error"))
+        r = requests.post(f"http://localhost:{self.port}/v1/chat/completions?x=1",
+                          json={"model": "chat_model", "max_tokens": 4, "messages": [{"role": "user", "content": "Hi"}]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(requests.post(f"http://localhost:{self.port}/v1/nope?beta=true", json={}).status_code, 404)
 
     def test_stream(self):
         r = requests.post(f"http://localhost:{self.port}/v1/messages", json=self.body(stream=True))

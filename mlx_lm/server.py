@@ -1860,7 +1860,10 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/messages": self.handle_chat_completions,
         }
 
-        if self.path not in request_factories:
+        # Without the query: Anthropic's beta clients (Claude Code, the SDK's
+        # client.beta.messages) post to /v1/messages?beta=true.
+        self.route = self.path.split("?", 1)[0]
+        if self.route not in request_factories:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
@@ -1911,7 +1914,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Anthropic Messages API: run as a chat request, answer in its format.
         self.anthropic = None
-        if self.path == "/v1/messages":
+        if self.route == "/v1/messages":
             try:
                 self.body = anthropic_api.to_chat_request(self.body)
             except (ValueError, KeyError, TypeError, AttributeError) as e:
@@ -1973,7 +1976,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Create the completion request
         try:
-            request = request_factories[self.path]()
+            request = request_factories[self.route]()
         except ValueError as e:
             # e.g. a malformed / unfetchable image_url -- report it instead of
             # dropping the connection.
@@ -2162,7 +2165,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return None
 
     def _error(self, status: int, message: str) -> bytes:
-        if self.path == "/v1/messages":
+        if getattr(self, "route", None) == "/v1/messages":
             return json.dumps(anthropic_api.error_body(status, message)).encode()
         return json.dumps({"error": message}).encode()
 

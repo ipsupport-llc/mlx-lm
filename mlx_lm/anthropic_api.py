@@ -104,6 +104,40 @@ def _assistant_message(content) -> dict:
     return message
 
 
+def _system_text(content) -> str:
+    if isinstance(content, list) and any(b.get("type") != "text" for b in content):
+        raise ValueError("A system message holds text only.")
+    return _text_of(content)
+
+
+def _add_system(messages: List[dict], text: str):
+    """A system message among the messages (Claude Code sends its
+    environment, and a context count after tool results, that way). Chat
+    templates take a system message only first: before any other it joins
+    the system prompt, after one it goes with the user turn or tool result
+    before it, where it stays in later requests too. Not as a user turn
+    after tool results: that would be a new question to a thinking
+    template (Qwen3.5 drops the tool call's reasoning before one)."""
+    if not text:
+        return
+    if all(m["role"] == "system" for m in messages):
+        if messages:
+            messages[0]["content"] += "\n\n" + text
+        else:
+            messages.append({"role": "system", "content": text})
+        return
+    last = messages[-1]
+    if last["role"] == "tool":
+        last["content"] = (last["content"] + "\n\n" + text) if last["content"] else text
+    elif last["role"] == "user":
+        if isinstance(last["content"], str):
+            last["content"] = (last["content"] + "\n\n" + text) if last["content"] else text
+        else:
+            last["content"].append({"type": "text", "text": "\n\n" + text})
+    else:
+        messages.append({"role": "user", "content": text})
+
+
 def to_chat_request(body: dict) -> dict:
     """An Anthropic messages request body as a chat completions body."""
     if not isinstance(body.get("messages"), list) or not body["messages"]:
@@ -112,13 +146,32 @@ def to_chat_request(body: dict) -> dict:
     system = body.get("system")
     if system:
         messages.append({"role": "system", "content": _text_of(system)})
+    # System text right after tool calls waits for their results: it
+    # mustn't come between a call and its result.
+    held = []
     for m in body["messages"]:
         if m.get("role") == "user":
             messages.extend(_user_messages(m.get("content")))
+            for text in held:
+                _add_system(messages, text)
+            held = []
         elif m.get("role") == "assistant":
+            for text in held:
+                _add_system(messages, text)
+            held = []
             messages.append(_assistant_message(m.get("content")))
+        elif m.get("role") == "system":
+            text = _system_text(m.get("content"))
+            if messages and messages[-1]["role"] == "assistant" and messages[-1].get("tool_calls"):
+                held.append(text)
+            else:
+                _add_system(messages, text)
         else:
             raise ValueError(f"Unsupported message role: {m.get('role')!r}")
+    for text in held:
+        _add_system(messages, text)
+    if all(m["role"] == "system" for m in messages):
+        raise ValueError("Request did not contain a user or assistant message")
 
     chat: Dict[str, Any] = {"messages": messages, "stream": bool(body.get("stream", False))}
     for key in ("model", "max_tokens", "temperature", "top_p", "top_k"):
