@@ -1369,32 +1369,50 @@ class ResponseGenerator:
         except Exception as e:
             rqueue.put(e)
 
-    def warm_next_turn(self, model_key, request, args, content, tool_calls):
+    def warm_next_turn(self, model_key, request, args, content, tool_calls, reasoning="", echoes_reasoning=False):
         """After a chat request: the conversation with this answer, as the
         client will send it back, gets prefilled while the server is idle
         and stored as a cache entry. A model whose cache can't be trimmed
         back (an SSM / delta-rule layer) otherwise reuses only up to where
-        the answer starts: the client's copy of it (no reasoning, the tool
-        calls re-rendered) differs from what was generated."""
+        the answer starts: the client's copy of it (its reasoning only if
+        the client sends that back, the tool calls re-rendered) differs
+        from what was generated. Whether it does is a guess (an Anthropic
+        client, or reasoning in its earlier answers); a wrong one leaves
+        the entry unused, as does a next request with other template
+        options or tools."""
         if not getattr(self.cli_args, "warm_next_turn", True) or self._is_distributed:
             return
         if request.request_type != "chat" or getattr(request, "images", None):
             return
+        message = self._answer_as_sent_back(request, content, tool_calls, reasoning, echoes_reasoning)
+        self._warm_jobs.append((model_key, request, args, message))
+
+    @staticmethod
+    def _answer_as_sent_back(request, content, tool_calls, reasoning="", echoes_reasoning=False):
+        """The answer as the client's next request carries it."""
         message = {"role": "assistant", "content": content}
+        # A client that sends the reasoning back (Anthropic clients send
+        # their thinking blocks; others show it in earlier turns) gets it
+        # rendered by a thinking template: the next turn has it too.
+        echoes_reasoning = echoes_reasoning or any(
+            m.get("role") == "assistant" and m.get("reasoning_content") for m in request.messages
+        )
+        if reasoning and echoes_reasoning:
+            message["reasoning_content"] = reasoning
         if tool_calls:
             message["tool_calls"] = tool_calls
-        self._warm_jobs.append((model_key, request, args, message))
+        return message
 
     def _next_turn_tokens(self, tokenizer, request, args, message):
         """The tokens the client's next request starts with: the common
-        prefix of two renders of the conversation + this answer + a next
+        prefix of renders of the conversation + this answer + a next
         message (tool results after tool calls, else a user message) with
         different contents -- whatever the template does to earlier turns."""
         chat_template_args = self.model_provider.cli_args.chat_template_args
         if args.chat_template_kwargs:
             chat_template_args = {**chat_template_args, **args.chat_template_kwargs}
 
-        def render(filler):
+        def render(filler, role):
             messages = json.loads(json.dumps(request.messages)) + [json.loads(json.dumps(message))]
             for m in messages:
                 content = m.get("content")
@@ -1404,9 +1422,11 @@ class ResponseGenerator:
                     m["content"] = ""
                 for tc in m.get("tool_calls") or []:
                     func = tc.get("function") or {}
-                    if isinstance(func.get("arguments"), str):
-                        func["arguments"] = json.loads(func["arguments"] or "{}")
-            if message.get("tool_calls"):
+                    # As the request's own are (process_message_content):
+                    # an empty string stays one.
+                    if isinstance(func.get("arguments"), str) and func["arguments"]:
+                        func["arguments"] = json.loads(func["arguments"])
+            if role == "tool":
                 messages += [
                     {"role": "tool", "tool_call_id": tc.get("id", ""), "content": filler}
                     for tc in message["tool_calls"]
@@ -1421,11 +1441,43 @@ class ResponseGenerator:
                 **chat_template_args,
             )
 
-        a, b = render("\u2581a1"), render("\u2582b2")
+        # Next messages that start with different bytes, so no token of
+        # theirs is shared ("\u2581" and "\u2582" share a byte-level token:
+        # the warmed entry ran one token into the message, and the next
+        # request, which can't trim it back, never reused it): a letter, a
+        # digit, CJK, whitespace and punctuation (both can merge with the
+        # template's text before the message), JSON, and nothing (a template
+        # can skip a wrapper for empty content).
+        fillers = ["a1", "7", "\u4e2d", " x", "\nx", "?", '{"a": 0}', "[1]", '"q"', ""]
+        # After tool calls: their results, a structured one too (a template
+        # can render it unquoted). Not a user message instead: Qwen3.5 keeps
+        # the reasoning of the turns since the last user message, so the
+        # call renders differently before one -- the entry would end before
+        # the answer for the common case, the results.
+        if message.get("tool_calls"):
+            probes = [(f, "tool") for f in fillers] + [({"a": 0}, "tool")]
+        else:
+            probes = [(f, "user") for f in fillers]
+        renders, error = [], None
+        for filler, role in probes:
+            try:
+                renders.append(render(filler, role))
+            except Exception as e:
+                # A template that rejects one (a structured result): the
+                # others still apply.
+                error = e
+        if not renders:
+            raise error
         n = 0
-        while n < min(len(a), len(b)) and a[n] == b[n]:
+        while all(n < len(r) for r in renders) and all(r[n] == renders[0][n] for r in renders):
             n += 1
-        return list(a[:n])
+        # Text before the message can still merge with a message no probe
+        # starts like: end the entry at a special token (never merged) when
+        # one is near, else a token earlier.
+        special = set(getattr(tokenizer, "all_special_ids", None) or [])
+        special |= set((getattr(tokenizer, "added_tokens_encoder", None) or {}).values())
+        cut = next((i + 1 for i in range(n - 1, max(n - 16, 0) - 1, -1) if renders[0][i] in special), None)
+        return list(renders[0][: cut if cut is not None else max(n - 1, 0)])
 
     def _warm_next(self, job, stream):
         # Best effort: a failure (e.g. out of memory) loses this entry, never
@@ -2226,6 +2278,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_keepalive_at = time.monotonic()
         # The whole answer (the stream sends and resets text / tool_calls).
         answer_text = ""
+        answer_reasoning = ""
         answer_calls = []   # as sent to the client, with their ids
 
         def send_calls(calls):
@@ -2262,6 +2315,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Collect the clean text by state: reasoning, tool, or normal
                 if current_state == "reasoning":
                     reasoning_text += clean_text
+                    answer_reasoning += clean_text
                 elif current_state == "tool":
                     tool_text += clean_text
                 elif current_state == "normal":
@@ -2378,6 +2432,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     args,
                     answer_text,
                     [self._as_client_has_it(c) for c in answer_calls],
+                    reasoning=answer_reasoning,
+                    echoes_reasoning=self.anthropic is not None,
                 )
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # Client disconnected mid-stream (Ctrl-C, timeout, navigated
