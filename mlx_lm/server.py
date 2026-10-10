@@ -1369,7 +1369,7 @@ class ResponseGenerator:
         except Exception as e:
             rqueue.put(e)
 
-    def warm_next_turn(self, model_key, request, args, content, tool_calls):
+    def warm_next_turn(self, model_key, request, args, content, tool_calls, reasoning="", echoes_reasoning=False):
         """After a chat request: the conversation with this answer, as the
         client will send it back, gets prefilled while the server is idle
         and stored as a cache entry. A model whose cache can't be trimmed
@@ -1380,10 +1380,24 @@ class ResponseGenerator:
             return
         if request.request_type != "chat" or getattr(request, "images", None):
             return
+        message = self._answer_as_sent_back(request, content, tool_calls, reasoning, echoes_reasoning)
+        self._warm_jobs.append((model_key, request, args, message))
+
+    @staticmethod
+    def _answer_as_sent_back(request, content, tool_calls, reasoning="", echoes_reasoning=False):
+        """The answer as the client's next request carries it."""
         message = {"role": "assistant", "content": content}
+        # A client that sends the reasoning back (Anthropic clients send
+        # their thinking blocks; others show it in earlier turns) gets it
+        # rendered by a thinking template: the next turn has it too.
+        echoes_reasoning = echoes_reasoning or any(
+            m.get("role") == "assistant" and m.get("reasoning_content") for m in request.messages
+        )
+        if reasoning and echoes_reasoning:
+            message["reasoning_content"] = reasoning
         if tool_calls:
             message["tool_calls"] = tool_calls
-        self._warm_jobs.append((model_key, request, args, message))
+        return message
 
     def _next_turn_tokens(self, tokenizer, request, args, message):
         """The tokens the client's next request starts with: the common
@@ -1404,8 +1418,10 @@ class ResponseGenerator:
                     m["content"] = ""
                 for tc in m.get("tool_calls") or []:
                     func = tc.get("function") or {}
-                    if isinstance(func.get("arguments"), str):
-                        func["arguments"] = json.loads(func["arguments"] or "{}")
+                    # As the request's own are (process_message_content):
+                    # an empty string stays one.
+                    if isinstance(func.get("arguments"), str) and func["arguments"]:
+                        func["arguments"] = json.loads(func["arguments"])
             if role == "tool":
                 messages += [
                     {"role": "tool", "tool_call_id": tc.get("id", ""), "content": filler}
@@ -2258,6 +2274,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_keepalive_at = time.monotonic()
         # The whole answer (the stream sends and resets text / tool_calls).
         answer_text = ""
+        answer_reasoning = ""
         answer_calls = []   # as sent to the client, with their ids
 
         def send_calls(calls):
@@ -2294,6 +2311,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Collect the clean text by state: reasoning, tool, or normal
                 if current_state == "reasoning":
                     reasoning_text += clean_text
+                    answer_reasoning += clean_text
                 elif current_state == "tool":
                     tool_text += clean_text
                 elif current_state == "normal":
@@ -2410,6 +2428,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     args,
                     answer_text,
                     [self._as_client_has_it(c) for c in answer_calls],
+                    reasoning=answer_reasoning,
+                    echoes_reasoning=self.anthropic is not None,
                 )
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # Client disconnected mid-stream (Ctrl-C, timeout, navigated

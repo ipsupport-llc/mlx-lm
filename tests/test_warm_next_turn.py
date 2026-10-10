@@ -16,6 +16,7 @@ from mlx_lm import load
 from mlx_lm.models import qwen3_5
 from mlx_lm.models.cache import LRUPromptCache, make_prompt_cache
 from mlx_lm.server import CompletionRequest, ResponseGenerator
+from mlx_lm.utils import load_tokenizer
 
 TOKENIZER = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
@@ -113,8 +114,12 @@ class TestWarmNextTurn(unittest.TestCase):
         self.assertGreater(len(warm), len(tok.apply_chat_template(messages, add_generation_prompt=True)))
         for nxt_msg in [{"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 21 C"},
                         {"role": "tool", "tool_call_id": "call_1", "content": '{"t": 21}'},
-                        {"role": "tool", "tool_call_id": "call_1", "content": ""}]:
-            nxt = tok.apply_chat_template(messages + [answer, nxt_msg], add_generation_prompt=True)
+                        {"role": "tool", "tool_call_id": "call_1", "content": ""},
+                        {"role": "tool", "tool_call_id": "call_1", "content": {"t": 21}}]:
+            try:
+                nxt = tok.apply_chat_template(messages + [answer, nxt_msg], add_generation_prompt=True)
+            except TypeError:
+                continue   # a structured result this template can't render: no next request either
             self.assertEqual(list(nxt[: len(warm)]), warm, repr(nxt_msg))
 
     def test_next_turn_tokens_end_at_a_special_token(self):
@@ -124,6 +129,44 @@ class TestWarmNextTurn(unittest.TestCase):
         request = CompletionRequest("chat", "", messages, None, None)
         warm = self.rg._next_turn_tokens(tok, request, self.args(), {"role": "assistant", "content": "Hello"})
         self.assertIn(warm[-1], set(tok.all_special_ids) | set(tok.added_tokens_encoder.values()))
+
+    def test_reasoning_a_client_sends_back(self):
+        # A thinking template renders the reasoning of the turns since the
+        # last user message: an Anthropic client sends its thinking blocks
+        # back, an OpenAI one (as a rule) doesn't.
+        tok = load_tokenizer("mlx-community/Qwen3-4B-4bit")
+        messages = [{"role": "user", "content": "weather in Kyiv?"}]
+        call = {"id": "call_1", "type": "function", "function": {"name": "weather", "arguments": '{"city": "Kyiv"}'}}
+        result = {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"}
+        for echoes in (True, False):
+            request = CompletionRequest("chat", "", json.loads(json.dumps(messages)), None, None)
+            answer = ResponseGenerator._answer_as_sent_back(request, "", [call], "Need the weather tool.", echoes)
+            warm = self.rg._next_turn_tokens(tok, request, self.args(), answer)
+            sent = {"role": "assistant", "content": "",
+                    "tool_calls": [dict(call, function={"name": "weather", "arguments": {"city": "Kyiv"}})]}
+            if echoes:
+                sent["reasoning_content"] = "Need the weather tool."
+            nxt = tok.apply_chat_template(messages + [sent, result], add_generation_prompt=True)
+            self.assertEqual(list(nxt[: len(warm)]), warm, f"echoes={echoes}")
+            self.assertGreater(len(warm), len(tok.apply_chat_template(messages, add_generation_prompt=True)))
+        # Reasoning in an earlier answer: this client sends it back.
+        history = messages + [{"role": "assistant", "content": "", "reasoning_content": "r",
+                               "tool_calls": [call]}, result]
+        request = CompletionRequest("chat", "", history, None, None)
+        self.assertEqual(ResponseGenerator._answer_as_sent_back(request, "Sunny.", [], "ok")["reasoning_content"], "ok")
+
+    def test_empty_tool_arguments_render_as_sent(self):
+        tok = self.provider.tokenizer
+        call = {"id": "call_1", "type": "function", "function": {"name": "now", "arguments": ""}}
+        messages = [{"role": "user", "content": "time?"},
+                    {"role": "assistant", "content": "", "tool_calls": [call]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "noon"}]
+        request = CompletionRequest("chat", "", json.loads(json.dumps(messages)), None, None)
+        answer = {"role": "assistant", "content": "It's noon."}
+        warm = self.rg._next_turn_tokens(tok, request, self.args(), answer)
+        nxt = tok.apply_chat_template(messages + [answer, {"role": "user", "content": "thanks"}],
+                                      add_generation_prompt=True)
+        self.assertEqual(list(nxt[: len(warm)]), warm)
 
     def test_warmed_entry_is_the_conversation_so_far(self):
         tok, model = self.provider.tokenizer, self.provider.model
