@@ -104,6 +104,12 @@ def _assistant_message(content) -> dict:
     return message
 
 
+def _system_text(content) -> str:
+    if isinstance(content, list) and any(b.get("type") != "text" for b in content):
+        raise ValueError("A system message holds text only.")
+    return _text_of(content)
+
+
 def _add_system(messages: List[dict], text: str):
     """A system message among the messages (Claude Code sends its
     environment, and a context count after tool results, that way). Chat
@@ -140,15 +146,30 @@ def to_chat_request(body: dict) -> dict:
     system = body.get("system")
     if system:
         messages.append({"role": "system", "content": _text_of(system)})
+    # System text right after tool calls waits for their results: it
+    # mustn't come between a call and its result.
+    held = []
     for m in body["messages"]:
         if m.get("role") == "user":
             messages.extend(_user_messages(m.get("content")))
+            for text in held:
+                _add_system(messages, text)
+            held = []
         elif m.get("role") == "assistant":
+            for text in held:
+                _add_system(messages, text)
+            held = []
             messages.append(_assistant_message(m.get("content")))
         elif m.get("role") == "system":
-            _add_system(messages, _text_of(m.get("content")))
+            text = _system_text(m.get("content"))
+            if messages and messages[-1]["role"] == "assistant" and messages[-1].get("tool_calls"):
+                held.append(text)
+            else:
+                _add_system(messages, text)
         else:
             raise ValueError(f"Unsupported message role: {m.get('role')!r}")
+    for text in held:
+        _add_system(messages, text)
     if all(m["role"] == "system" for m in messages):
         raise ValueError("Request did not contain a user or assistant message")
 

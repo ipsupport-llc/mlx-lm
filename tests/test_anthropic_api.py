@@ -170,6 +170,19 @@ class TestRequestConversion(unittest.TestCase):
             {"role": "system", "content": "<total_tokens>9</total_tokens>"}]})
         self.assertEqual(chat["messages"][-1], {"role": "tool", "tool_call_id": "toolu_1",
                                                 "content": "text\n\n<total_tokens>9</total_tokens>"})
+        # Between tool calls and their results: with the results.
+        chat = anthropic_api.to_chat_request({"messages": [
+            {"role": "user", "content": "Read it"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}]},
+            {"role": "system", "content": "Between."},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "text"}]}]})
+        self.assertEqual([m["role"] for m in chat["messages"]], ["user", "assistant", "tool"])
+        self.assertEqual(chat["messages"][-1]["content"], "text\n\nBetween.")
+        # A system message holds text only.
+        with self.assertRaises(ValueError):
+            anthropic_api.to_chat_request({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [{"type": "image", "source": {"type": "url", "url": "http://x/i.png"}}]}]})
         # With an image the user turn stays a list of parts.
         chat = anthropic_api.to_chat_request({"messages": [
             {"role": "user", "content": [{"type": "text", "text": "See"},
