@@ -744,6 +744,114 @@ class TestToolParsing(unittest.TestCase):
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
 
+    def test_muse_spark(self):
+        # The server strips the markers.
+        test_case = (
+            '\n<atem:invoke name="search">\n'
+            '<atem:parameter name="query">weather in Paris</atem:parameter>'
+            '<atem:parameter name="limit">5</atem:parameter>'
+            '<atem:parameter name="ratio">0.5</atem:parameter>'
+            '<atem:parameter name="safe">true</atem:parameter>'
+            '<atem:parameter name="tags">["a", "b"]</atem:parameter>'
+            '<atem:parameter name="filters">{"unit": "c"}</atem:parameter>\n'
+            "</atem:invoke>\n"
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            {
+                "name": "search",
+                "arguments": {
+                    "query": "weather in Paris",
+                    "limit": 5,
+                    "ratio": 0.5,
+                    "safe": True,
+                    "tags": ["a", "b"],
+                    "filters": {"unit": "c"},
+                },
+            },
+        )
+
+        test_case = (
+            '<atem:invoke name="write">\n'
+            '<atem:parameter name="content">line 1\n  </atem:invoke>\n"quoted" line\n'
+            "</atem:parameter>\n</atem:invoke>"
+        )
+        tool_call = muse_spark.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call,
+            {
+                "name": "write",
+                "arguments": {"content": 'line 1\n  </atem:invoke>\n"quoted" line'},
+            },
+        )
+
+        # Any name without a double quote, also after another attribute.
+        test_case = (
+            '<atem:invoke name="f">\n'
+            '<atem:parameter name="a:b">1</atem:parameter>\n'
+            '<atem:parameter type="text" name="max tokens">two words</atem:parameter>\n'
+            "</atem:invoke>"
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            {"name": "f", "arguments": {"a:b": 1, "max tokens": "two words"}},
+        )
+
+        test_case = (
+            '<atem:invoke name="get_time">\n'
+            '<atem:parameter name="city">Paris</atem:parameter>\n'
+            "</atem:invoke>\n"
+            '<atem:invoke name="clock.now">\n</atem:invoke>\n'
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            [
+                {"name": "get_time", "arguments": {"city": "Paris"}},
+                {"name": "clock.now", "arguments": {}},
+            ],
+        )
+
+        with self.assertRaises(ValueError):
+            muse_spark.parse_tool_call("no call here", None)
+
+    def test_qwen3_coder_large_integer(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "record_id": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        for value, expected in (
+            # First integer that is not exactly representable by an IEEE-754 float.
+            ("9007199254740993", 9007199254740993),
+            ("140.0", 140),
+        ):
+            with self.subTest(value=value):
+                text = (
+                    "<function=lookup>"
+                    f"<parameter=record_id>{value}</parameter>"
+                    "</function>"
+                )
+
+                tool_call = qwen3_coder.parse_tool_call(text, tools)
+
+                self.assertEqual(
+                    tool_call,
+                    {
+                        "name": "lookup",
+                        "arguments": {"record_id": expected},
+                    },
+                )
+
     def test_qwen3_coder_iso_date(self):
         """Qwen3 coder parser should not crash on ISO 8601 dates."""
         tools = [
