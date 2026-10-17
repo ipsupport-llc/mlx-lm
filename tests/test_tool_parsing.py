@@ -1190,6 +1190,13 @@ class TestToolParsing(unittest.TestCase):
         tool_call = minimax_m3.parse_tool_call(test_case, None)
         self.assertIn("__parse_error__", tool_call["arguments"])
 
+    def test_olmo3_structured_arguments(self):
+        # Commas inside arrays, objects and strings don't split arguments.
+        self.assertEqual(
+            olmo3.parse_tool_call('f(nums=[1, 2], opts={"a": 1, "b": 2}, s="x, y", on=true, n=null)'),
+            {"name": "f", "arguments": {"nums": [1, 2], "opts": {"a": 1, "b": 2}, "s": "x, y", "on": True, "n": None}},
+        )
+
     def test_deepseek_dsml_parallel(self):
         # DSML puts multiple <｜DSML｜invoke> in one <｜DSML｜tool_calls> block = native
         # parallel calls. The leading ">" is the leftover the server captures after the

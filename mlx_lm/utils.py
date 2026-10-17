@@ -876,6 +876,7 @@ def load_model(
         and any(k.endswith(".weight_packed") for k in weights)
     ):
         ct_format = qc.get("format")
+        quantization = None
         if ct_format == "nvfp4-pack-quantized":
             weights = _transform_compressed_tensors_nvfp4_weights(weights, qc)
             quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
@@ -883,13 +884,11 @@ def load_model(
             weights, quantization = _transform_compressed_tensors_int4_weights(
                 weights, qc
             )
-        else:
-            raise ValueError(
-                f"Unsupported compressed-tensors format: {ct_format!r}. "
-                "Supported: 'nvfp4-pack-quantized', 'pack-quantized'."
-            )
-        config["quantization"] = quantization
-        config["quantization_config"] = quantization
+        # Other formats (e.g. mxfp4-pack-quantized) stay with the model's own
+        # sanitize() and _compressed_tensors_quantization below.
+        if quantization is not None:
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)

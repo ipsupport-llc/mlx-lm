@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import ast
+import json
 from typing import Any
 
 import regex as re
@@ -19,7 +20,6 @@ are JSON literals (null, true, false) instead of Python literals.
 
 
 _tool_call_regex = re.compile(r"^\s*(\w+)\((.*)\)\s*$", re.MULTILINE)
-_tool_args_regex = re.compile(r'(\w+)=(?:"([^"]*)"|([^,]+))(?:,\s*|$)', re.DOTALL)
 
 _JSON_LITERALS = {"null": None, "true": True, "false": False}
 
@@ -29,9 +29,38 @@ def _coerce(value: str):
     if value in _JSON_LITERALS:
         return _JSON_LITERALS[value]
     try:
+        return json.loads(value)
+    except ValueError:
+        pass
+    try:
         return ast.literal_eval(value)
     except (ValueError, SyntaxError):
         return value
+
+
+def _split_args(args: str):
+    """The `key=value` pairs at the top level: commas inside brackets,
+    braces or quotes don't split (arrays and objects stay whole)."""
+    parts, depth, quote, start, i = [], 0, None, 0, 0
+    while i < len(args):
+        ch = args[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(args[start:i])
+            start = i + 1
+        i += 1
+    parts.append(args[start:])
+    return [p.strip() for p in parts if p.strip()]
 
 
 def parse_tool_call(text: str, tools: Any | None = None):
@@ -40,9 +69,15 @@ def parse_tool_call(text: str, tools: Any | None = None):
         func_name = match.group(1)
         args_str = match.group(2)
         arguments = {}
-        if args_str:
-            for key, quoted, raw in _tool_args_regex.findall(args_str):
-                arguments[key.strip()] = quoted if quoted else _coerce(raw)
+        for part in _split_args(args_str or ""):
+            key, sep, value = part.partition("=")
+            if not sep:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                arguments[key.strip()] = _coerce(value) if "\\" in value else value[1:-1]
+            else:
+                arguments[key.strip()] = _coerce(value)
         calls.append({"name": func_name, "arguments": arguments})
 
     if not calls:

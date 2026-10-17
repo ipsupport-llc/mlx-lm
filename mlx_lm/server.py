@@ -2851,6 +2851,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(response_json)
                 self.wfile.flush()
             if finish_reason in ("stop", "tool_calls") and getattr(args, "cache_store", True):
+                # The answer as the client got it: a non-streamed harmony
+                # reply was split into content and reasoning (generate_response).
+                if not self.stream and answer_text:
+                    tok = self.response_generator.model_provider.tokenizer
+                    if tok is not None and has_harmony_format(tok):
+                        answer_text, harmony_reasoning = parse_harmony_response(answer_text)
+                        if harmony_reasoning:
+                            answer_reasoning = (answer_reasoning or "") + harmony_reasoning
                 self.response_generator.warm_next_turn(
                     ctx.model_key,
                     request,
