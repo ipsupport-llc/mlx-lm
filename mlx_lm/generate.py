@@ -2045,21 +2045,23 @@ class TextStateMachine:
         return (initial, self._states[initial][0], self._states, "")
 
     @staticmethod
-    def step(state, text):
+    def split(state, text):
         """Consume a chunk of decoded text.
 
-        Returns (new_state, emittable_text, current_state_name) where
-        emittable_text is the text safe to show (control sequences stripped,
-        possible partial matches held back in the buffer).
+        Returns (new_state, segments) with one (state_name, text) per state
+        passed. Control sequences are stripped and possible partial matches
+        held back in the buffer. The last segment is the current state.
         """
         s, n, states, buf = state
+        # n has already read the buffer.
+        start = len(buf)
         buf += text
         trie = states[s][0]
-        emittable = ""
-        # buf[:consumed] has been emitted or discarded; buf[consumed:] pending.
-        consumed = 0
+        segments = []
+        # buf[begin:consumed] is safe text of state s; buf[consumed:] pending.
+        begin = consumed = 0
 
-        for i in range(len(buf)):
+        for i in range(start, len(buf)):
             ch = buf[i]
             while ch not in n and n is not trie:
                 n = n["__fail__"]
@@ -2068,20 +2070,26 @@ class TextStateMachine:
 
             match = n.get("__match__")
             if match is not None:
-                match_start = i + 1 - len(match[0])
-                emittable += buf[consumed:match_start]
-                consumed = i + 1
+                segments.append((s, buf[begin : i + 1 - len(match[0])]))
+                begin = consumed = i + 1
                 s = states[s][1][match[1]]
                 if s is None:
-                    return (s, None, states, buf[consumed:]), emittable, s
+                    segments.append((s, ""))
+                    return (s, None, states, buf[consumed:]), segments
                 trie = states[s][0]
                 n = trie
             elif n is trie:
                 # At the root: no partial match in progress, everything is safe.
-                emittable += buf[consumed : i + 1]
                 consumed = i + 1
 
-        return (s, n, states, buf[consumed:]), emittable, s
+        segments.append((s, buf[begin:consumed]))
+        return (s, n, states, buf[consumed:]), segments
+
+    @staticmethod
+    def step(state, text):
+        """As split, but returns (new_state, emittable_text, current_state_name)."""
+        state, segments = TextStateMachine.split(state, text)
+        return state, "".join(t for _, t in segments), state[0]
 
     @staticmethod
     def flush(state):
@@ -2120,8 +2128,12 @@ def make_text_state_machine(tokenizer, stop_words=None):
         )
         transitions["reasoning"] = [(tokenizer.think_end, "normal")]
 
+    response_transitions = getattr(tokenizer, "response_transitions", {})
     if tokenizer.has_tool_calling:
-        transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
+        # A response format that goes to "tool" decides where calls start.
+        targets = {dst for edges in response_transitions.values() for _, dst in edges}
+        if "tool" not in targets:
+            transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
         if tokenizer.has_thinking:
             transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
         transitions["tool"] = (
@@ -2131,6 +2143,9 @@ def make_text_state_machine(tokenizer, stop_words=None):
     if tokenizer.structural_markers:
         for w in tokenizer.structural_markers:
             transitions.setdefault("normal", []).append((w, "normal"))
+
+    for state_name, edges in response_transitions.items():
+        transitions.setdefault(state_name, []).extend(edges)
 
     if stop_words:
         for state_name in set(transitions) | {"normal"}:

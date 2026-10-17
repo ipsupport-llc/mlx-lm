@@ -1076,7 +1076,18 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         model_path,
         tokenizer_config_extra,
         eos_token_ids=eos_token_ids,
+        defaults=_tokenizer_defaults(model_path),
     )
+
+
+def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
+    """The TOKENIZER_DEFAULTS of the model module, if any."""
+    try:
+        model_class, _ = _get_classes(load_config(model_path))
+    except (FileNotFoundError, KeyError, ValueError):
+        return None
+    module = importlib.import_module(model_class.__module__)
+    return getattr(module, "TOKENIZER_DEFAULTS", None)
 
 
 def load(
@@ -1603,6 +1614,7 @@ def save_config(
         "qwen3_5_moe",
         "lfm2_vl",
         "lfm2-vl",
+        "muse_spark",
     ):
         config.pop("vision_config", None)
     if "quantization" in config:

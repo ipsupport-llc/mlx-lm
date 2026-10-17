@@ -8,7 +8,7 @@ import inspect
 import json
 from functools import partial
 from json import JSONDecodeError
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -408,8 +408,12 @@ class TokenizerWrapper:
         tool_call_start=None,
         tool_call_end=None,
         tool_parser=None,
+        response_format: Optional[Dict[str, Any]] = None,
     ):
         self._tokenizer = tokenizer
+        # A model's own answer format (chat_templates.<type>.RESPONSE_FORMAT):
+        # extra state machine transitions and the state an answer starts in.
+        self._response_format = response_format or {}
         # Built once, since building the token map is expensive.
         self._detokenizer = detokenizer_class(tokenizer)
         self._eos_token_ids = set(eos_token_ids or [])
@@ -560,6 +564,14 @@ class TokenizerWrapper:
     @property
     def structural_markers(self):
         return self._structural_markers
+
+    @property
+    def response_transitions(self) -> Dict[str, List[Tuple[str, str]]]:
+        return self._response_format.get("transitions", {})
+
+    @property
+    def response_initial_state(self) -> Optional[str]:
+        return self._response_format.get("initial_state")
 
     @property
     def tool_parser(self):
@@ -723,6 +735,8 @@ def _infer_tool_parser(tokenizer):
             return "mistral"
         elif "<｜DSML｜tool_calls>" in chat_template:
             return "deepseek_dsml"
+        elif "<atem:function_calls>" in chat_template:
+            return "muse_spark"
         elif "<function_calls>" in chat_template:
             return "olmo3"
         elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
@@ -743,12 +757,15 @@ def load(
     model_path,
     tokenizer_config_extra: Optional[Dict[str, Any]] = None,
     eos_token_ids=None,
+    defaults: Optional[Dict[str, Any]] = None,
 ) -> TokenizerWrapper:
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
     Note, to use a fast streaming tokenizer, pass a local file path rather than
     a Hugging Face repo ID.
+
+    ``defaults`` are the model's settings for checkpoints without them.
     """
     detokenizer_class = NaiveStreamingDetokenizer
 
@@ -775,10 +792,14 @@ def load(
             elif _is_spm_decoder_no_space(decoder):
                 detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
 
+    defaults = defaults or {}
+    if eos_token_ids is None:
+        eos_token_ids = defaults.get("eos_token_ids")
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
 
     chat_template = None
+    response_format = None
 
     tokenizer_config_extra = tokenizer_config_extra or {}
     try:
@@ -833,12 +854,19 @@ def load(
 
     tokenizer_config = tokenizer.init_kwargs
 
-    if chat_template_type := tokenizer_config.get("chat_template_type", False):
-        chat_template = importlib.import_module(
-            f"mlx_lm.chat_templates.{chat_template_type}"
-        ).apply_chat_template
+    chat_template_type = tokenizer_config.get(
+        "chat_template_type", defaults.get("chat_template_type")
+    )
+    if chat_template_type:
+        module = importlib.import_module(f"mlx_lm.chat_templates.{chat_template_type}")
+        # A template in the checkpoint replaces only the default template.
+        if "chat_template_type" in tokenizer_config or tokenizer.chat_template is None:
+            chat_template = getattr(module, "apply_chat_template", None)
+        response_format = getattr(module, "RESPONSE_FORMAT", None)
 
-    tool_parser_type = tokenizer_config.get("tool_parser_type")
+    tool_parser_type = tokenizer_config.get(
+        "tool_parser_type", defaults.get("tool_parser_type")
+    )
     if tool_parser_type is None:
         tool_parser_type = _infer_tool_parser(tokenizer)
 
@@ -861,6 +889,7 @@ def load(
         tool_parser=tool_parser,
         tool_call_start=tool_call_start,
         tool_call_end=tool_call_end,
+        response_format=response_format,
     )
 
 

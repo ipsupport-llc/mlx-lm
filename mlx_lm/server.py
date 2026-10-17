@@ -874,7 +874,7 @@ class ResponseGenerator:
                 )
             else:
                 prompt = tokenizer.encode(convert_chat(messages, role_mapping))
-                return prompt, [prompt], ["assistant"], "normal"
+                return prompt, [prompt], ["assistant"], getattr(tokenizer, "response_initial_state", None) or "normal"
         else:
             prompt = tokenizer.encode(request.prompt)
             return prompt, [prompt], ["assistant"], "normal"
@@ -889,6 +889,9 @@ class ResponseGenerator:
             think_end = tokenizer.rfind_think_end(prompt)
             if think_start > think_end:
                 initial_state = "reasoning"
+        # A model with its own answer format starts in its own state (e.g.
+        # Muse Spark: a message header).
+        initial_state = getattr(tokenizer, "response_initial_state", None) or initial_state
 
         segments = []
         segment_types = []
@@ -2722,34 +2725,35 @@ class APIHandler(BaseHTTPRequestHandler):
                     n_tokens += 1
                     n_drafted += bool(getattr(gen, "from_draft", False))
 
-                    # Advance the text state machine to strip control sequences
+                    # Advance the text state machine to strip control sequences.
+                    # One chunk can cross a state change: each part goes by
+                    # its own state (text in other states, e.g. a message
+                    # header, is dropped).
                     if gen.finish_reason == "stop":
                         sm_state, current_state = TextStateMachine.discard(sm_state)
-                        clean_text = ""
+                        parts = [(current_state, "")]
                     elif gen.finish_reason == "length":
-                        sm_state, clean_text, current_state = TextStateMachine.step(
-                            sm_state, gen.text
-                        )
+                        sm_state, parts = TextStateMachine.split(sm_state, gen.text)
                         sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
-                        clean_text += flushed
+                        parts.append((current_state, flushed))
                     else:
-                        sm_state, clean_text, current_state = TextStateMachine.step(
-                            sm_state, gen.text
-                        )
+                        sm_state, parts = TextStateMachine.split(sm_state, gen.text)
+                        current_state = parts[-1][0]
 
-                    # Collect the clean text by state: reasoning, tool, or normal
-                    if current_state == "reasoning":
-                        reasoning_text += clean_text
-                        answer_reasoning += clean_text
-                    elif current_state == "tool":
-                        tool_text += clean_text
-                    elif current_state == "normal":
-                        if prev_state == "tool":
-                            tool_calls.append(tool_text)
-                            tool_text = ""
-                            made_tool_call = True
-                        text += clean_text
-                        answer_text += clean_text
+                    for part_state, clean_text in parts:
+                        if part_state == "reasoning":
+                            reasoning_text += clean_text
+                            answer_reasoning += clean_text
+                        elif part_state == "tool":
+                            tool_text += clean_text
+                        elif part_state == "normal":
+                            if prev_state == "tool":
+                                tool_calls.append(tool_text)
+                                tool_text = ""
+                                made_tool_call = True
+                            text += clean_text
+                            answer_text += clean_text
+                        prev_state = part_state
 
                     # Add the tokens and logprobs to the vars.
                     tokens.append(gen.token)
