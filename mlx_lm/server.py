@@ -2680,6 +2680,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # The whole answer (the stream sends and resets text / tool_calls).
         answer_text = ""
         answer_reasoning = ""
+        dropped_text = ""
         answer_calls = []   # as sent to the client, with their ids
 
         def send_calls(calls):
@@ -2753,6 +2754,10 @@ class APIHandler(BaseHTTPRequestHandler):
                                 made_tool_call = True
                             text += clean_text
                             answer_text += clean_text
+                        else:
+                            # Another state's text (a message header) is
+                            # dropped; kept in case it was all there was.
+                            dropped_text += clean_text
                         prev_state = part_state
 
                     # Add the tokens and logprobs to the vars.
@@ -2850,6 +2855,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
+            # A model that skipped its format's header: its words, not nothing.
+            if not answer_text and not answer_reasoning and not made_tool_call and dropped_text.strip():
+                text += dropped_text
+                answer_text += dropped_text
             formatted = send_calls(tool_calls)
             folded, finish_reason = tool_formatter.fold_unparsed(text, finish_reason)
             answer_text += folded[len(text):]
