@@ -1011,6 +1011,7 @@ class ResponseGenerator:
             "detokenizer": detokenizer,
             "segment_types": [],
             "top_logprobs": handoff.args.top_logprobs,
+            "logprobs": handoff.args.logprobs,
             "handoff": True,
         }
 
