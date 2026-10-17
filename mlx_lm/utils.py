@@ -60,6 +60,8 @@ MODEL_REMAPPING = {
     "lfm2_vl": "lfm2-vl",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant (the 12B): gemma4.Model with its vision_embedder
     "deepseek_v41_text": "deepseek_v41",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5_moe",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
