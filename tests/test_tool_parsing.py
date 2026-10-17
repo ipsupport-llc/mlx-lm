@@ -12,6 +12,7 @@ from mlx_lm.tool_parsers import (
     longcat,
     minimax_m2,
     mistral,
+    muse_spark,
     pythonic,
     qwen3_coder,
 )
@@ -183,6 +184,40 @@ class TestToolParsing(unittest.TestCase):
             glm47.parse_tool_call(test_case, tools),
             {"name": "get_weather", "arguments": {"postal_code": "123", "days": 3}},
         )
+
+    def test_muse_spark(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "postal_code": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            '<atem:invoke name="get_weather">'
+            '<atem:parameter name="postal_code">123</atem:parameter>'
+            '<atem:parameter name="days">3</atem:parameter>'
+            "</atem:invoke>"
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, tools),
+            {"name": "get_weather", "arguments": {"postal_code": "123", "days": 3}},
+        )
+        # Without a schema, values decode as JSON where they can.
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case + test_case),
+            [{"name": "get_weather", "arguments": {"postal_code": 123, "days": 3}}] * 2,
+        )
+        with self.assertRaises(ValueError):
+            muse_spark.parse_tool_call("no call here")
 
     def test_pythonic_single_quoted_args_with_commas(self):
         # LFM2.5 emits single-quoted strings; embedded commas must not truncate
