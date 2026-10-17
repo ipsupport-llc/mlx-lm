@@ -393,7 +393,7 @@ class GenerationContext:
 class Response:
     text: str
     token: int
-    logprob: float
+    logprob: Optional[float]
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
     # Drafted (speculative decoding) and accepted, not sampled one by one.
@@ -1121,6 +1121,7 @@ class ResponseGenerator:
                         "detokenizer": current_tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
+                        "logprobs": args.logprobs,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -1246,7 +1247,8 @@ class ResponseGenerator:
                             Response(
                                 text,
                                 r.token,
-                                r.logprobs[r.token].item(),
+                                # .item() waits for the next step: only read when asked.
+                                (r.logprobs[r.token].item() if result["logprobs"] else None),
                                 r.finish_reason,
                                 _format_top_logprobs(
                                     r.logprobs,
@@ -1516,7 +1518,8 @@ class ResponseGenerator:
                         Response(
                             gen.text,
                             gen.token,
-                            gen.logprobs[gen.token].item(),
+                            # .item() waits for the next step: only read when asked.
+                            gen.logprobs[gen.token].item() if args.logprobs else None,
                             finish_reason,
                             _format_top_logprobs(
                                 gen.logprobs, args.top_logprobs, tokenizer

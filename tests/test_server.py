@@ -26,6 +26,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 from mlx_lm.server import (
+    Response,
     APIHandler,
     GenerationContext,
     LRUPromptCache,
@@ -523,6 +524,32 @@ class TestServer(unittest.TestCase):
             )
         line = next(l for l in logs.output if "Request stats:" in l)
         self.assertIn("first_token_s=1.000 tokens=3 decode_s=1.000", line)
+
+    def test_handle_completions_logprob_only_when_requested(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        post_data = {
+            "model": "default_model",
+            "prompt": "Once upon a time",
+            "max_tokens": 4,
+        }
+
+        # Without a seed the request is batched, with a seed it is not.
+        for extra in ({}, {"seed": 0}):
+            with mock.patch("mlx_lm.server.Response", wraps=Response) as response:
+                r = requests.post(url, json={**post_data, **extra})
+            self.assertEqual(r.status_code, 200)
+            logprobs = [c.args[2] for c in response.call_args_list]
+            self.assertTrue(logprobs)
+            self.assertTrue(all(lp is None for lp in logprobs))
+
+            with mock.patch("mlx_lm.server.Response", wraps=Response) as response:
+                r = requests.post(url, json={**post_data, **extra, "logprobs": True})
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            logprobs = [c.args[2] for c in response.call_args_list]
+            self.assertTrue(logprobs)
+            self.assertTrue(all(isinstance(lp, float) for lp in logprobs))
+            self.assertIn("logprobs", body["choices"][0])
 
     def test_max_tokens_zero_is_rejected(self):
         url = f"http://localhost:{self.port}/v1/completions"
