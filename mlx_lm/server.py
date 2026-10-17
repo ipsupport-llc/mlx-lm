@@ -684,6 +684,9 @@ class ResponseGenerator:
         self._state_machine_cache = {}
 
         self._time_budget = TimeBudget()
+        # For the stall check: requests in work, and when work last moved.
+        self._busy = False
+        self._last_progress = time.monotonic()
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
@@ -710,7 +713,16 @@ class ResponseGenerator:
 
     @property
     def is_healthy(self):
-        return self.generation_available()
+        return self.generation_available() and not self._is_stalled()
+
+    def _touch_progress(self):
+        self._last_progress = time.monotonic()
+
+    def _is_stalled(self):
+        # The generation thread can stay alive while blocked in native code
+        # (a Metal allocation that never returns): no progress while busy.
+        timeout = getattr(self.cli_args, "generation_stall_timeout", 300)
+        return bool(timeout) and self._busy and time.monotonic() - self._last_progress > timeout
 
     def _junction_split(self, segments, segment_types, n_cached, n_prompt):
         """Split the segments where the nearest cached prompt diverged from
@@ -745,7 +757,9 @@ class ResponseGenerator:
         --prompt-cache-bytes."""
         total = getattr(self.cli_args, "prompt_cache_bytes", None)
         if total is not None:
-            active = batch_generator.prompt_cache_nbytes
+            # The waiting prompts' KV too: a new prompt's cache holds nothing
+            # yet when it's admitted.
+            active = batch_generator.estimated_prompt_cache_nbytes
             self.prompt_cache.trim_to(n_bytes=total - active)
 
     def _log_cache_reuse(self, n_reused, n_prompt):
@@ -1224,6 +1238,7 @@ class ResponseGenerator:
             # No request so serve from the current batch
             elif batch_generator is not None:
                 if len(batch_results) == 0:
+                    self._busy = False
                     if drain_batch:
                         current_model = None
                         current_tokenizer = None
@@ -1234,8 +1249,10 @@ class ResponseGenerator:
                     continue
 
                 uids_to_remove = []
+                self._busy = True
                 for _ in self._time_budget:
                     prompt_responses, gen_responses = batch_generator.next()
+                    self._touch_progress()
                     if not prompt_responses and not gen_responses:
                         break
 
@@ -1320,6 +1337,8 @@ class ResponseGenerator:
                         # It may have already been removed during
                         # generation
                         batch_results.pop(uid, None)
+                # The budget holds while prefills grow, not only at inserts.
+                self._trim_to_cap(batch_generator)
 
         # Make sure the model and prompt cache are destroyed in the generation
         # thread under same stream.
@@ -1336,10 +1355,13 @@ class ResponseGenerator:
         sent = [-1]
 
         def progress(tokens_processed, tokens_total):
+            self._touch_progress()
             if tokens_processed > sent[0] or tokens_processed == tokens_total:
                 sent[0] = max(sent[0], tokens_processed)
                 rqueue.put((tokens_processed, tokens_total))
 
+        self._busy = True
+        self._touch_progress()
         try:
             # Load the model and tokenizer
             model = self.model_provider.model
@@ -1549,6 +1571,7 @@ class ResponseGenerator:
                     quantized_kv_start=self.cli_args.quantized_kv_start,
                 )
                 for gen in steps:
+                    self._touch_progress()
                     finish_reason = gen.finish_reason
 
                     # Token-level stop word detection
@@ -1610,6 +1633,8 @@ class ResponseGenerator:
 
         except Exception as e:
             rqueue.put(e)
+        finally:
+            self._busy = False
 
     def warm_next_turn(self, model_key, request, args, content, tool_calls, reasoning="", echoes_reasoning=False):
         """After a chat request: the conversation with this answer, as the
@@ -2011,6 +2036,8 @@ class ResponseGenerator:
             except QueueEmpty:
                 if not self.generation_available():
                     raise RuntimeError("generation thread died") from None
+                if self._is_stalled():
+                    raise RuntimeError("generation stalled") from None
 
     def generate(
         self,
@@ -2899,7 +2926,8 @@ class APIHandler(BaseHTTPRequestHandler):
             # Client disconnected mid-stream (Ctrl-C, timeout, navigated
             # away) -- the generation already did its useful work, so just
             # stop cleanly instead of crashing the request thread.
-            logging.debug(f"Client disconnected mid-response, stopping generation: {e!r}")
+            logging.info("Client disconnected during generation.")
+            logging.debug(f"Disconnect: {e!r}")
         finally:
             ctx.stop()
             # One line per request that produced a token, for clients that
@@ -3382,6 +3410,14 @@ def make_parser():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--generation-stall-timeout",
+        type=int,
+        default=300,
+        help="Seconds without generation progress, with requests in work, "
+        "before /health reports unavailable and waiting requests fail. "
+        "0 disables the check (default: 300)",
     )
     parser.add_argument(
         "--kv-bits",

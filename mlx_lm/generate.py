@@ -2862,6 +2862,21 @@ class BatchGenerator:
         total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
         return total
 
+    @property
+    def estimated_prompt_cache_nbytes(self):
+        """prompt_cache_nbytes plus the KV the waiting prompts will allocate
+        (they hold no arrays yet), at the per-token cost of the batch caches."""
+        per_token = 0.0
+        for cache in self._prompt_batch.prompt_cache + self._generation_batch.prompt_cache:
+            keys = getattr(cache, "keys", None)
+            # Quantized caches keep (packed, scales, biases).
+            keys = keys[0] if isinstance(keys, (tuple, list)) else keys
+            if keys is None or keys.ndim != 4 or keys.shape[0] * keys.shape[2] == 0:
+                continue
+            per_token += cache.nbytes / (keys.shape[0] * keys.shape[2])
+        pending = sum(len(s) for p in self._unprocessed_sequences for s in p[1])
+        return self.prompt_cache_nbytes + int(pending * per_token)
+
     def _make_batch(self, n: int):
         uids = []
         caches = []
