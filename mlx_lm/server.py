@@ -34,7 +34,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound
 
-from . import anthropic_api
+from . import anthropic_api, responses_api
 from ._version import __version__
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
@@ -2049,6 +2049,10 @@ class ResponseGenerator:
 
 class APIHandler(BaseHTTPRequestHandler):
     anthropic: Optional[anthropic_api.MessageStream] = None
+    responses_stream: Optional[responses_api.ResponseStream] = None
+    # The stream format of the request's API (Anthropic or Responses), None
+    # for chat completions.
+    wire = None
 
     def __init__(
         self,
@@ -2100,6 +2104,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
             "/v1/messages": self.handle_chat_completions,
+            "/v1/responses": self.handle_chat_completions,
         }
 
         # Without the query: Anthropic's beta clients (Claude Code, the SDK's
@@ -2173,6 +2178,24 @@ class APIHandler(BaseHTTPRequestHandler):
             self.anthropic = anthropic_api.MessageStream(
                 self.body.get("model", "default_model")
             )
+
+        # OpenAI Responses API: the same, in its format.
+        self.responses_stream = None
+        if self.route == "/v1/responses":
+            original = self.body
+            try:
+                self.body = responses_api.to_chat_request(original)
+            except (ValueError, KeyError, TypeError, AttributeError) as e:
+                self._set_completion_headers(400)
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(responses_api.error_body(400, str(e))).encode()
+                )
+                return
+            self.responses_stream = responses_api.ResponseStream(
+                self.body.get("model", "default_model"), original
+            )
+        self.wire = self.anthropic or self.responses_stream
 
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
@@ -2497,6 +2520,8 @@ class APIHandler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> bytes:
         if getattr(self, "route", None) == "/v1/messages":
             return json.dumps(anthropic_api.error_body(status, message)).encode()
+        if getattr(self, "route", None) == "/v1/responses":
+            return json.dumps(responses_api.error_body(status, message)).encode()
         return json.dumps({"error": message}).encode()
 
     def _as_client_has_it(self, call: dict) -> dict:
@@ -2507,8 +2532,8 @@ class APIHandler(BaseHTTPRequestHandler):
         return call
 
     def _write_chunk(self, resp: dict):
-        if self.anthropic is not None:
-            self.wfile.write(self.anthropic.chunk(resp))
+        if self.wire is not None:
+            self.wfile.write(self.wire.chunk(resp))
         else:
             self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
 
@@ -2582,9 +2607,9 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.stream:
             self._set_stream_headers(200)
             self.end_headers()
-            if self.anthropic is not None:
+            if self.wire is not None:
                 self.wfile.write(
-                    self.anthropic.start(len(ctx.prompt), ctx.prompt_cache_count)
+                    self.wire.start(len(ctx.prompt), ctx.prompt_cache_count)
                 )
                 self.wfile.flush()
             logging.debug("Starting stream:")
@@ -2802,9 +2827,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 self._write_chunk(resp)
                 self.wfile.flush()
-                if self.anthropic is not None:
+                if self.wire is not None:
                     self.wfile.write(
-                        self.anthropic.stop(
+                        self.wire.stop(
                             len(tokens), self._matched_stop(finish_reason, tokens, stop_words)
                         )
                     )
@@ -2819,7 +2844,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                     self._write_chunk(resp)
                     self.wfile.flush()
-                if self.anthropic is None:
+                if self.wire is None:
                     self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
             else:
@@ -2841,6 +2866,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         self.anthropic.model,
                         self._matched_stop(finish_reason, tokens, stop_words),
                     )
+                elif self.responses_stream is not None:
+                    resp = responses_api.to_response(resp, self.responses_stream.model, self.responses_stream.body)
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
                     logging.debug(f"Outgoing Response: {response_debug}")
@@ -2866,7 +2893,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     answer_text,
                     [self._as_client_has_it(c) for c in answer_calls],
                     reasoning=answer_reasoning,
-                    echoes_reasoning=self.anthropic is not None,
+                    echoes_reasoning=self.wire is not None,
                 )
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # Client disconnected mid-stream (Ctrl-C, timeout, navigated
