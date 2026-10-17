@@ -10,7 +10,9 @@ import unittest
 
 import mlx.core as mx
 import numpy as np
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 import torch.nn.functional as F
 from torch import nn
 

@@ -2506,6 +2506,8 @@ class TestModels(unittest.TestCase):
                 expected = attention(x, cache=baseline_cache)
             self.assertTrue(mx.array_equal(actual, expected))
             attention.train()
+            # Several rows: MLX's single-query SDPA kernels have no VJP.
+            x = mx.random.normal((1, 64, 64))
             grad = mx.grad(lambda x: attention(x).sum())(x)
             self.assertTrue(mx.all(mx.isfinite(grad)))
 
@@ -3415,6 +3417,164 @@ class TestModels(unittest.TestCase):
             real_sinks = set(range(pad, pad + 4))
             last_row = set(topk_indices[i, 0, -1].tolist())
             self.assertEqual(last_row & real_sinks, real_sinks)
+
+    def test_deepseek_v4_rope_inverse(self):
+        import math as _math
+
+        from mlx_lm.models.deepseek_v4 import DeepseekV4RoPE
+
+        scaling = {
+            "type": "yarn",
+            "factor": 16,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        }
+        rope = DeepseekV4RoPE(8, 160000, scaling)
+        x = mx.random.uniform(shape=(1, 2, 4, 8))
+        y = rope(x, offset=3)
+        z = rope(y, offset=3, inverse=True)
+        self.assertTrue(mx.allclose(x, z, rtol=1e-5, atol=1e-5))
+
+    def test_deepseek_v4_sinkhorn(self):
+        from mlx_lm.models.deepseek_v4 import hc_split_sinkhorn
+
+        hc = 4
+        n = 16
+        mix_hc = (2 + hc) * hc
+        mixes = mx.random.normal(shape=(n, mix_hc))
+        hc_scale = mx.ones((3,)) * 0.1
+        hc_base = mx.zeros((mix_hc,))
+        _pre, _post, comb = hc_split_sinkhorn(
+            mixes, hc_scale, hc_base, hc, 20, 1e-6
+        )
+        row_sums = comb.sum(axis=-1)
+        col_sums = comb.sum(axis=-2)
+        self.assertTrue(mx.all(mx.abs(row_sums - 1.0) < 1e-3))
+        self.assertTrue(mx.all(mx.abs(col_sums - 1.0) < 1e-3))
+
+    def test_deepseek_v4(self):
+        from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.cache import RotatingKVCache
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=64,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=32,
+            o_groups=2,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=8,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=4,
+            moe_intermediate_size=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=4,
+            max_position_embeddings=256,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 128,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        self.assertEqual(len(model.layers), args.num_hidden_layers)
+        self.assertEqual(model.model_type, args.model_type)
+
+        caches = model.make_cache()
+        from mlx_lm.models.cache import ArraysCache, CacheList
+        self.assertIsInstance(caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], CacheList)
+        self.assertIsInstance(caches[2].caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[2].caches[1], ArraysCache)
+        self.assertIsInstance(caches[3], RotatingKVCache)
+
+        # Prefill-only path (no cache)
+        # Prefill length deliberately exceeds ``sliding_window=8`` so the
+        # RotatingKVCache's post-wrap / ring-buffer path, the compressed-KV
+        # buffer growth, and the stored-window-len > config-window case are
+        # all covered. Previous test used 7 tokens (< window) and missed an
+        # entire class of mask-size bugs.
+        inputs = mx.array(
+            [[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3]], dtype=mx.int32
+        )
+        out = model(inputs)
+        self.assertEqual(out.shape, (1, inputs.shape[1], args.vocab_size))
+
+        # Stepped-decode with cache matches one-shot prefill on the last token.
+        caches = model.make_cache()
+        last = None
+        for i in range(inputs.shape[1]):
+            last = model(inputs[:, i : i + 1], cache=caches)
+        diff = mx.max(mx.abs(out[0, -1] - last[0, -1])).item()
+        self.assertLess(diff, 1e-3)
+
+    def test_deepseek_v4_hash_gate(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=8,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=32,
+            o_groups=1,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=4,
+            compress_ratios=[0],
+            index_n_heads=2,
+            index_head_dim=32,
+            index_topk=2,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=16,
+            rope_scaling=None,
+        )
+        gate = deepseek_v4.MoEGate(args, layer_id=0)
+        # Force a known tid2eid table
+        table = mx.array(
+            [
+                [0, 1],
+                [1, 2],
+                [2, 3],
+                [3, 0],
+                [0, 2],
+                [1, 3],
+                [2, 0],
+                [3, 1],
+            ],
+            dtype=mx.int32,
+        )
+        gate.tid2eid = table
+        x = mx.random.normal(shape=(1, 4, args.hidden_size))
+        input_ids = mx.array([[0, 3, 5, 7]], dtype=mx.int32)
+        inds, _ = gate(x, input_ids)
+        inds = inds.reshape(-1, args.num_experts_per_tok)
+        expected = mx.stack([table[0], table[3], table[5], table[7]])
+        self.assertTrue(mx.all(inds == expected))
 
     def test_gemma2(self):
         from mlx_lm.models import gemma2
