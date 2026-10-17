@@ -280,5 +280,18 @@ class TestMuseSparkResponseFormat(unittest.TestCase):
             self.assertEqual(out["tool"], "")
 
 
+class TestMuseGlimmerAnswerFormat(unittest.TestCase):
+    def test_glimmer_gets_the_spark_answer_format(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_lm.utils import _tokenizer_defaults
+
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "config.json").write_text(json.dumps({"model_type": "muse_glimmer"}))
+            self.assertEqual(_tokenizer_defaults(Path(d))["chat_template_type"], "muse_spark")
+
+
 if __name__ == "__main__":
     unittest.main()
