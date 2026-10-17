@@ -33,3 +33,4 @@ Meituan's `LongCat Flash Lite` Helped add support for the following model archit
 Z.ai & THUKEG's `GLM5 (GLM MoE DSA)`
 - Ethan Elasky: Added support for talkie-lm's `Talkie`.
 - Jonathan Springer: Added architecture-specific tool parser for IBM Granite models
+- Martin Mauch: Added support for InternLM's `Intern-S2-Mobius`.
