@@ -629,9 +629,14 @@ def load_model(
         config["zero_centered_norms"] = False
 
     def _quantize(quantization):
+        # The per-module overrides share a dict with the top-level default.
+        overrides = set(config["quantization"]) - {"bits", "group_size", "mode"}
+        applied = set()
+
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
+                applied.add(p)
                 return _layer_quantization(p, config["quantization"][p])
             if not hasattr(m, "to_quantized"):
                 return False
@@ -651,6 +656,21 @@ def load_model(
             mode=quantization.get("mode", "affine"),
             class_predicate=class_predicate,
         )
+
+        if overrides and not applied:
+            # A map that names no module is never intended, and a sanitize()
+            # rename is the usual cause. A warning, not an error: the bits and
+            # group size are also read from each weight's shape
+            # (_shape_quantization), so such a model usually still loads right.
+            logging.warning(
+                f"None of the {len(overrides)} per-module entries in "
+                f"config['quantization'] name a module of the model at "
+                f"{model_path}. The map is probably keyed with the checkpoint "
+                "weight names, so the overrides are dropped and the top-level "
+                f"group_size={quantization['group_size']} bits="
+                f"{quantization['bits']} applies to every layer instead. "
+                f"First unmatched key: {sorted(overrides)[0]!r}."
+            )
 
     if (quantization := config.get("quantization", None)) is not None:
         _quantize(quantization)
