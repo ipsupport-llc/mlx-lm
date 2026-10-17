@@ -639,6 +639,22 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
+def _has_byte_level_pretokenizer(tokenizer_content):
+    """Whether the vocabulary uses GPT-2-style byte markers (a ``ByteLevel``
+    pre-tokenizer, possibly in a ``Sequence``), which only
+    ``BPEStreamingDetokenizer`` decodes -- whatever the ``decoder`` says."""
+
+    def _is_byte_level(node):
+        return isinstance(node, dict) and node.get("type", None) == "ByteLevel"
+
+    pre_tokenizer = tokenizer_content.get("pre_tokenizer")
+    if _is_byte_level(pre_tokenizer):
+        return True
+    if isinstance(pre_tokenizer, dict) and pre_tokenizer.get("type") == "Sequence":
+        return any(_is_byte_level(p) for p in pre_tokenizer.get("pretokenizers", []))
+    return False
+
+
 def _infer_tool_parser(tokenizer):
     """Attempt to auto-infer a tool parser from the chat template or vocab."""
     chat_template = tokenizer.chat_template
@@ -712,12 +728,16 @@ def load(
                 ) from e
 
         if "decoder" in tokenizer_content:
-            if _is_spm_decoder(tokenizer_content["decoder"]):
-                detokenizer_class = SPMStreamingDetokenizer
-            elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
-                detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
-            elif _is_bpe_decoder(tokenizer_content["decoder"]):
+            decoder = tokenizer_content["decoder"]
+            if _is_bpe_decoder(decoder) or _has_byte_level_pretokenizer(tokenizer_content):
+                # A byte-level vocabulary needs the BPE detokenizer even with an
+                # SPM-style decoder (e.g. Mistral tekken v13): the SPM one would
+                # leave the byte-level space marker in the output.
                 detokenizer_class = BPEStreamingDetokenizer
+            elif _is_spm_decoder(decoder):
+                detokenizer_class = SPMStreamingDetokenizer
+            elif _is_spm_decoder_no_space(decoder):
+                detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
