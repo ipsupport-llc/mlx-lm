@@ -524,6 +524,11 @@ class TestServer(unittest.TestCase):
         line = next(l for l in logs.output if "Request stats:" in l)
         self.assertIn("first_token_s=1.000 tokens=3 decode_s=1.000", line)
 
+    def test_max_tokens_zero_is_rejected(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})
+        self.assertEqual(response.status_code, 400)
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 
@@ -627,6 +632,35 @@ class TestServer(unittest.TestCase):
                             "function": {
                                 "name": "add",
                                 "arguments": '{"a": 2, "b": 3}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "5", "tool_call_id": "123"},
+            ],
+        }
+        response = requests.post(url, json=chat_post_data)
+        response_body = response.text
+        self.assertIn("id", response_body)
+        self.assertIn("choices", response_body)
+
+    def test_handle_chat_completions_with_dict_tool_arguments(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        chat_post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "what is 2+3?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": "123",
+                            "function": {
+                                "name": "add",
+                                "arguments": {"a": 2, "b": 3},
                             },
                         }
                     ],

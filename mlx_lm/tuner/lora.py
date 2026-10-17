@@ -5,7 +5,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear, dequantize_experts
 
 
 class LoRALinear(nn.Module):
@@ -124,14 +124,7 @@ class LoRASwitchLinear(nn.Module):
         is_quantized = isinstance(linear, QuantizedSwitchLinear)
 
         if is_quantized:
-            weight = mx.dequantize(
-                weight,
-                linear.scales,
-                linear.biases,
-                group_size=linear.group_size,
-                bits=linear.bits,
-                mode=linear.mode,
-            )
+            weight = dequantize_experts(linear)
         num_experts, output_dims, input_dims = weight.shape
         fused_linear = SwitchLinear(input_dims, output_dims, num_experts, bias=bias)
 

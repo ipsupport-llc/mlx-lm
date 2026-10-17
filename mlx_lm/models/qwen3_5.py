@@ -12,9 +12,10 @@ from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
+    gather_last_axis,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, normalize_qk
 from .pipeline import PipelineMixin
 from .qwen3_5_vision import VisionConfig, VisionModel
 from .qwen3_next import Qwen3NextAttention as Attention
@@ -243,9 +244,7 @@ class GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
         if ssm_sink is not None:
             # What a speculative rollback needs to replay this update on an
@@ -452,6 +451,7 @@ class TextModel(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         if args.mtp_num_hidden_layers > 0:
             self.mtp = MTP(args)
+        self.sharding_group = None
 
     def __call__(
         self,
@@ -464,6 +464,8 @@ class TextModel(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+            if self.sharding_group is not None:
+                out = gather_last_axis(out, self.sharding_group)
         return out
 
     @property
@@ -485,7 +487,10 @@ class TextModel(nn.Module):
     def _lm_head(self, normed):
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(normed)
-        return self.lm_head(normed)
+        out = self.lm_head(normed)
+        if self.sharding_group is not None:
+            out = gather_last_axis(out, self.sharding_group)
+        return out
 
     def make_mtp_cache(self):
         return [KVCache() for _ in self.mtp.layers]
@@ -745,6 +750,14 @@ class Model(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
         rank = group.rank()
+
+        # Each rank computes a slice of the vocabulary
+        lm = self.language_model
+        if not lm.args.tie_word_embeddings:
+            vocab = lm.args.vocab_size
+            assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
+            lm.lm_head = shard_linear(lm.lm_head, "all-to-sharded", group=group)
+            lm.sharding_group = group
 
         # A sharding factory for the convolution in gated delta net
         def conv_sharding(key_dim):
