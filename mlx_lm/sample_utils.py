@@ -72,6 +72,16 @@ def make_sampler(
 
     # Rows of one call are sampled independently (XTC draws one coin a call).
     sampler.rows_independent = xtc_probability <= 0.0
+    if xtc_probability <= 0.0:
+        # The log-probabilities the sampler draws from (no XTC: a fixed
+        # distribution), for speculative sampling.
+        def distribution(logprobs: mx.array) -> mx.array:
+            for method in sampling_methods:
+                logprobs = method(logprobs)
+            scaled = logprobs * (1.0 / temp)
+            return scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+
+        sampler.distribution = distribution
     return sampler
 
 
