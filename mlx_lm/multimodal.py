@@ -938,6 +938,52 @@ class Lfm2VlImageInputs:
         return expanded, embeddings, cache_key
 
 
+class MuseSparkImageInputs:
+    """Muse Spark images (processors.muse_spark): each image placeholder of
+    the prompt becomes <|image_start|>, one <|patch|> per image token and
+    <|image_end|>; the vision rows go at the patch tokens (embed_inputs)."""
+
+    def __init__(self, model, config: dict, token_ids: dict):
+        from .processors.muse_spark import IMAGE_END, IMAGE_START, Processor
+
+        self.model = model
+        self.processor = Processor.from_config(config)
+        self.patch_id = model.args.image_token_id
+        self.start_id = token_ids[IMAGE_START]
+        self.end_id = token_ids[IMAGE_END]
+
+    def build(
+        self, prompt: List[int], images: List[bytes]
+    ) -> Tuple[List[int], mx.array, List[int]]:
+        n_placeholders = sum(1 for t in prompt if t == self.patch_id)
+        if n_placeholders != len(images):
+            raise ValueError(
+                f"Chat template produced {n_placeholders} image placeholder(s) "
+                f"for {len(images)} image(s)."
+            )
+        pixel_values, counts = [], []
+        for blob in images:
+            pixels, n = self.processor.preprocess_image(np.asarray(_decode(blob).convert("RGB")))
+            pixel_values.append(pixels)
+            counts.append(n)
+        keys = [
+            _IMAGE_KEY_BASE + int.from_bytes(hashlib.sha256(b).digest()[:5], "big")
+            for b in images
+        ]
+        expanded, cache_key, img = [], [], 0
+        for tok in prompt:
+            if tok != self.patch_id:
+                expanded.append(tok)
+                cache_key.append(tok)
+                continue
+            expanded += [self.start_id] + [self.patch_id] * counts[img] + [self.end_id]
+            cache_key += [self.start_id] + [keys[img]] * counts[img] + [self.end_id]
+            img += 1
+        embeddings = self.model.embed_inputs(mx.array(expanded), pixel_values=pixel_values)
+        mx.eval(embeddings)
+        return expanded, embeddings, cache_key
+
+
 def _special_token_ids(model_path) -> dict:
     """Added-token name -> id, from the model's tokenizer.json."""
     path = Path(model_path) / "tokenizer.json"
@@ -963,7 +1009,7 @@ def vision_spans(cache_key: List[int]) -> List[Tuple[int, int]]:
 
 
 def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
-    """ImageInputs for a vision-capable Gemma 4 or Qwen3.5 model, else None."""
+    """ImageInputs for a vision-capable Gemma 4, Qwen3.5, LFM2-VL or Muse Spark model, else None."""
     if getattr(model, "model_type", None) in ("qwen3_5", "qwen3_5_moe"):
         if getattr(model, "vision_tower", None) is None:
             return None
@@ -996,6 +1042,16 @@ def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
         if any(t not in ids for t in needed):
             return None
         return inputs
+    if getattr(model, "model_type", None) == "muse_spark":
+        if getattr(model.model, "vision_tower", None) is None:
+            return None
+        from .utils import _download, load_config
+
+        path = Path(_download(str(model_path)))
+        ids = _special_token_ids(path)
+        if "<|image_start|>" not in ids or "<|image_end|>" not in ids:
+            return None
+        return MuseSparkImageInputs(model, load_config(path), ids)
     if getattr(model, "model_type", None) not in ("gemma4", "gemma4_unified"):
         return None
     # Images, audio or both.
