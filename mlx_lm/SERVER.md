@@ -210,3 +210,16 @@ The response contains the following fields:
 - `max_model_len`: The context length from the model config. It is not
   present if the config does not give one.
 - `token_strs`: The token strings, if `return_token_strs` is true.
+
+### Responses API
+
+`POST /v1/responses` takes an OpenAI Responses request and answers in that
+format, streamed (`stream: true`) or whole. Agentic clients that use only
+this API (for example Codex CLI) can use the server.
+
+The server keeps no responses: `previous_response_id` is refused, and the
+client sends the whole conversation in `input`. Function tools and custom
+(freeform) tools are supported. Hosted tools (web search, file search) are
+ignored, because a local model can't call them. `reasoning.effort` turns
+thinking on or off (`none` and `minimal` turn it off) and is passed to the
+chat template as `reasoning_effort`.
