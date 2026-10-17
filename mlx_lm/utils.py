@@ -1230,7 +1230,11 @@ def dequantize_model(model: nn.Module) -> nn.Module:
     Returns:
         nn.Module: The model with dequantized layers.
     """
-    from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    from .models.switch_layers import (
+        QuantizedSwitchLinear,
+        SwitchLinear,
+        dequantize_experts,
+    )
 
     dequantize_layers = []
     for name, module in model.named_modules():
@@ -1246,14 +1250,17 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             cls = SwitchLinear
         else:
             continue
-        weight = mx.dequantize(
-            module.weight,
-            module.scales,
-            module.biases,
-            module.group_size,
-            module.bits,
-            module.mode,
-        )
+        if isinstance(module, QuantizedSwitchLinear):
+            weight = dequantize_experts(module)
+        else:
+            weight = mx.dequantize(
+                module.weight,
+                module.scales,
+                module.biases,
+                module.group_size,
+                module.bits,
+                module.mode,
+            )
         args = weight.shape[::-1]
         m = cls(*args, **kwargs)
         if bias:

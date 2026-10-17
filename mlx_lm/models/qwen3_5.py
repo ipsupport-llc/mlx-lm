@@ -487,7 +487,10 @@ class TextModel(nn.Module):
     def _lm_head(self, normed):
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(normed)
-        return self.lm_head(normed)
+        out = self.lm_head(normed)
+        if self.sharding_group is not None:
+            out = gather_last_axis(out, self.sharding_group)
+        return out
 
     def make_mtp_cache(self):
         return [KVCache() for _ in self.mtp.layers]

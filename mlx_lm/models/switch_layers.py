@@ -35,6 +35,34 @@ def _quantize_experts(w, *, group_size, bits, mode):
     return mx.stack([q for q, _ in qs]), mx.stack([s for _, s in qs]), gs
 
 
+def dequantize_experts(layer) -> mx.array:
+    """The full-precision expert weights of a QuantizedSwitchLinear, with
+    each expert's nvfp4 tensor scale when it has them."""
+    gs = getattr(layer, "global_scale", None)
+    if gs is None:
+        return mx.dequantize(
+            layer.weight,
+            layer.scales,
+            layer.get("biases"),
+            group_size=layer.group_size,
+            bits=layer.bits,
+            mode=layer.mode,
+        )
+    return mx.stack(
+        [
+            mx.dequantize(
+                layer.weight[e],
+                layer.scales[e],
+                group_size=layer.group_size,
+                bits=layer.bits,
+                mode=layer.mode,
+                global_scale=gs[e],
+            )
+            for e in range(layer.weight.shape[0])
+        ]
+    )
+
+
 class QuantizedSwitchLinear(nn.Module):
     def __init__(
         self,
