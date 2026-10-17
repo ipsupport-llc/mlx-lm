@@ -196,6 +196,62 @@ class TestUtils(unittest.TestCase):
         self.assertIs(model_cls, bailing_moe_v3.Model)
         self.assertIs(args_cls, bailing_moe_v3.ModelArgs)
 
+    def test_load_model_text_only_qwen3_5(self):
+        # Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM checkpoints from
+        # transformers have a flat config, a *_text model type and weight
+        # names without the language_model prefix.
+        from mlx_lm.models import qwen3_5, qwen3_5_moe
+
+        text_config = {
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "full_attention_interval": 2,
+            "intermediate_size": 64,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "vocab_size": 64,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 8,
+            "linear_value_head_dim": 8,
+            "linear_conv_kernel_dim": 3,
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 64,
+        }
+        moe_config = {
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+        }
+        for module, model_type, architecture, extra in (
+            (qwen3_5, "qwen3_5_text", "Qwen3_5ForCausalLM", {}),
+            (qwen3_5_moe, "qwen3_5_moe_text", "Qwen3_5MoeForCausalLM", moe_config),
+        ):
+            config = {
+                "model_type": model_type,
+                "architectures": [architecture],
+                **text_config,
+                **extra,
+            }
+            model = module.Model(module.ModelArgs.from_dict(config))
+            weights = {
+                k.removeprefix("language_model."): v
+                for k, v in tree_flatten(model.parameters())
+            }
+            with tempfile.TemporaryDirectory(dir=self.test_dir) as path:
+                mx.save_safetensors(os.path.join(path, "model.safetensors"), weights)
+                with open(os.path.join(path, "config.json"), "w") as f:
+                    json.dump(config, f)
+                loaded, _ = utils.load_model(Path(path))
+
+            self.assertIsInstance(loaded, module.Model)
+            inputs = mx.array([[1, 2, 3]])
+            # Both in inference mode (training takes another gated delta form).
+            model.eval()
+            self.assertTrue(mx.array_equal(loaded(inputs), model(inputs)))
+
     def test_load_model_gemma4_with_per_layer_projection_quantization(self):
         from mlx_lm.models import gemma4
 
@@ -254,6 +310,86 @@ class TestUtils(unittest.TestCase):
             logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
+
+    def test_load_model_per_module_map_in_checkpoint_names(self):
+        # muse_glimmer's sanitize() renames language_model.model.* to model.*, so a map keyed with the checkpoint names matches nothing.
+        from mlx_lm.models import muse_glimmer
+
+        config_in = {
+            "model_type": "muse_glimmer",
+            "vocab_size": 64,
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "sliding_window": 8,
+        }
+        args = muse_glimmer.ModelArgs.from_dict(config_in)
+        model = muse_glimmer.Model(args)
+        # quantize_model writes only the top-level default, so a quant_predicate supplies the two per-module entries.
+        per_module = {
+            "lm_head": {"group_size": 32, "bits": 8},
+            "model.layers.0.mlp.down_proj": {"group_size": 32, "bits": 8},
+        }
+        model, config = utils.quantize_model(
+            model,
+            config_in,
+            group_size=32,
+            bits=4,
+            quant_predicate=lambda p, _: per_module.get(p, True),
+        )
+        self.assertEqual(
+            config["quantization"]["model.layers.0.mlp.down_proj"],
+            per_module["model.layers.0.mlp.down_proj"],
+        )
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+            # A map in the model's namespace must still load.
+            loaded, _ = utils.load_model(Path(mlx_path))
+
+        self.assertEqual(loaded.lm_head.bits, 8)
+        self.assertEqual(loaded.layers[0].mlp.down_proj.bits, 8)
+        self.assertEqual(loaded.layers[1].mlp.down_proj.bits, 4)
+
+        # Put the same entries back under the names the checkpoint uses.
+        in_checkpoint_names = {
+            (
+                "language_model.lm_head."
+                if k == "lm_head"
+                else "language_model.model." + k.removeprefix("model.")
+            ): v
+            for k, v in per_module.items()
+        }
+        config["quantization"].update(in_checkpoint_names)
+        for k in per_module:
+            del config["quantization"][k]
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+            # The fork maps checkpoint-named entries to the model's names
+            # (muse_glimmer's ModelArgs), so this loads with the overrides.
+            loaded, _ = utils.load_model(Path(mlx_path))
+        self.assertEqual(loaded.lm_head.bits, 8)
+        self.assertEqual(loaded.layers[0].mlp.down_proj.bits, 8)
+        self.assertEqual(loaded.layers[1].mlp.down_proj.bits, 4)
+
+        # Entries that name nothing are warned about; the bits still come
+        # from each weight's shape.
+        for k in in_checkpoint_names:
+            del config["quantization"][k]
+        config["quantization"]["no.such.module"] = {"group_size": 32, "bits": 8}
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+            with self.assertLogs(level="WARNING") as logs:
+                loaded, _ = utils.load_model(Path(mlx_path))
+        self.assertTrue(any("no.such.module" in line for line in logs.output))
+        self.assertEqual(loaded.lm_head.bits, 8)
 
     def test_infer_quant_config(self):
         from mlx_lm.models.mla import MultiLinear
@@ -455,6 +591,17 @@ class TestTrustRemoteCode(unittest.TestCase):
     def test_compressed_tensors_float_quantized_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "float-quantized"):
             utils._compressed_tensors_quantization({"format": "float-quantized"})
+
+    def test_modelopt_quantization(self):
+        nvfp4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+        # config.json layout
+        config = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+        self.assertEqual(utils._modelopt_quantization(config), nvfp4)
+        # hf_quant_config.json layout
+        config = {"quant_method": "modelopt", "quantization": {"quant_algo": "NVFP4"}}
+        self.assertEqual(utils._modelopt_quantization(config), nvfp4)
+        with self.assertRaisesRegex(ValueError, "FP8"):
+            utils._modelopt_quantization({"quant_algo": "FP8"})
 
 
 if __name__ == "__main__":

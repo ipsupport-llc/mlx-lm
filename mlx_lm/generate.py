@@ -2477,7 +2477,19 @@ class GenerationBatch:
         # asynchronously
         self._next_tokens = sampled
         self._next_logprobs = list(logprobs)
-        mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+        # Materialize the cache writes each step, not just the token/logprob
+        # outputs. The prompt (prefill) loop already evals the cache state per
+        # chunk; the decode loop did not, so the lazy cache-write graph (KV
+        # appends plus any recurrent/conv state updates) accumulated a
+        # generation of live Metal buffers per step and eventually hit the
+        # backend's resource limit after a few thousand generated tokens.
+        # Including the cache state here keeps the live-buffer count flat.
+        mx.async_eval(
+            self._next_tokens,
+            self._next_logprobs,
+            token_context,
+            [c.state for c in self.prompt_cache],
+        )
 
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained
@@ -2650,13 +2662,23 @@ class BatchGenerator:
         return self._stream
 
     def close(self):
-        if self._old_wired_limit is not None:
+        if self._old_wired_limit is None:
+            return
+        old = self._old_wired_limit
+        self._old_wired_limit = None
+        try:
             mx.synchronize(self._stream)
-            mx.set_wired_limit(self._old_wired_limit)
-            self._old_wired_limit = None
+            mx.set_wired_limit(old)
+        except RuntimeError:
+            # GC / another thread does not own this GPU stream. Dropping the
+            # restore is better than raising from a finalizer.
+            pass
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @contextlib.contextmanager
     def stats(self):

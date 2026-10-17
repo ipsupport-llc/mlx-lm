@@ -725,6 +725,7 @@ class TestModels(unittest.TestCase):
     )
     def test_switch_linear_global_scale(self):
         from mlx_lm.models.switch_layers import SwitchLinear
+        from mlx_lm.utils import dequantize_model
 
         mx.random.seed(0)
         E, N, K = 8, 128, 256
@@ -754,6 +755,12 @@ class TestModels(unittest.TestCase):
         )
         expected = x @ w_hat[indices].swapaxes(-1, -2)
         self.assertTrue(mx.allclose(ql(x, indices), expected, atol=1e-4))
+
+        # dequantize_model applies each expert's scale.
+        holder = nn.Module()
+        holder.layer = ql
+        weight = dequantize_model(holder).layer.weight.astype(mx.float32)
+        self.assertTrue(mx.allclose(weight, w_hat, rtol=1e-2, atol=1e-6))
 
         # Without it the layer keeps the plain nvfp4 parameters
         self.assertNotIn(
@@ -2824,6 +2831,40 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_gemma4_per_layer_config(self):
+        from mlx_lm.models import gemma4
+
+        config = {
+            "vocab_size": 32,
+            "text_config": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "num_global_key_value_heads": 2,
+                "head_dim": 16,
+                "global_head_dim": 32,
+                "attention_k_eq_v": True,
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+                "layer_types": ["sliding_attention", "full_attention"] * 2,
+            },
+        }
+        legacy = gemma4.Model(gemma4.ModelArgs.from_dict(copy.deepcopy(config)))
+        text_config = config["text_config"]
+        head_dim = text_config.pop("global_head_dim")
+        kv_heads = text_config.pop("num_global_key_value_heads")
+        text_config["per_layer_config"] = {
+            "01": {"head_dim": head_dim, "num_key_value_heads": kv_heads},
+            "03": {"head_dim": head_dim, "num_key_value_heads": kv_heads},
+        }
+        model = gemma4.Model(gemma4.ModelArgs.from_dict(config))
+        model.load_weights(tree_flatten(legacy.parameters()))
+
+        tokens = mx.array([[1, 2, 3]])
+        self.assertTrue(mx.array_equal(model(tokens), legacy(tokens)))
 
     def test_gemma4_quantized_embedding_preserves_lookup_scale(self):
         from mlx_lm.models import gemma4_text

@@ -153,6 +153,10 @@ class ToolCallFormatter:
         self._tool_parser = tool_parser
         self._tools = tools
         self._streaming = streaming
+        # Tool text the parser rejected: folded back into the content, so
+        # what the model wrote never vanishes (fold_unparsed).
+        self.unparsed: List[str] = []
+        self.made_valid_call = False
 
     def _format(self, tc):
         tc_id = tc.pop("id", None) or str(uuid.uuid4())
@@ -183,11 +187,23 @@ class ToolCallFormatter:
                     f"Failed to parse tool call ({type(e).__name__}: {e}); the model wrote: "
                     f"{json.dumps(snippet, ensure_ascii=False)}"
                 )
+                self.unparsed.append(tool_text)
                 continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
+            self.made_valid_call = True
         return result
+
+    def fold_unparsed(self, text, finish_reason):
+        """The content with the rejected tool text appended, and a
+        finish reason that says "tool_calls" only if a call parsed."""
+        if self.unparsed:
+            text = text + "".join(self.unparsed)
+            self.unparsed = []
+        if finish_reason == "tool_calls" and not self.made_valid_call:
+            finish_reason = "stop"
+        return text, finish_reason
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -393,7 +409,7 @@ class GenerationContext:
 class Response:
     text: str
     token: int
-    logprob: float
+    logprob: Optional[float]
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
     # Drafted (speculative decoding) and accepted, not sampled one by one.
@@ -995,6 +1011,7 @@ class ResponseGenerator:
             "detokenizer": detokenizer,
             "segment_types": [],
             "top_logprobs": handoff.args.top_logprobs,
+            "logprobs": handoff.args.logprobs,
             "handoff": True,
         }
 
@@ -1121,6 +1138,7 @@ class ResponseGenerator:
                         "detokenizer": current_tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
+                        "logprobs": args.logprobs,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -1246,7 +1264,8 @@ class ResponseGenerator:
                             Response(
                                 text,
                                 r.token,
-                                r.logprobs[r.token].item(),
+                                # .item() waits for the next step: only read when asked.
+                                (r.logprobs[r.token].item() if result["logprobs"] else None),
                                 r.finish_reason,
                                 _format_top_logprobs(
                                     r.logprobs,
@@ -1516,7 +1535,8 @@ class ResponseGenerator:
                         Response(
                             gen.text,
                             gen.token,
-                            gen.logprobs[gen.token].item(),
+                            # .item() waits for the next step: only read when asked.
+                            gen.logprobs[gen.token].item() if args.logprobs else None,
                             finish_reason,
                             _format_top_logprobs(
                                 gen.logprobs, args.top_logprobs, tokenizer
@@ -2234,7 +2254,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("logprobs", bool)
         self._validate("top_logprobs", int, min_val=0, max_val=11, whitelist=[-1])
         self._validate("xtc_probability", float, min_val=0, max_val=1)
-        self._validate("xtc_threshold", float, min_val=0, max_val=1)
+        # apply_xtc rejects anything above 0.5; keep the two ranges in step so a
+        # request is refused here rather than deeper in the sampler.
+        self._validate("xtc_threshold", float, min_val=0, max_val=0.5)
         self._validate("requested_model", str)
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
@@ -2579,10 +2601,15 @@ class APIHandler(BaseHTTPRequestHandler):
                         and current_state != "tool"
                         and (text or tool_calls or reasoning_text)
                     ):
+                        formatted = send_calls(tool_calls)
+                        folded, _ = tool_formatter.fold_unparsed(text, None)
+                        # The next turn's warm-up holds what the client got.
+                        answer_text += folded[len(text):]
+                        text = folded
                         resp = self.generate_response(
                             text,
                             None,
-                            tool_calls=send_calls(tool_calls),
+                            tool_calls=formatted,
                             reasoning_text=reasoning_text,
                         )
                         self._write_chunk(resp)
@@ -2657,12 +2684,16 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
+            formatted = send_calls(tool_calls)
+            folded, finish_reason = tool_formatter.fold_unparsed(text, finish_reason)
+            answer_text += folded[len(text):]
+            text = folded
 
             if self.stream:
                 resp = self.generate_response(
                     text,
                     finish_reason,
-                    tool_calls=send_calls(tool_calls),
+                    tool_calls=formatted,
                     reasoning_text=reasoning_text,
                 )
                 self._write_chunk(resp)
@@ -2698,7 +2729,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens=top_tokens,
                     tokens=tokens,
                     reasoning_text=reasoning_text,
-                    tool_calls=send_calls(tool_calls),
+                    tool_calls=formatted,
                 )
                 if self.anthropic is not None:
                     resp = anthropic_api.to_message(

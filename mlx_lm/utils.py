@@ -60,6 +60,8 @@ MODEL_REMAPPING = {
     "lfm2_vl": "lfm2-vl",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant (the 12B): gemma4.Model with its vision_embedder
     "deepseek_v41_text": "deepseek_v41",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5_moe",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
@@ -329,6 +331,19 @@ def _compressed_tensors_quantization(quantization_config: dict) -> dict:
     )
 
 
+def _modelopt_quantization(quantization_config: dict) -> dict:
+    """Map a ModelOpt config to an MLX quantization dict.
+
+    config.json has the fields at the top level, hf_quant_config.json under
+    ``quantization``. NVFP4 always uses groups of 16.
+    """
+    fields = quantization_config.get("quantization", quantization_config)
+    algo = fields.get("quant_algo")
+    if algo != "NVFP4":
+        raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
+    return {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
 # transformers tags non-finite floats so config.json stays valid JSON, e.g.
 # {"__float__": "Infinity"}. Undo it or the value arrives as a dict.
 _FLOAT_TAG_KEY = "__float__"
@@ -596,7 +611,10 @@ def load_model(
         hf_quant_config = model_path / "hf_quant_config.json"
         if hf_quant_config.exists():
             with open(hf_quant_config, "r") as fid:
-                config["quantization_config"] = json.load(fid)
+                config["quantization_config"] = {
+                    "quant_method": "modelopt",
+                    **json.load(fid),
+                }
 
     model_args = model_args_class.from_dict(config)
 
@@ -611,9 +629,14 @@ def load_model(
         config["zero_centered_norms"] = False
 
     def _quantize(quantization):
+        # The per-module overrides share a dict with the top-level default.
+        overrides = set(config["quantization"]) - {"bits", "group_size", "mode"}
+        applied = set()
+
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
+                applied.add(p)
                 return _layer_quantization(p, config["quantization"][p])
             if not hasattr(m, "to_quantized"):
                 return False
@@ -633,6 +656,21 @@ def load_model(
             mode=quantization.get("mode", "affine"),
             class_predicate=class_predicate,
         )
+
+        if overrides and not applied:
+            # A map that names no module is never intended, and a sanitize()
+            # rename is the usual cause. A warning, not an error: the bits and
+            # group size are also read from each weight's shape
+            # (_shape_quantization), so such a model usually still loads right.
+            logging.warning(
+                f"None of the {len(overrides)} per-module entries in "
+                f"config['quantization'] name a module of the model at "
+                f"{model_path}. The map is probably keyed with the checkpoint "
+                "weight names, so the overrides are dropped and the top-level "
+                f"group_size={quantization['group_size']} bits="
+                f"{quantization['bits']} applies to every layer instead. "
+                f"First unmatched key: {sorted(overrides)[0]!r}."
+            )
 
     if (quantization := config.get("quantization", None)) is not None:
         _quantize(quantization)
@@ -671,15 +709,7 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "modelopt":
-            # NVIDIA ModelOpt.
-            algo = quantization_config["quantization"]["quant_algo"]
-            if algo != "NVFP4":
-                raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
-            quantization = {
-                "group_size": quantization_config["quantization"].get("group_size", 16),
-                "bits": 4,
-                "mode": "nvfp4",
-            }
+            quantization = _modelopt_quantization(quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -739,6 +769,10 @@ def load_model(
             )
         else:
             mx.eval(model.parameters())
+
+    from .models.qgemm import qgemm_quantize
+
+    model = qgemm_quantize(model)
 
     return model, config
 

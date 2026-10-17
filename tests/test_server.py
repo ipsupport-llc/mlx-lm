@@ -26,6 +26,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 from mlx_lm.server import (
+    Response,
     APIHandler,
     GenerationContext,
     LRUPromptCache,
@@ -245,13 +246,55 @@ class TestToolCallFormatter(unittest.TestCase):
             {"items": [{"name": "noodles", "organic": True}]},
         )
 
+    def test_unparsed_tool_call_folds_into_content(self):
+        def broken_parser(tool_text, tools):
+            raise ValueError("malformed call")
+
+        formatter = ToolCallFormatter(broken_parser, tools=None)
+        raw = '<tool_call>{"name": "get_weather"</tool_call>'
+
+        self.assertEqual(formatter([raw]), [])
+        self.assertEqual(formatter.unparsed, [raw])
+
+        text, finish_reason = formatter.fold_unparsed("", "tool_calls")
+        self.assertEqual(text, raw)
+        self.assertEqual(finish_reason, "stop")
+        self.assertEqual(formatter.unparsed, [])
+
+    def test_partial_parse_keeps_valid_call_and_unparsed_text(self):
+        good = 'get_time(location="Paris")'
+
+        def selective_parser(tool_text, tools):
+            if tool_text == good:
+                return {"name": "get_time", "arguments": {"location": "Paris"}}
+            raise ValueError("malformed call")
+
+        formatter = ToolCallFormatter(selective_parser, tools=None)
+        bad = '<tool_call>{"name": '
+
+        formatted = formatter([good, bad])
+
+        self.assertEqual(formatted[0]["function"]["name"], "get_time")
+        self.assertTrue(formatter.made_valid_call)
+        self.assertEqual(formatter.unparsed, [bad])
+
+        text, finish_reason = formatter.fold_unparsed("", "tool_calls")
+        self.assertEqual(text, bad)
+        self.assertEqual(finish_reason, "tool_calls")
+
+    def test_fold_unparsed_noop_without_failures(self):
+        formatter = ToolCallFormatter(pythonic.parse_tool_call, tools=None)
+        formatter(['[get_time(location="Paris")]'])
+
+        text, finish_reason = formatter.fold_unparsed("answer", "tool_calls")
+        self.assertEqual((text, finish_reason), ("answer", "tool_calls"))
+
 
 def _complete(port, prompt, max_tokens=8):
     url = f"http://localhost:{port}/v1/completions"
     body = {"model": "default_model", "prompt": prompt, "max_tokens": max_tokens, "temperature": 0.0}
     response = requests.post(url, json=body)
     return response.status_code, json.loads(response.text)
-
 
 
 class TestServer(unittest.TestCase):
@@ -524,10 +567,57 @@ class TestServer(unittest.TestCase):
         line = next(l for l in logs.output if "Request stats:" in l)
         self.assertIn("first_token_s=1.000 tokens=3 decode_s=1.000", line)
 
+    def test_handle_completions_logprob_only_when_requested(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        post_data = {
+            "model": "default_model",
+            "prompt": "Once upon a time",
+            "max_tokens": 4,
+        }
+
+        # Without a seed the request is batched, with a seed it is not.
+        for extra in ({}, {"seed": 0}):
+            with mock.patch("mlx_lm.server.Response", wraps=Response) as response:
+                r = requests.post(url, json={**post_data, **extra})
+            self.assertEqual(r.status_code, 200)
+            logprobs = [c.args[2] for c in response.call_args_list]
+            self.assertTrue(logprobs)
+            self.assertTrue(all(lp is None for lp in logprobs))
+
+            with mock.patch("mlx_lm.server.Response", wraps=Response) as response:
+                r = requests.post(url, json={**post_data, **extra, "logprobs": True})
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            logprobs = [c.args[2] for c in response.call_args_list]
+            self.assertTrue(logprobs)
+            self.assertTrue(all(isinstance(lp, float) for lp in logprobs))
+            self.assertIn("logprobs", body["choices"][0])
+
     def test_max_tokens_zero_is_rejected(self):
         url = f"http://localhost:{self.port}/v1/completions"
         response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})
         self.assertEqual(response.status_code, 400)
+
+    def test_xtc_threshold_above_half_is_rejected(self):
+        """The server's range must match the sampler's.
+
+        `apply_xtc` rejects anything above 0.5. While the server accepted up to
+        1.0, a value in between passed validation here and raised inside the
+        sampler instead -- which is a much worse place for it to fail.
+        """
+        url = f"http://localhost:{self.port}/v1/completions"
+
+        base = {"model": "default_model", "prompt": "hi", "max_tokens": 1}
+
+        response = requests.post(url, json={**base, "xtc_threshold": 0.7})
+        self.assertEqual(response.status_code, 400)
+
+        # 0.5 is the documented maximum and must still pass validation. Assert
+        # only that it is not rejected -- the shared generation thread may have
+        # been torn down by an earlier test in this class, so a 200 here is not
+        # something this test can rely on.
+        response = requests.post(url, json={**base, "xtc_threshold": 0.5})
+        self.assertNotEqual(response.status_code, 400, response.text[:200])
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
