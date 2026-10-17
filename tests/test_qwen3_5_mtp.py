@@ -335,6 +335,31 @@ class TestQwen35MTP(unittest.TestCase):
         for _, logprobs, _ in out:
             self.assertEqual(logprobs.shape, (VOCAB,))
 
+    def test_speculative_sampling_keeps_the_output_distribution(self):
+        # The random head's distribution differs from the backbone's, so
+        # drafts are often rejected and replaced from the residual: the
+        # (first, second) token pairs must still follow plain sampling.
+        from collections import Counter
+
+        model = make_model()
+        prompt = mx.random.randint(0, VOCAB, (9,))
+        sampler = make_sampler(temp=0.8, top_k=4)
+        self.assertTrue(hasattr(sampler, "distribution"))
+        n = 1000
+
+        def pairs(fn):
+            got = Counter()
+            for seed in range(n):
+                mx.random.seed(seed)
+                got[tuple(t for t, *_ in fn())] += 1
+            return got
+
+        mtp = pairs(lambda: mtp_generate_step(
+            prompt, model, num_draft_tokens=1, adaptive=False, max_tokens=2, sampler=sampler))
+        plain = pairs(lambda: generate_step(prompt, model, max_tokens=2, sampler=sampler))
+        tv = sum(abs(mtp[k] - plain[k]) for k in set(mtp) | set(plain)) / (2 * n)
+        self.assertLess(tv, 0.08)
+
     def test_stream_generate_uses_the_head(self):
         """stream_generate dispatches to the head (as the server calls it),
         with the same tokens."""

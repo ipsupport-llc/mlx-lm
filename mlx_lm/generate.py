@@ -1124,6 +1124,10 @@ def mtp_generate_step(
     those samples, then emits the backbone's sample right after it. Every
     emitted token is the backbone's own sample, so the output distribution
     is exactly plain decoding's (greedy: the same tokens), with any sampler.
+    With a sampler that has a fixed distribution (temperature, top-p/k,
+    min-p; no XTC) the drafts are sampled from the head's distribution and
+    accepted as in speculative sampling: same output distribution, more
+    drafts kept.
 
     The rejected drafts are rolled back: attention caches trim, the
     GatedDeltaNet states are recomputed over the kept tokens from what the
@@ -1148,6 +1152,12 @@ def mtp_generate_step(
         raise ValueError("mtp_generate_step supports a single sequence only.")
 
     sampler = sampler or greedy_sampler
+    # A sampler with a fixed distribution (no XTC): speculative sampling --
+    # drafts drawn from the head's distribution, kept with probability
+    # min(1, p/q), a rejected one replaced from max(0, p - q). The output
+    # distribution is plain sampling's; more drafts are kept than when they
+    # must equal the backbone's own sample.
+    distribution = getattr(sampler, "distribution", None)
     # The caller's own list (the server stores it after the request).
     cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
     mtp_cache = lm.make_mtp_cache()
@@ -1250,7 +1260,7 @@ def mtp_generate_step(
             started = time.perf_counter()
             fixup = None  # mid-iteration: cache state not well defined
             with mx.stream(stream):
-                drafts = []
+                drafts, draft_q = [], []
                 if k > 0:
                     hs, ts = hidden, tok.reshape(1, 1)
                     if pending_h is not None:
@@ -1259,7 +1269,14 @@ def mtp_generate_step(
                     for _ in range(k):
                         logits, h = lm.mtp_step(hs, ts, mtp_cache)
                         quantize_cache_fn(mtp_cache)
-                        d = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
+                        if distribution is None:
+                            d = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
+                        else:
+                            # In float32: the ratios and the residual need it.
+                            last = logits[:, -1, :].astype(mx.float32)
+                            q = distribution(last - mx.logsumexp(last, axis=-1, keepdims=True))
+                            draft_q.append(q)
+                            d = mx.random.categorical(q).reshape(1, 1)
                         drafts.append(d)
                         hs, ts = h[:, -1:], d
                 # Quantized here, on the accepted tokens only (like plain
@@ -1269,18 +1286,51 @@ def mtp_generate_step(
                 block = mx.concatenate([tok.reshape(1, 1)] + drafts, axis=1)
                 sink = []
                 hid = lm.backbone(block, cache=cache, ssm_sink=sink)
-                toks, lps = _sample(lm.logits_from_backbone(hid[0]))
+                if draft_q:
+                    # The sampler's distribution, worked out once: the
+                    # backbone's tokens are drawn from it and the drafts
+                    # judged against it.
+                    logits = lm.logits_from_backbone(hid[0]).astype(mx.float32)
+                    lps = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+                    p_all = distribution(lps)
+                    toks = mx.random.categorical(p_all)
+                else:
+                    toks, lps = _sample(lm.logits_from_backbone(hid[0]))
                 draft_ids = (
                     mx.concatenate(drafts, axis=1)[0]
                     if drafts
                     else mx.array([], mx.uint32)
                 )
-                mx.eval(toks, lps, draft_ids)
+                accept = replace = None
+                if draft_q:
+                    p = p_all[:k]
+                    q = mx.concatenate(draft_q, axis=0)
+                    idx = draft_ids[:, None].astype(mx.int32)
+                    log_ratio = (
+                        mx.take_along_axis(p, idx, axis=-1) - mx.take_along_axis(q, idx, axis=-1)
+                    )[:, 0]
+                    accept = mx.log(mx.random.uniform(shape=(k,))) < log_ratio
+                    # Where a draft is rejected the token comes from max(0, p - q).
+                    residual = mx.maximum(mx.exp(p) - mx.exp(q), 0)
+                    # No residual mass left (rounding): p itself.
+                    empty = residual.sum(axis=-1, keepdims=True) <= 0
+                    replace = mx.random.categorical(mx.where(empty, p, mx.log(residual)))
+                    mx.eval(toks, lps, draft_ids, accept, replace)
+                else:
+                    mx.eval(toks, lps, draft_ids)
             toks_l = toks.tolist()
             draft_l = draft_ids.tolist()
             n_acc = 0
-            while n_acc < k and draft_l[n_acc] == toks_l[n_acc]:
-                n_acc += 1
+            if accept is not None:
+                accept_l = accept.tolist()
+                while n_acc < k and accept_l[n_acc]:
+                    n_acc += 1
+                if n_acc < k:
+                    toks_l[n_acc] = replace[n_acc].item()
+                    toks = mx.array(toks_l, dtype=toks.dtype)
+            else:
+                while n_acc < k and draft_l[n_acc] == toks_l[n_acc]:
+                    n_acc += 1
             if lengths:
                 lengths.update(k, n_acc, time.perf_counter() - started)
 
@@ -1310,7 +1360,7 @@ def mtp_generate_step(
             for i in range(n_acc):
                 # Stopping here keeps tok + the first i + 1 drafts.
                 fixup = ("keep", sink, i + 2, n_acc + 1)
-                yield toks_l[i], lps[i], True
+                yield draft_l[i], lps[i], True
                 n_out += 1
                 if n_out >= limit:
                     return
