@@ -15,13 +15,15 @@
 #   * "centered" RMSNorm (output = norm(x) * (1 + weight)) on the four
 #     per-block norms; standard RMSNorm on the final norm
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .muse_glimmer_vision import VisionAdapter, VisionConfig, VisionModel
 
 
 @dataclass
@@ -47,6 +49,11 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     final_logit_softcapping: float = 20.0
     output_multiplier: float = 0.19611613513818404
+    vision_config: Optional[dict] = None
+    image_token_id: Optional[int] = None
+    out_hidden_size: Optional[int] = None
+    projector_hidden_size: int = 4096
+    projector_hidden_act: str = "gelu"
 
     @classmethod
     def from_dict(cls, params):
@@ -260,9 +267,31 @@ class Model(nn.Module):
         self.tie_word_embeddings = args.tie_word_embeddings
         if not self.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.vision_tower = None
+        if args.vision_config is not None and args.image_token_id is not None:
+            self.vision_tower = VisionModel(VisionConfig.from_dict(args.vision_config))
+            merged_hidden_size = args.vision_config.get("hidden_size", 1536) * self.vision_tower.merge_size**2
+            self.vision_adapter = VisionAdapter(
+                args.out_hidden_size or merged_hidden_size,
+                args.projector_hidden_size,
+                args.projector_hidden_act,
+            )
+            self.vision_projection = nn.Linear(
+                args.projector_hidden_size, args.hidden_size, bias=False
+            )
 
-    def __call__(self, inputs: mx.array, cache=None):
-        out = self.model(inputs, cache=cache)
+    def __call__(self, inputs: mx.array, cache=None, input_embeddings: Optional[mx.array] = None):
+        if input_embeddings is not None:
+            h = input_embeddings
+            h = mx.fast.rms_norm(h, None, self.model.embed_eps)
+            if cache is None:
+                cache = [None] * len(self.model.layers)
+            masks = self.model._masks(h, cache)
+            for layer, c, mask in zip(self.model.layers, cache, masks):
+                h = layer(h, mask, c)
+            out = self.model.norm(h)
+        else:
+            out = self.model(inputs, cache=cache)
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -271,15 +300,39 @@ class Model(nn.Module):
         cap = self.args.final_logit_softcapping
         return mx.tanh(out / cap) * cap
 
+    def image_features(self, pixel_values: mx.array, grid_thw: np.ndarray) -> mx.array:
+        """Image tokens [N, hidden_size], one row per merged patch, in the
+        order `grid_thw` lists the images."""
+        features = self.vision_tower(pixel_values, grid_thw)
+        features = self.vision_adapter(features)
+        return self.vision_projection(features)
+
+    def embed_with_images(self, input_ids: mx.array, pixel_values: mx.array, grid_thw: np.ndarray) -> mx.array:
+        """Token embeddings [1, L, H] with the image placeholder rows
+        replaced by the image features, in order."""
+        embeds = self.model.embed_tokens(input_ids)
+        embeds = mx.fast.rms_norm(embeds, None, self.model.embed_eps)
+        features = self.image_features(pixel_values, grid_thw)
+        mask = (input_ids == self.args.image_token_id)[0]
+        positions = mx.array([i for i, m in enumerate(mask.tolist()) if m], dtype=mx.int32)
+        if positions.shape[0] != features.shape[0]:
+            raise ValueError(f"{positions.shape[0]} image tokens for {features.shape[0]} image features")
+        return embeds.at[0, positions].add(features.astype(embeds.dtype) - embeds[0, positions])
+
     def sanitize(self, weights):
         out = {}
         for k, v in weights.items():
-            # Drop the vision tower — this is a text-only port. Some
-            # checkpoints nest these directly (vision_tower.*), others
-            # under a top-level model. prefix (model.vision_tower.*) --
-            # check the key with that prefix stripped either way.
+            # Some checkpoints nest vision/text weights directly
+            # (vision_tower.*), others under a top-level model. prefix
+            # (model.vision_tower.*) -- check with that prefix stripped.
             bare = k[len("model.") :] if k.startswith("model.") else k
             if bare.startswith(("vision_tower", "vision_adapter", "vision_projection")):
+                if self.vision_tower is None:
+                    continue
+                k = bare.replace("vision_tower.vision_model.", "vision_tower.", 1)
+                if "position_ids" in k:
+                    continue
+                out[k] = v
                 continue
             # Meta/MLX nest the text tower under language_model.*
             if k.startswith("language_model.model."):
