@@ -742,6 +742,10 @@ def load_model(
         else:
             mx.eval(model.parameters())
 
+    from .models.qgemm import qgemm_quantize
+
+    model = qgemm_quantize(model)
+
     return model, config
 
 
