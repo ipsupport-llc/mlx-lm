@@ -248,6 +248,8 @@ class TestUtils(unittest.TestCase):
 
             self.assertIsInstance(loaded, module.Model)
             inputs = mx.array([[1, 2, 3]])
+            # Both in inference mode (training takes another gated delta form).
+            model.eval()
             self.assertTrue(mx.array_equal(loaded(inputs), model(inputs)))
 
     def test_load_model_gemma4_with_per_layer_projection_quantization(self):
