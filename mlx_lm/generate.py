@@ -2866,16 +2866,27 @@ class BatchGenerator:
     def estimated_prompt_cache_nbytes(self):
         """prompt_cache_nbytes plus the KV the waiting prompts will allocate
         (they hold no arrays yet), at the per-token cost of the batch caches."""
-        per_token = 0.0
-        for cache in self._prompt_batch.prompt_cache + self._generation_batch.prompt_cache:
+        pending = sum(len(s) for p in self._unprocessed_sequences for s in p[1])
+
+        def growth(cache):
+            # The bytes `pending` more tokens add to one layer's cache.
+            if hasattr(cache, "caches"):  # CacheList
+                return sum(growth(c) for c in cache.caches)
             keys = getattr(cache, "keys", None)
             # Quantized caches keep (packed, scales, biases).
             keys = keys[0] if isinstance(keys, (tuple, list)) else keys
             if keys is None or keys.ndim != 4 or keys.shape[0] * keys.shape[2] == 0:
-                continue
-            per_token += cache.nbytes / (keys.shape[0] * keys.shape[2])
-        pending = sum(len(s) for p in self._unprocessed_sequences for s in p[1])
-        return self.prompt_cache_nbytes + int(pending * per_token)
+                return 0
+            tokens = pending
+            # A rotating cache keeps at most its window.
+            if getattr(cache, "max_size", None):
+                tokens = min(tokens, cache.max_size)
+            return cache.nbytes / (keys.shape[0] * keys.shape[2]) * tokens
+
+        # Both batches hold the same layers: one estimate, the larger.
+        batches = (self._prompt_batch.prompt_cache, self._generation_batch.prompt_cache)
+        extra = max(sum(growth(c) for c in caches) for caches in batches)
+        return self.prompt_cache_nbytes + int(extra)
 
     def _make_batch(self, n: int):
         uids = []

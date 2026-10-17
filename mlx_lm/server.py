@@ -1249,7 +1249,9 @@ class ResponseGenerator:
                     continue
 
                 uids_to_remove = []
-                self._busy = True
+                if not self._busy:
+                    self._busy = True
+                    self._touch_progress()
                 for _ in self._time_budget:
                     prompt_responses, gen_responses = batch_generator.next()
                     self._touch_progress()
@@ -1339,6 +1341,8 @@ class ResponseGenerator:
                         batch_results.pop(uid, None)
                 # The budget holds while prefills grow, not only at inserts.
                 self._trim_to_cap(batch_generator)
+                # Idle work (a warm-up) between rounds isn't a request's.
+                self._busy = bool(batch_results)
 
         # Make sure the model and prompt cache are destroyed in the generation
         # thread under same stream.
@@ -1404,6 +1408,8 @@ class ResponseGenerator:
                     prompt, input_embeddings, cache_prompt = image_inputs.build(
                         prompt, request.images
                     )
+                # Encoding the media took a while: that's progress.
+                self._touch_progress()
             stop_sequences, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
