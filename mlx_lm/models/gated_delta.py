@@ -564,16 +564,10 @@ def gated_delta_ops(
     mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     """
-    Ops-based gated delta rule, used whenever the Metal kernel is unavailable.
-
-    That includes every training step, since the kernel has no VJP. Scalar
-    gating without a mask takes the chunkwise-parallel path, which is
-    equivalent to the sequential recurrence but retains O(T / chunk) states
-    for autograd instead of one per timestep; everything else falls back to
-    :func:`gated_delta_sequential`.
+    Ops-based gated delta rule, used whenever the Metal kernel is unavailable
+    (the sequential recurrence; training takes gated_delta_chunkwise, see
+    gated_delta_update).
     """
-    if mask is None and g.ndim == 3:
-        return gated_delta_chunkwise(q, k, v, g, beta, state)
     return gated_delta_sequential(q, k, v, g, beta, state, mask)
 
 
@@ -780,6 +774,11 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
+    # Training (the kernel has no VJP): the chunkwise-parallel form keeps
+    # O(T / chunk) states for autograd instead of one per timestep. Scalar
+    # gating without a mask only.
+    if not use_kernel and mask is None and g.ndim == 3:
+        return gated_delta_chunkwise(q, k, v, g, beta, state)
     if (
         not use_kernel
         or mx.default_device() != mx.gpu
