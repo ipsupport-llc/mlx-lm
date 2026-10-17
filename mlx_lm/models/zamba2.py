@@ -12,7 +12,7 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import CacheList, KVCache, MambaCache
+from .cache import ArraysCache, CacheList, KVCache
 from .rope_utils import initialize_rope
 from .ssm import ssm_update
 
@@ -155,7 +155,7 @@ class Zamba2MambaMixer(nn.Module):
         self.out_proj = nn.Linear(self.mamba_d_ssm, self.hidden_size, bias=False)
 
     def _apply_conv(
-        self, conv_input: mx.array, cache: Optional[MambaCache] = None
+        self, conv_input: mx.array, cache: Optional[ArraysCache] = None
     ) -> mx.array:
         """Apply 1D convolution w/ state caching."""
         if cache is None or cache[0] is None:
@@ -177,7 +177,7 @@ class Zamba2MambaMixer(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: Optional[MambaCache] = None,
+        cache: Optional[ArraysCache] = None,
         mask: Optional[mx.array] = None,
     ) -> mx.array:
         batch_size, seq_len, _ = x.shape
@@ -496,7 +496,7 @@ class Zamba2MambaDecoderLayer(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: Optional[MambaCache] = None,
+        cache: Optional[ArraysCache] = None,
         mask: Optional[mx.array] = None,
         transformer_hidden_states: Optional[mx.array] = None,
     ) -> mx.array:
@@ -533,7 +533,7 @@ class Zamba2HybridLayer(nn.Module):
         shared_transformers: List["Zamba2SharedTransformerBlock"],
         attn_mask: Optional[mx.array] = None,
         ssm_mask: Optional[mx.array] = None,
-        mamba_cache: Optional[MambaCache] = None,
+        mamba_cache: Optional[ArraysCache] = None,
         attn_cache: Optional[KVCache] = None,
     ) -> mx.array:
         # Concatenate hidden_states w/ ORIGINAL embeddings (not itself!)
@@ -618,7 +618,7 @@ class Zamba2Model(nn.Module):
                 if attn_cache is None:
                     attn_cache = cache[i][1]  # KVCache
                 if mamba_cache is None:
-                    mamba_cache = cache[i][0]  # MambaCache
+                    mamba_cache = cache[i][0]  # ArraysCache
             else:
                 if mamba_cache is None:
                     mamba_cache = cache[i]
@@ -675,10 +675,10 @@ class Model(nn.Module):
         for i in range(self.args.num_hidden_layers):
             if i in hybrid_layer_ids:
                 # Hybrid layers need both Mamba and KV cache
-                caches.append(CacheList(MambaCache(), KVCache()))
+                caches.append(CacheList(ArraysCache(size=2), KVCache()))
             else:
                 # Standard Mamba layers only need Mamba cache
-                caches.append(MambaCache())
+                caches.append(ArraysCache(size=2))
         return caches
 
     def sanitize(self, weights: dict) -> dict:
