@@ -582,6 +582,7 @@ class TestGenerate(unittest.TestCase):
             self.model,
             max_tokens=10,
         )
+        self.addCleanup(batch_gen.close)
         prompt = self.tokenizer.encode("hello")
         force_0 = make_logits_processors({0: 2000.0})
 
