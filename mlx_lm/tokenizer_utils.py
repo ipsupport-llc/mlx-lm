@@ -282,6 +282,21 @@ def _infer_thinking(tokenizer):
             )
 
     # Multi token thinking modes
+    if _is_llm_jp_harmony(tokenizer):
+        # The tokenizer decodes a space after every special token, so the
+        # generated text carries spaces the template does not; the token
+        # form used to find a prefilled reasoning in the prompt has none.
+        return (
+            "<|channel|> analysis<|message|> ",
+            "<|end|>",
+            tuple(
+                tokenizer.encode(
+                    "<|channel|>analysis<|message|>", add_special_tokens=False
+                )
+            ),
+            (vocab["<|end|>"],),
+        )
+
     if "<|channel>" in vocab and "<channel|>" in vocab:
         think_start = "<|channel>thought"
         think_end = "<channel|>"
@@ -330,7 +345,26 @@ def _chat_template_text(tokenizer) -> str:
     return template if isinstance(template, str) else ""
 
 
+def _is_llm_jp_harmony(tokenizer):
+    chat_template = tokenizer.chat_template
+    return (
+        isinstance(chat_template, str)
+        and "chat_format=llm-jp-harmony-v1" in chat_template
+    )
+
+
 def _infer_structural_markers(tokenizer):
+    if _is_llm_jp_harmony(tokenizer):
+        # Message headers. "<|message|> " includes the tokenizer's space so an
+        # intentional leading space in the body survives.
+        return (
+            "<|start|> assistant",
+            "<|channel|> final",
+            "<|channel|> commentary",
+            "<|message|> ",
+            "<|channel|> analysis<|message|><|end|>",
+            "<|end|>",
+        )
     if _is_xtml_vocab(tokenizer.get_vocab()):
         return (
             "<|open|>response<|sep|>",
@@ -639,11 +673,29 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
+def _has_byte_level_pretokenizer(tokenizer_content):
+    """Whether the vocabulary uses GPT-2-style byte markers (a ``ByteLevel``
+    pre-tokenizer, possibly in a ``Sequence``), which only
+    ``BPEStreamingDetokenizer`` decodes -- whatever the ``decoder`` says."""
+
+    def _is_byte_level(node):
+        return isinstance(node, dict) and node.get("type", None) == "ByteLevel"
+
+    pre_tokenizer = tokenizer_content.get("pre_tokenizer")
+    if _is_byte_level(pre_tokenizer):
+        return True
+    if isinstance(pre_tokenizer, dict) and pre_tokenizer.get("type") == "Sequence":
+        return any(_is_byte_level(p) for p in pre_tokenizer.get("pretokenizers", []))
+    return False
+
+
 def _infer_tool_parser(tokenizer):
     """Attempt to auto-infer a tool parser from the chat template or vocab."""
     chat_template = tokenizer.chat_template
     if isinstance(chat_template, str):
-        if "<minimax:tool_call>" in chat_template:
+        if _is_llm_jp_harmony(tokenizer):
+            return "llm_jp_harmony"
+        elif "<minimax:tool_call>" in chat_template:
             return "minimax_m2"
         elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
             return "gemma4"
@@ -669,6 +721,10 @@ def _infer_tool_parser(tokenizer):
             return "minicpm5"
         elif "[TOOL_CALLS]" in chat_template:
             return "mistral"
+        elif "<｜DSML｜tool_calls>" in chat_template:
+            return "deepseek_dsml"
+        elif "<function_calls>" in chat_template:
+            return "olmo3"
         elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
             return "json_tools"
 
@@ -708,21 +764,72 @@ def load(
                 ) from e
 
         if "decoder" in tokenizer_content:
-            if _is_spm_decoder(tokenizer_content["decoder"]):
-                detokenizer_class = SPMStreamingDetokenizer
-            elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
-                detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
-            elif _is_bpe_decoder(tokenizer_content["decoder"]):
+            decoder = tokenizer_content["decoder"]
+            if _is_bpe_decoder(decoder) or _has_byte_level_pretokenizer(tokenizer_content):
+                # A byte-level vocabulary needs the BPE detokenizer even with an
+                # SPM-style decoder (e.g. Mistral tekken v13): the SPM one would
+                # leave the byte-level space marker in the output.
                 detokenizer_class = BPEStreamingDetokenizer
+            elif _is_spm_decoder(decoder):
+                detokenizer_class = SPMStreamingDetokenizer
+            elif _is_spm_decoder_no_space(decoder):
+                detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
 
     chat_template = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    tokenizer_config_extra = tokenizer_config_extra or {}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **tokenizer_config_extra
+        )
+    # TODO: Remove this once transformers upstream adds DSV4
+    except (AttributeError, ValueError) as e:
+        if "config" in tokenizer_config_extra:
+            raise
+        from transformers import PretrainedConfig
+
+        stub_kwargs: Dict[str, Any] = {}
+        model_config_file = model_path / "config.json"
+        if model_config_file.exists():
+            try:
+                with open(model_config_file, "r") as f:
+                    raw = json.load(f)
+                for key in (
+                    "model_type",
+                    "max_position_embeddings",
+                    "vocab_size",
+                    "bos_token_id",
+                    "eos_token_id",
+                    "pad_token_id",
+                ):
+                    if key in raw:
+                        stub_kwargs[key] = raw[key]
+            except (OSError, JSONDecodeError):
+                pass
+
+        warnings.warn(
+            "Falling back to a generic tokenizer because Transformers does "
+            f"not recognize this model config yet: {e}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            config=PretrainedConfig(**stub_kwargs),
+            **tokenizer_config_extra,
+        )
+
+    # The streaming detokenizers (SPM/BPE) need a ``vocab`` mapping. Custom
+    # tokenizers (e.g. via ``trust_remote_code``) often expose only ``get_vocab``;
+    # fall back to the correct-by-construction Naive detokenizer instead of
+    # crashing on the missing ``.vocab``.
+    if detokenizer_class is not NaiveStreamingDetokenizer and not hasattr(
+        tokenizer, "vocab"
+    ):
+        detokenizer_class = NaiveStreamingDetokenizer
 
     tokenizer_config = tokenizer.init_kwargs
 

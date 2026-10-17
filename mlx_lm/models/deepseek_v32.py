@@ -11,7 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
-from .mla import MultiLinear
+from .mla import MultiLinear, latent_length, max_absorbed_queries
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -116,6 +116,37 @@ class Indexer(nn.Module):
             scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
+
+        # The learned top-k does not reliably keep the first few real key
+        # positions of each sequence (attention sinks). Once sparse attention
+        # starts (past index_topk), losing a sink collapses generation into
+        # repetition (StreamingLLM effect, Xiao et al. 2023). Force sinks + a
+        # small recency window into the selection; non-causal picks for early
+        # rows are harmless since the caller ANDs this selection with the real
+        # causal mask before use.
+        #
+        # offset/left_padding can be a per-sequence array under BatchKVCache
+        # (not a python scalar), and "sink" means the first real tokens of
+        # each sequence, not buffer column 0 once left-padding is involved —
+        # so both are folded into the position math with an explicit batch
+        # axis instead of assuming a shared scalar offset.
+        n_sinks, local_window = 4, 128
+        num_keys = scores.shape[-1]
+        left_padding = mx.array(getattr(cache, "left_padding", 0))
+        query_pos = mx.arange(scores.shape[2]).reshape(1, -1, 1) + (
+            mx.array(offset) + left_padding
+        ).reshape(-1, 1, 1)
+        key_pos = mx.arange(num_keys).reshape(1, 1, num_keys)
+        sink_start = left_padding.reshape(-1, 1, 1)
+        force_keep = ((key_pos >= sink_start) & (key_pos < sink_start + n_sinks)) | (
+            (key_pos <= query_pos) & (key_pos > query_pos - local_window)
+        )
+        scores = mx.where(
+            force_keep[:, None],
+            mx.array(float("inf"), scores.dtype),
+            scores,
+        )
+
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
             ..., -self.index_topk :
         ]
@@ -152,6 +183,11 @@ class DeepseekV32Attention(nn.Module):
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
+        self._absorbed_dims = (
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
         self.embed_q = MultiLinear(
             self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads
         )
@@ -251,7 +287,10 @@ class DeepseekV32Attention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorbed = L == 1 or L <= max_absorbed_queries(
+            *self._absorbed_dims, latent_length(kv_latent)
+        )
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
@@ -261,7 +300,7 @@ class DeepseekV32Attention(nn.Module):
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)

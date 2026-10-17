@@ -4,6 +4,7 @@ import argparse
 from collections import deque
 import gc
 import json
+import types
 import logging
 import pickle
 import platform
@@ -31,6 +32,7 @@ from urllib.parse import unquote
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
+from huggingface_hub.errors import CacheNotFound
 
 from . import anthropic_api
 from ._version import __version__
@@ -51,6 +53,7 @@ from .generate import (
     stream_generate,
     wired_limit,
 )
+from .harmony import has_harmony_format, parse_harmony_response
 from .models.cache import (
     LRUPromptCache,
     can_trim_prompt_cache,
@@ -300,6 +303,8 @@ class LogitsProcessorArguments:
     presence_context_size: int
     frequency_penalty: float
     frequency_context_size: int
+    # llama.cpp's: the EOS tokens blocked, generation runs to max_tokens.
+    ignore_eos: bool = False
 
 
 @dataclass
@@ -624,9 +629,28 @@ def _make_sampler(args, tokenizer):
     )
 
 
-def _make_logits_processors(args):
+def _max_model_len(config):
+    """The context length in the model config, or None."""
+    keys = ["max_position_embeddings", "max_seq_len", "max_sequence_length", "seq_length", "n_positions"]
+    lengths = [
+        c[k]
+        for c in (config, config.get("text_config") or {})
+        for k in keys
+        if isinstance(c.get(k), int)
+    ]
+    return min(lengths, default=None)
+
+
+def _make_logits_processors(args, tokenizer=None):
+    logit_bias = args.logits.logit_bias
+    if getattr(args.logits, "ignore_eos", False):
+        # Blocks the EOS tokens the way llama.cpp does. Without the tokenizer
+        # (a check only), any non-empty bias says there are processors.
+        eos = getattr(tokenizer, "eos_token_ids", None) or [-1]
+        logit_bias = dict(logit_bias or {})
+        logit_bias.update({t: float("-inf") for t in eos if t >= 0} or {0: 0.0})
     return make_logits_processors(
-        args.logits.logit_bias,
+        logit_bias,
         args.logits.repetition_penalty,
         args.logits.repetition_context_size,
         args.logits.presence_penalty,
@@ -999,7 +1023,7 @@ class ResponseGenerator:
             caches=[cache],
             all_tokens=[history],
             samplers=[_make_sampler(handoff.args, tokenizer)],
-            logits_processors=[_make_logits_processors(handoff.args)],
+            logits_processors=[_make_logits_processors(handoff.args, tokenizer)],
             stop_sequences=[stop_sequences],
         )
         # For tests: how many moved, and the text the last one had sent.
@@ -1129,7 +1153,7 @@ class ResponseGenerator:
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, current_tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[_make_logits_processors(args, current_tokenizer)],
                         stop_sequences=[stop_sequences],
                     )
                     batch_results[uid] = {
@@ -1382,7 +1406,7 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            logits_processors = _make_logits_processors(args)
+            logits_processors = _make_logits_processors(args, tokenizer)
 
             use_draft = (
                 self.model_provider.draft_model is not None
@@ -2081,7 +2105,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Without the query: Anthropic's beta clients (Claude Code, the SDK's
         # client.beta.messages) post to /v1/messages?beta=true.
         self.route = self.path.split("?", 1)[0]
-        if self.route not in request_factories:
+        if self.route not in request_factories and self.route != "/tokenize":
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
@@ -2130,6 +2154,10 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.route == "/tokenize":
+            self.handle_tokenize()
+            return
+
         # Anthropic Messages API: run as a chat request, answer in its format.
         self.anthropic = None
         if self.route == "/v1/messages":
@@ -2175,6 +2203,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
         self.xtc_threshold = self.body.get("xtc_threshold", 0.1)
         self.logit_bias = self.body.get("logit_bias", None)
+        self.ignore_eos = self.body.get("ignore_eos", False)
         self.logprobs = self.body.get("logprobs", False)
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
@@ -2261,6 +2290,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
+        self._validate("ignore_eos", bool)
 
         if self.logit_bias is not None:
             try:
@@ -2307,6 +2337,24 @@ class APIHandler(BaseHTTPRequestHandler):
             dict: A dictionary containing the response, in the same format as
               OpenAI's API.
         """
+        # gpt-oss-family models emit OpenAI's "harmony" multi-channel format
+        # (<|channel|>NAME<|message|>BODY<|end|>...), which the reasoning-split
+        # state machine above never detects (it only matches a single fixed
+        # start/end token pair, e.g. <think>/</think> — harmony's <|channel|>
+        # is one token shared across every channel boundary, with the channel
+        # name generated as ordinary text). Unpatched, raw channel markers
+        # land verbatim in message.content. Only applied when NOT streaming:
+        # the harmony parser needs the fully-accumulated text to correctly
+        # attribute a channel's content, which only the non-streaming path
+        # ever has in `text`; streaming-safe incremental splitting is a
+        # follow-up. See mlx_lm.harmony and ml-explore/mlx-lm#875.
+        if not self.stream and text:
+            tokenizer = self.response_generator.model_provider.tokenizer
+            if tokenizer is not None and has_harmony_format(tokenizer):
+                text, harmony_reasoning = parse_harmony_response(text)
+                if harmony_reasoning:
+                    reasoning_text = (reasoning_text or "") + harmony_reasoning
+
         token_logprobs = token_logprobs or []
         top_logprobs = top_tokens or []
         tool_calls = tool_calls or []
@@ -2391,6 +2439,61 @@ class APIHandler(BaseHTTPRequestHandler):
                 return word
         return None
 
+    def _send_json(self, status_code, body):
+        self._set_completion_headers(status_code)
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+        self.wfile.flush()
+
+    def handle_tokenize(self):
+        """POST /tokenize: the loaded model's tokens for a prompt, or for
+        chat messages templated as /v1/chat/completions would."""
+        body = self.body
+        prompt = body.get("prompt")
+        messages = body.get("messages")
+        add_special_tokens = body.get("add_special_tokens", True)
+        return_token_strs = body.get("return_token_strs", False)
+        provider = self.response_generator.model_provider
+        tokenizer = provider.tokenizer
+
+        if (prompt is None) == (messages is None):
+            error = "Exactly one of prompt or messages is required"
+        elif prompt is not None and not isinstance(prompt, str):
+            error = "prompt must be of type str"
+        elif messages is not None and not isinstance(messages, list):
+            error = "messages must be of type list"
+        elif not isinstance(add_special_tokens, bool):
+            error = "add_special_tokens must be of type bool"
+        elif not isinstance(return_token_strs, bool):
+            error = "return_token_strs must be of type bool"
+        else:
+            error = None
+        if error is not None:
+            self._send_json(400, {"error": error})
+            return
+        if tokenizer is None:
+            self._send_json(503, {"error": "No model is loaded"})
+            return
+
+        try:
+            if prompt is not None:
+                tokens = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+            else:
+                request = CompletionRequest("chat", "", messages, body.get("tools") or None, body.get("role_mapping"))
+                options = types.SimpleNamespace(chat_template_kwargs=body.get("chat_template_kwargs"))
+                tokens = self.response_generator._tokenize(tokenizer, request, options)[0]
+            response = {"tokens": list(tokens), "count": len(tokens)}
+            args = getattr(provider.model, "args", None)
+            max_len = _max_model_len(vars(args)) if args is not None and hasattr(args, "__dict__") else None
+            if max_len is not None:
+                response["max_model_len"] = max_len
+            if return_token_strs:
+                response["token_strs"] = tokenizer.convert_ids_to_tokens(tokens)
+        except Exception as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        self._send_json(200, response)
+
     def _error(self, status: int, message: str) -> bytes:
         if getattr(self, "route", None) == "/v1/messages":
             return json.dumps(anthropic_api.error_body(status, message)).encode()
@@ -2439,6 +2542,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 presence_context_size=self.presence_context_size,
                 frequency_penalty=self.frequency_penalty,
                 frequency_context_size=self.frequency_context_size,
+                ignore_eos=self.ignore_eos,
             ),
             stop_words=stop_words,
             max_tokens=self.max_tokens,
@@ -2747,6 +2851,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(response_json)
                 self.wfile.flush()
             if finish_reason in ("stop", "tool_calls") and getattr(args, "cache_store", True):
+                # The answer as the client got it: a non-streamed harmony
+                # reply was split into content and reasoning (generate_response).
+                if not self.stream and answer_text:
+                    tok = self.response_generator.model_provider.tokenizer
+                    if tok is not None and has_harmony_format(tok):
+                        answer_text, harmony_reasoning = parse_harmony_response(answer_text)
+                        if harmony_reasoning:
+                            answer_reasoning = (answer_reasoning or "") + harmony_reasoning
                 self.response_generator.warm_next_turn(
                     ctx.model_key,
                     request,
@@ -2883,9 +2995,6 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /v1/models endpoint.
         """
-        self._set_completion_headers(200)
-        self.end_headers()
-
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
         # /v1/models[/<id>] and LM Studio's /api/v0/models[/<id>]: the id is
@@ -2905,11 +3014,17 @@ class APIHandler(BaseHTTPRequestHandler):
             file_names = {f.file_path.name for f in repo.refs["main"].files}
             return all(f in file_names for f in files)
 
-        # Scan the cache directory for downloaded mlx models
-        hf_cache_info = scan_cache_dir()
-        downloaded_models = [
-            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
-        ]
+        # Scan the cache directory for downloaded mlx models. A machine that only
+        # serves local paths may have no Hugging Face cache at all; that means no
+        # cached models, not a failed request.
+        try:
+            hf_cache_info = scan_cache_dir()
+        except CacheNotFound:
+            downloaded_models = []
+        else:
+            downloaded_models = [
+                repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
+            ]
 
         # Create a list of available models
         models = [
@@ -2942,8 +3057,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 models.append({"id": alias, "object": "model", "created": self.created})
 
         response = {"object": "list", "data": models}
-
         response_json = json.dumps(response).encode()
+
+        # The status goes out only once the body is known. It used to be sent
+        # first, so a scan failure left the client with a 200 and no body.
+        self._set_completion_headers(200)
+        self.end_headers()
         self.wfile.write(response_json)
         self.wfile.flush()
 

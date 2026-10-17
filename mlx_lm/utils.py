@@ -11,6 +11,7 @@ import os
 import re
 import resource
 import shutil
+import struct
 from decimal import Decimal
 from pathlib import Path
 from textwrap import dedent
@@ -62,6 +63,7 @@ MODEL_REMAPPING = {
     "deepseek_v41_text": "deepseek_v41",
     "qwen3_5_text": "qwen3_5",
     "qwen3_5_moe_text": "qwen3_5_moe",
+    "nemotron_h_puzzle": "nemotron_h",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
@@ -201,6 +203,169 @@ def _transform_awq_weights(
     return new_weights, mlx_quantization
 
 
+def _e4m3_decode_table() -> mx.array:
+    """Return a 256-entry ``float32`` LUT mapping every E4M3FN byte to its value.
+
+    OCP ``E4M3FN``: 1 sign / 4 exponent (bias 7) / 3 mantissa bits, no infinities, and
+    ``(exp=15, mant=7)`` reserved for NaN (max finite magnitude is therefore 448). This
+    matches the byte convention MLX uses for ``nvfp4`` scales (verified empirically).
+    """
+    table = []
+    for b in range(256):
+        s = (b >> 7) & 1
+        e = (b >> 3) & 0xF
+        m = b & 0x7
+        if e == 0:
+            val = (m / 8.0) * 2.0**-6  # subnormal
+        elif e == 15 and m == 7:
+            val = float("nan")
+        else:
+            val = (1.0 + m / 8.0) * 2.0 ** (e - 7)
+        table.append(-val if s else val)
+    return mx.array(table, dtype=mx.float32)
+
+
+# Built once; reused by every NVFP4 fold.
+_E4M3_DECODE_LUT = _e4m3_decode_table()
+
+
+def _f32_to_e4m3(x: mx.array) -> mx.array:
+    """Encode non-negative ``float32`` values to ``E4M3FN`` bytes (round-to-nearest-even).
+
+    Pure-MLX bit manipulation (MLX exposes no float8 dtype). Saturates to 448 on
+    overflow and flushes to the subnormal grid / zero on underflow. Inputs are assumed
+    ``>= 0`` (NVFP4 group scales are magnitudes), so the sign bit is always 0.
+    """
+    x = mx.maximum(x.astype(mx.float32), 0.0)
+    bits = x.view(mx.uint32)
+    fexp = (bits >> 23) & 0xFF  # fp32 exponent, bias 127
+    fman = bits & 0x7FFFFF  # fp32 mantissa, 23 bits
+
+    # Normal path: target E4M3 biased exponent e = (fexp - 127) + 7.
+    e = fexp.astype(mx.int32) - 120
+    drop = 20  # 23 -> 3 mantissa bits
+    round_bit = (fman >> (drop - 1)) & 1
+    sticky = (fman & ((1 << (drop - 1)) - 1)) != 0
+    mant3 = fman >> drop
+    roundup = round_bit & (sticky.astype(mx.uint32) | (mant3 & 1))
+    mant3 = mant3 + roundup
+    carry = mant3 >> 3  # mantissa overflowed past 7 -> bump exponent
+    mant3 = mant3 & 0x7
+    e = e + carry.astype(mx.int32)
+    # Saturate: e > 15, or the NaN slot (e == 15, mant == 7), clamps to 448 (e15 m6).
+    over = (e > 15) | ((e == 15) & (mant3 == 7))
+    e = mx.where(over, mx.array(15, mx.int32), e)
+    mant3 = mx.where(over, mx.array(6, mx.uint32), mant3)
+    normal_byte = (e.astype(mx.uint32) << 3) | mant3
+    normal_valid = e >= 1
+
+    # Subnormal path: value = m * 2^-9, so m = round(x * 512) (RNE). m == 8 lands
+    # exactly on the smallest normal (0x08 = e1 m0 = 2^-6), so it is encoded correctly.
+    sub = x * 512.0
+    sub_floor = mx.floor(sub)
+    frac = sub - sub_floor
+    sf = sub_floor.astype(mx.uint32)
+    up = (frac > 0.5) | ((frac == 0.5) & ((sf & 1) == 1))
+    sub_byte = sf + up.astype(mx.uint32)
+
+    byte = mx.where(normal_valid, normal_byte, sub_byte)
+    return byte.astype(mx.uint8)
+
+
+def _transform_compressed_tensors_nvfp4_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Dict[str, mx.array]:
+    """Fold compressed-tensors NVFP4 weights into MLX-native ``nvfp4`` weights.
+
+    A ``nvfp4-pack-quantized`` checkpoint stores, per quantized Linear:
+
+    - ``<p>.weight_packed``       ``uint8``  ``[out, in // 2]``  (2x E2M1 per byte)
+    - ``<p>.weight_scale``        ``uint8``  ``[out, in // 16]`` (E4M3 per group of 16,
+      loaded by ``mx.load`` as raw bytes -- the same byte layout MLX uses for nvfp4 scales)
+    - ``<p>.weight_global_scale`` ``float32`` ``[1]`` (per-tensor; the real weight is
+      ``fp4 * weight_scale / weight_global_scale``)
+
+    MLX ``nvfp4`` ``QuantizedLinear`` expects ``<p>.weight`` (``uint32``) plus
+    ``<p>.scales`` (``uint8`` E4M3) and is single-level: the per-tensor global scale is
+    not representable (and is rejected on the Metal backend). Both decodes are linear in
+    the FP4 codes, so the global scale can be folded directly into the per-group E4M3
+    scales: ``scale_mlx = E4M3(weight_scale / global_scale)``. We keep the original packed
+    E2M1 codes bit-exact (only the per-group scales are re-encoded once), avoiding the
+    weight dequantize/re-quantize round-trip entirely.
+    """
+    packed_suffix = ".weight_packed"
+
+    new_weights = {}
+    for key in list(weights.keys()):
+        if key.endswith(packed_suffix):
+            prefix = key[: -len(packed_suffix)]
+            packed = weights[key]
+            scale = weights[f"{prefix}.weight_scale"]
+            global_scale = weights[f"{prefix}.weight_global_scale"].astype(mx.float32)
+
+            # weight_packed is uint8 [out, in//2]; reinterpret as uint32 [out, in//8]
+            # to match MLX's nvfp4 weight layout (bit-identical, no data movement).
+            new_weights[f"{prefix}.weight"] = packed.view(mx.uint32)
+
+            # Fold the per-tensor global scale into the per-group E4M3 scales:
+            # decode E4M3 -> divide by global scale -> re-encode E4M3. The FP4 codes are
+            # untouched, so this only re-rounds the (much smaller) scale tensor once.
+            decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
+            new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
+        elif key.endswith(".weight_scale") or key.endswith(".weight_global_scale"):
+            # Consumed alongside their ``.weight_packed``.
+            continue
+        else:
+            new_weights[key] = weights[key]
+
+    return new_weights
+
+
+def _transform_compressed_tensors_int4_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Dict[str, mx.array]:
+    """Remap compressed-tensors INT4 ``pack-quantized`` weights to MLX affine weights.
+
+    A symmetric int4 ``pack-quantized`` checkpoint stores, per quantized Linear:
+
+    - ``<p>.weight_packed`` ``int32`` ``[out, in // 8]`` (8x int4 per word, LSB-first)
+    - ``<p>.weight_scale``  (``bf16``/``float``) ``[out, in // group_size]``
+    - ``<p>.weight_shape``  ``int64`` ``[2]`` (unused by MLX)
+
+    MLX affine ``QuantizedLinear`` uses the same int4 packing and dequantizes as
+    ``w * scale + bias``. Symmetric int4 stores values in ``[0, 15]`` representing
+    ``[-8, 7]``, i.e. ``value = packed - 8``, so we set ``bias = -8 * scale``. The packed
+    ``int32`` is bit-identical to MLX's ``uint32`` layout (reinterpreted via ``view``).
+    This is the model-agnostic version of the int4 remap in ``deepseek_v3.sanitize``.
+    """
+    weights_cfg = (
+        quantization_config.get("config_groups", {})
+        .get("group_0", {})
+        .get("weights", {})
+    )
+    group_size = weights_cfg.get("group_size", 32)
+    bits = weights_cfg.get("num_bits", 4)
+    packed_suffix = ".weight_packed"
+
+    new_weights = {}
+    for key in list(weights.keys()):
+        if key.endswith(packed_suffix):
+            prefix = key[: -len(packed_suffix)]
+            scale = weights[f"{prefix}.weight_scale"]
+            new_weights[f"{prefix}.weight"] = weights[key].view(mx.uint32)
+            new_weights[f"{prefix}.scales"] = scale
+            new_weights[f"{prefix}.biases"] = -(2 ** (bits - 1)) * scale
+        elif key.endswith(".weight_scale") or key.endswith(".weight_shape"):
+            # Consumed alongside their ``.weight_packed`` (shape is unused by MLX).
+            continue
+        else:
+            new_weights[key] = weights[key]
+
+    return new_weights, {"group_size": group_size, "bits": bits, "mode": "affine"}
+
+
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -258,6 +423,7 @@ DEFAULT_ALLOW_PATTERNS = [
     "model*.safetensors",
     "*.py",
     "tokenizer.model",
+    "*.model",
     "*.tiktoken",
     "tiktoken.model",
     "*.txt",
@@ -527,6 +693,81 @@ def infer_quant_config(path: str, module: nn.Module, weights: dict) -> dict:
     )
 
 
+def _load_safetensors_with_e8m0(path: str) -> Dict[str, mx.array]:
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header_bytes = f.read(header_len)
+        data_offset = 8 + header_len
+        header = json.loads(header_bytes)
+
+        e8m0_tensors: Dict[str, mx.array] = {}
+        remaining_header = {}
+        for name, meta in header.items():
+            if name == "__metadata__":
+                remaining_header[name] = meta
+                continue
+            if isinstance(meta, dict) and meta.get("dtype") == "F8_E8M0":
+                start, end = meta["data_offsets"]
+                f.seek(data_offset + start)
+                raw = f.read(end - start)
+                arr = mx.array(memoryview(raw), dtype=mx.uint8).reshape(meta["shape"])
+                e8m0_tensors[name] = arr
+            else:
+                remaining_header[name] = meta
+
+    if not e8m0_tensors:
+        # Shouldn't reach here if caller filtered correctly, but fall back anyway.
+        return dict(mx.load(path))
+
+    # Write a scratch safetensors without the F8_E8M0 entries so mx.load works.
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        prefix="mlx_lm_e8m0_", suffix=".safetensors", delete=False
+    ) as tmp:
+        scratch = Path(tmp.name)
+
+    try:
+        # Reassemble the remaining tensors into a new safetensors file.
+        # We only need their bytes; recompute tight offsets starting from 0.
+        new_header = {}
+        if "__metadata__" in remaining_header:
+            new_header["__metadata__"] = remaining_header["__metadata__"]
+        running = 0
+        payloads = []
+        with open(path, "rb") as src:
+            for name, meta in remaining_header.items():
+                if name == "__metadata__":
+                    continue
+                start, end = meta["data_offsets"]
+                src.seek(data_offset + start)
+                blob = src.read(end - start)
+                payloads.append(blob)
+                new_meta = dict(meta)
+                new_meta["data_offsets"] = [running, running + len(blob)]
+                new_header[name] = new_meta
+                running += len(blob)
+
+        new_header_bytes = json.dumps(
+            new_header, separators=(",", ":")
+        ).encode("utf-8")
+        with open(scratch, "wb") as out:
+            out.write(struct.pack("<Q", len(new_header_bytes)))
+            out.write(new_header_bytes)
+            for blob in payloads:
+                out.write(blob)
+
+        merged = dict(mx.load(str(scratch)))
+    finally:
+        try:
+            scratch.unlink()
+        except OSError:
+            pass
+
+    merged.update(e8m0_tensors)
+    return merged
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -578,7 +819,12 @@ def load_model(
     # kept, so an id is not reused by a new array during sanitize.
     sources = {}
     for wf in weight_files:
-        loaded = mx.load(wf)
+        try:
+            loaded = mx.load(wf)
+        except RuntimeError as e:
+            if "F8_E8M0" not in str(e):
+                raise
+            loaded = _load_safetensors_with_e8m0(wf)
         sources.update({id(v): (v, wf, k) for k, v in loaded.items()})
         weights.update(loaded)
 
@@ -619,6 +865,30 @@ def load_model(
     model_args = model_args_class.from_dict(config)
 
     model = model_class(model_args)
+
+    # Transform compressed-tensors weights into MLX-native form before sanitize() so that
+    # per-expert (MoE) tensors are renamed to .weight/.scales(/.biases) and then stacked
+    # correctly. Skip if a model already remapped them itself (no .weight_packed left).
+    if (
+        (qc := config.get("quantization_config"))
+        and isinstance(qc, dict)
+        and qc.get("quant_method") == "compressed-tensors"
+        and any(k.endswith(".weight_packed") for k in weights)
+    ):
+        ct_format = qc.get("format")
+        quantization = None
+        if ct_format == "nvfp4-pack-quantized":
+            weights = _transform_compressed_tensors_nvfp4_weights(weights, qc)
+            quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+        elif ct_format == "pack-quantized":
+            weights, quantization = _transform_compressed_tensors_int4_weights(
+                weights, qc
+            )
+        # Other formats (e.g. mxfp4-pack-quantized) stay with the model's own
+        # sanitize() and _compressed_tensors_quantization below.
+        if quantization is not None:
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
@@ -682,7 +952,9 @@ def load_model(
             from .models.bitlinear_layers import bitnet_quantize
 
             model = bitnet_quantize(model, quantization_config)
-        elif quant_method == "mxfp4":
+        elif (
+            quant_method == "mxfp4" or quantization_config.get("store_dtype") == "mxfp4"
+        ):
             quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             config["quantization"] = quantization
             config["quantization_config"] = quantization

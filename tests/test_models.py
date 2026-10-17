@@ -691,6 +691,47 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(qout)).item())
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
+    def _k2_horizon_args(self, **overrides):
+        from mlx_lm.models import k2_horizon
+
+        config = dict(
+            model_type="k2_horizon",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=1000,
+            rms_norm_eps=1e-6,
+            max_position_embeddings=512,
+            rope_theta=10000.0,
+            num_experts=0,
+            num_experts_per_tok=0,
+            moe_intermediate_size=0,
+            mlp_only_layers=[0, 1, 2, 3],
+            num_shared_experts=0,
+            mova_num_experts=0,
+            mova_num_experts_per_tok=0,
+            attention_bias=False,
+            query_key_norm=False,
+            layernorm_num_groups=1,
+            rope_parameters=None,
+            use_sliding_window=False,
+            tie_word_embeddings=False,
+        )
+        config.update(overrides)
+        return k2_horizon.ModelArgs(**config)
+
+    def test_k2_horizon(self):
+        from mlx_lm.models import k2_horizon
+
+        args = self._k2_horizon_args()
+        model = k2_horizon.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)
@@ -1124,6 +1165,195 @@ class TestModels(unittest.TestCase):
             args.n_layers,
         )
 
+    def test_qwen4_exp_ngram_constants_are_checked(self):
+        """The n-gram hash constants (layer_multipliers and friends) are rebuilt
+        from the config -- the seed is not in config.json -- and the checkpoint
+        carries the reference's copies. A rebuild that disagrees must fail loudly
+        at load, not read the wrong rows of the n-gram table in silence."""
+        from mlx_lm.models import qwen4_exp
+
+        text_config = dict(
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            vocab_size=10_000,
+            rms_norm_eps=1e-6,
+            full_attention_interval=4,
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            shared_expert_intermediate_size=32,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            hc_count=4,
+            hc_lowrank=16,
+            indexer_n_heads=2,
+            indexer_kv_heads=1,
+            indexer_head_dim=16,
+            indexer_budget=8,
+            indexer_compress_ratio=4,
+            ngram_size=3,
+            heads_per_ngram=2,
+            ngram_vocab_size_base=101,
+            split_ngram_parts=4,
+            ple_embed_dim=64,
+            ple_layer_ids=[2],
+            eos_token_id=1,
+            rope_parameters={
+                "rope_theta": 10000000,
+                "partial_rotary_factor": 0.25,
+            },
+        )
+        model = qwen4_exp.Model(
+            qwen4_exp.ModelArgs(model_type="qwen4_exp", text_config=text_config)
+        )
+        weights = dict(tree_flatten(model.parameters()))
+        key = next(k for k in weights if k.endswith("ple_embedding.layer_multipliers"))
+        layer = int(key.split(".layers.")[1].split(".")[0])
+        table = model.model.layers[layer].ple.ple_embedding
+        self.assertTrue(mx.array_equal(weights[key], table._mults))
+        model.sanitize(dict(weights))  # matching constants pass
+
+        # A different seed rebuilds the hash constants, so the checkpoint's copies
+        # no longer match and sanitize must reject them instead of degrading.
+        wrong = qwen4_exp.Model(
+            qwen4_exp.ModelArgs(
+                model_type="qwen4_exp", text_config={**text_config, "seed": 0}
+            )
+        )
+        bad = dict(tree_flatten(wrong.parameters()))
+        self.assertFalse(mx.array_equal(bad[key], weights[key]))
+        with self.assertRaises(ValueError):
+            model.sanitize(bad)
+
+    def test_qwen4_exp(self):
+        from mlx_lm.models import qwen4_exp
+
+        args = qwen4_exp.ModelArgs(
+            model_type="qwen4_exp",
+            text_config=dict(
+                hidden_size=64,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=32,
+                vocab_size=10_000,
+                rms_norm_eps=1e-6,
+                full_attention_interval=4,
+                num_experts=8,
+                num_experts_per_tok=2,
+                moe_intermediate_size=32,
+                shared_expert_intermediate_size=32,
+                linear_num_key_heads=2,
+                linear_num_value_heads=4,
+                linear_key_head_dim=16,
+                linear_value_head_dim=16,
+                linear_conv_kernel_dim=4,
+                hc_count=4,
+                hc_lowrank=16,
+                indexer_n_heads=2,
+                indexer_kv_heads=1,
+                indexer_head_dim=16,
+                indexer_budget=8,
+                indexer_compress_ratio=4,
+                ngram_size=3,
+                heads_per_ngram=2,
+                ngram_vocab_size_base=101,
+                split_ngram_parts=4,
+                ple_embed_dim=64,
+                ple_layer_ids=[2],
+                eos_token_id=1,
+                rope_parameters={
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25,
+                },
+            ),
+        )
+        model = qwen4_exp.Model(args)
+
+        # The n-gram shards load under both names: `shard_{i}` (HF) and
+        # `shards.{i}` (this file, and mlx-vlm conversions).
+        weights = dict(tree_flatten(model.parameters()))
+        shard_keys = [k for k in weights if ".ngram_embedding.shards." in k]
+        self.assertEqual(len(shard_keys), 4)
+        hf = {
+            k.replace(".ngram_embedding.shards.", ".ngram_embedding.shard_"): v
+            for k, v in weights.items()
+        }
+        self.assertEqual(set(model.sanitize(hf)), set(weights))
+        self.assertEqual(set(model.sanitize(weights)), set(weights))
+
+        self.model_test_runner(
+            model, args.model_type, args.text.vocab_size, args.text.num_hidden_layers
+        )
+
+        # A context longer than the indexer budget takes the sparse attention
+        # path, which the generic runner does not reach. The length is not a
+        # multiple of the compression ratio, so the incomplete block at the end
+        # is also covered.
+        cache = make_prompt_cache(model)
+        inputs = mx.array([list(range(2, 24))])
+        outputs = model(inputs, cache=cache)
+        self.assertEqual(outputs.shape, (1, 22, args.text.vocab_size))
+        outputs = model(mx.array([[7]]), cache=cache)
+        self.assertEqual(outputs.shape, (1, 1, args.text.vocab_size))
+
+        # The runner leaves the model in float16, too coarse to compare logits.
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        # The sparse path must stay causal: changing the last token cannot move
+        # the logits of the earlier ones.
+        other = mx.concatenate([inputs[:, :-1], mx.array([[997]])], axis=-1)
+        prefill = model(inputs)
+        self.assertTrue(mx.allclose(prefill[:, :-1], model(other)[:, :-1]))
+
+        # ...and a prefill must match a token by token decoding.
+        cache = make_prompt_cache(model)
+        steps = [model(inputs[:, i : i + 1], cache=cache) for i in range(22)]
+        self.assertTrue(mx.allclose(prefill, mx.concatenate(steps, axis=1), atol=1e-4))
+
+        # Rows of unequal length in one batch: the merge left-pads the short
+        # row, so the sparse index must read its blocks from the first real
+        # token of each row and not from the start of the shared buffer.
+        lengths = [22, 15]
+        rows = [mx.array([list(range(2, 2 + n))]) for n in lengths]
+        per_row = [make_prompt_cache(model) for _ in lengths]
+        for r, c in zip(rows, per_row):
+            model(r, cache=c)
+        batch_cache = [cs[0].merge(list(cs)) for cs in zip(*per_row)]
+
+        step = mx.array([[31], [31]])
+        batched = model(step, cache=batch_cache)
+        solo = [model(step[:1], cache=c) for c in per_row]
+        for i, s in enumerate(solo):
+            self.assertTrue(mx.allclose(batched[i : i + 1], s, atol=1e-4))
+
+        # Same rows through the batch generator path: the prompts are right
+        # padded, then `finalize` turns that padding into left padding.
+        padding = [max(lengths) - n for n in lengths]
+        batch_cache = [
+            cs[0].merge(list(cs))
+            for cs in zip(*[make_prompt_cache(model) for _ in lengths])
+        ]
+        for c in batch_cache:
+            c.prepare(lengths=lengths, right_padding=padding)
+        model(
+            mx.concatenate(
+                [mx.pad(r, [(0, 0), (0, p)]) for r, p in zip(rows, padding)]
+            ),
+            cache=batch_cache,
+        )
+        for c in batch_cache:
+            c.finalize()
+        batched = model(step, cache=batch_cache)
+        for i, s in enumerate(solo):
+            self.assertTrue(mx.allclose(batched[i : i + 1], s, atol=1e-4))
+
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe
 
@@ -1151,6 +1381,148 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_qwen3_moe_rope_scaling(self):
+        # Regression test: qwen3_moe declared rope_scaling but built a plain
+        # nn.RoPE, so YaRN configs were silently ignored. Mirrors the qwen3
+        # (dense) handling, including transformers >= 5 rope_parameters nesting.
+        from mlx_lm.models import qwen3_moe, rope_utils
+
+        config = {
+            "model_type": "qwen3_moe",
+            "hidden_size": 1024,
+            "num_hidden_layers": 4,
+            "intermediate_size": 2048,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "head_dim": 128,
+            "vocab_size": 10_000,
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [],
+            "num_experts_per_tok": 4,
+            "num_experts": 16,
+            "moe_intermediate_size": 1024,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": False,
+            "norm_topk_prob": True,
+            "rope_theta": 1000.0,
+        }
+
+        # No scaling: unchanged behaviour, a plain RoPE.
+        args = qwen3_moe.ModelArgs.from_dict(config)
+        model = qwen3_moe.Model(args)
+        self.assertIsInstance(model.layers[0].self_attn.rope, nn.RoPE)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # Flat rope_scaling (the shape Qwen documents for enabling YaRN) must
+        # reach the rope layer.
+        config["rope_scaling"] = {
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 1024,
+        }
+        args = qwen3_moe.ModelArgs.from_dict(config)
+        model = qwen3_moe.Model(args)
+        self.assertIsInstance(model.layers[0].self_attn.rope, rope_utils.YarnRoPE)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # transformers >= 5 nests rope_theta and rope_scaling under
+        # rope_parameters and drops the flat fields.
+        del config["rope_theta"], config["rope_scaling"]
+        config["rope_parameters"] = {
+            "rope_theta": 1000.0,
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 1024,
+        }
+        args = qwen3_moe.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 1000.0)
+        self.assertEqual(args.rope_scaling, config["rope_parameters"])
+        model = qwen3_moe.Model(args)
+        self.assertIsInstance(model.layers[0].self_attn.rope, rope_utils.YarnRoPE)
+
+        # Flat fields from older configs still take priority.
+        config["rope_theta"] = 2000.0
+        config["rope_scaling"] = {"rope_type": "linear", "factor": 2.0}
+        args = qwen3_moe.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 2000.0)
+        self.assertEqual(args.rope_scaling, config["rope_scaling"])
+
+        # No rope_theta anywhere is an error, not a silent default.
+        del config["rope_theta"], config["rope_scaling"]
+        del config["rope_parameters"]["rope_theta"]
+        with self.assertRaises(ValueError):
+            qwen3_moe.ModelArgs.from_dict(config)
+
+    def test_kolibri1(self):
+        from mlx_lm.models import kolibri1
+
+        args = kolibri1.ModelArgs(
+            model_type="kolibri1",
+            hidden_size=128,
+            num_hidden_layers=5,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            sliding_window=4,
+            layer_types=["sliding_attention"] * 4 + ["full_attention"],
+        )
+        model = kolibri1.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_kolibri1_sanitize_expert_names(self):
+        from mlx_lm.models import kolibri1
+
+        args = kolibri1.ModelArgs(
+            model_type="kolibri1",
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            sliding_window=4,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+        model = kolibri1.Model(args)
+        nn.quantize(model, group_size=64, bits=4)
+        weights = dict(tree_flatten(model.parameters()))
+        inputs = mx.array([[0, 1, 2]])
+        expected = model(inputs)
+
+        # Stacked experts named `experts`, and one entry per expert.
+        stacked = {k.replace("switch_mlp", "experts"): v for k, v in weights.items()}
+        per_expert = {}
+        for k, v in weights.items():
+            if "switch_mlp" in k:
+                for e in range(args.num_experts):
+                    per_expert[k.replace("switch_mlp", f"experts.{e}")] = v[e]
+            else:
+                per_expert[k] = v
+
+        for layout in [weights, stacked, per_expert]:
+            loaded = kolibri1.Model(args)
+            nn.quantize(loaded, group_size=64, bits=4)
+            loaded.load_weights(list(loaded.sanitize(dict(layout)).items()))
+            self.assertTrue(mx.array_equal(loaded(inputs), expected))
 
     def check_moe_sanitize(self, model, num_experts, moe_attr):
         """Expert stacking must not be gated on layer 0 being an MoE layer."""
@@ -1253,6 +1625,129 @@ class TestModels(unittest.TestCase):
         )
         self.check_moe_sanitize(Klear.Model(args), args.num_experts, "experts")
 
+    def ernie4_5_moe_model(self):
+        from mlx_lm.models import ernie4_5_moe
+
+        args = ernie4_5_moe.ModelArgs(
+            hidden_size=8,
+            intermediate_size=8,
+            moe_intermediate_size=8,
+            model_type="ernie4_5_moe",
+            max_position_embeddings=64,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            vocab_size=16,
+            rope_theta=1000.0,
+            use_bias=False,
+            tie_word_embeddings=True,
+            moe_num_experts=4,
+            moe_k=2,
+            moe_layer_start_index=1,
+        )
+        return ernie4_5_moe.Model(args)
+
+    def test_ernie4_5_moe_sanitize_correction_bias(self):
+        model = self.ernie4_5_moe_model()
+        gate = "model.layers.1.mlp.gate.weight"
+        key = "model.layers.1.mlp.moe_statics.e_score_correction_bias"
+        gate_weight = mx.zeros((4, 8))
+
+        # The checkpoint stores the bias as [1, E]. The model expects [E].
+        bias = mx.arange(4, dtype=mx.float32)
+        weights = model.sanitize({gate: gate_weight, key: bias[None]})
+        self.assertEqual(weights[key].shape, (4,))
+        self.assertTrue(mx.array_equal(weights[key], bias))
+        weights = model.sanitize(weights)
+        self.assertTrue(mx.array_equal(weights[key], bias))
+
+        # A MoE layer without a bias gets zeros.
+        weights = model.sanitize({gate: gate_weight})
+        self.assertTrue(mx.array_equal(weights[key], mx.zeros((4,))))
+
+        # Pipeline loading can pass only some layers, or none.
+        self.assertEqual(model.sanitize({}), {})
+        dense = {"model.layers.0.mlp.gate_proj.weight": mx.zeros((8, 8))}
+        self.assertEqual(list(model.sanitize(dense)), list(dense))
+
+        self.assertFalse(model.cast_predicate(key))
+        self.assertTrue(model.cast_predicate(gate))
+
+    def test_ernie4_5_moe_correction_bias_routing(self):
+        model = self.ernie4_5_moe_model()
+        moe = model.layers[1].mlp
+
+        # With x = ones, the logit of expert e is the sum of its gate row.
+        logits = mx.array([2.0, 1.0, 0.99, -3.0])
+        bias = mx.array([0.0, 0.0, 0.05, 0.0])
+        weights = dict(tree_flatten(model.parameters()))
+        weights["model.layers.1.mlp.gate.weight"] = mx.broadcast_to(
+            logits[:, None] / 8, (4, 8)
+        )
+        weights["model.layers.1.mlp.moe_statics.e_score_correction_bias"] = bias[
+            None
+        ].astype(mx.bfloat16)
+        model.load_weights(list(model.sanitize(weights).items()), strict=True)
+        self.assertEqual(moe.moe_statics.e_score_correction_bias.dtype, mx.bfloat16)
+
+        probs = mx.softmax(logits)
+        unbiased = set(mx.argsort(-probs)[:2].tolist())
+        expected = set(mx.argsort(-(probs + bias))[:2].tolist())
+        # The bias must flip a near-tie, otherwise the test checks nothing.
+        self.assertNotEqual(unbiased, expected)
+
+        # Replace the experts with one-hot outputs to read the routing weights.
+        selected = {}
+
+        def switch_mlp(x, inds):
+            selected["inds"] = inds
+            one_hot = (inds[..., None] == mx.arange(4)).astype(mx.float32)
+            return mx.pad(one_hot, [(0, 0), (0, 0), (0, 0), (0, 4)])
+
+        moe.switch_mlp = switch_mlp
+        with mock.patch.object(mx, "argpartition", wraps=mx.argpartition) as argpart:
+            out = moe(mx.ones((1, 1, 8)))
+
+        # A bf16 bias must not lower the precision of the selection scores.
+        self.assertEqual(argpart.call_args.args[0].dtype, mx.float32)
+        self.assertEqual(set(selected["inds"].flatten().tolist()), expected)
+
+        expected_weights = mx.zeros(4)
+        for i in expected:
+            expected_weights[i] = probs[i] / sum(probs[j] for j in expected)
+        self.assertTrue(mx.allclose(out[0, 0, :4], expected_weights, atol=1e-5))
+
+    def test_sarvam_moe(self):
+        from mlx_lm.models import sarvam_moe
+
+        args = sarvam_moe.ModelArgs(
+            model_type="sarvam_moe",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-6,
+            head_dim=256,
+            vocab_size=10_000,
+            num_experts=16,
+            num_shared_experts=1,
+            num_experts_per_tok=4,
+            moe_intermediate_size=512,
+            first_k_dense_replace=1,
+            rope_theta=10000.0,
+            max_position_embeddings=4096,
+            tie_word_embeddings=False,
+            use_qk_norm=True,
+            moe_router_enable_expert_bias=True,
+            routed_scaling_factor=2.5,
+        )
+        model = sarvam_moe.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 
@@ -1326,6 +1821,140 @@ class TestModels(unittest.TestCase):
         del config["rope_parameters"]["rope_theta"]
         with self.assertRaises(ValueError):
             qwen3.ModelArgs.from_dict(config)
+
+    def test_rope_parameters_from_transformers_v5(self):
+        # transformers >= 5 saves rope_theta, rope_scaling and
+        # partial_rotary_factor under rope_parameters, nested by layer type
+        # when sliding and full attention layers use different RoPE. Both
+        # layouts of the same config must build the same model.
+        from mlx_lm.models import exaone4, gemma3_text, granite, llama, phi3
+
+        base = {
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 128,
+        }
+        granite_config = {
+            **base,
+            "model_type": "granite",
+            "num_key_value_heads": 2,
+            "logits_scaling": 1.0,
+            "attention_multiplier": 1.0,
+            "embedding_multiplier": 1.0,
+            "residual_multiplier": 1.0,
+            "max_position_embeddings": 128,
+            "attention_bias": False,
+            "mlp_bias": False,
+        }
+        exaone4_config = {
+            **base,
+            "model_type": "exaone4",
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "head_dim": 16,
+            "tie_word_embeddings": False,
+            "sliding_window": None,
+            "sliding_window_pattern": None,
+        }
+        gemma3_config = {
+            **base,
+            "model_type": "gemma3_text",
+            "head_dim": 16,
+            "num_key_value_heads": 1,
+            "sliding_window": 8,
+            "sliding_window_pattern": 2,
+        }
+        llama3 = {
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 32,
+        }
+        longrope = {
+            "short_factor": [1.0, 1.1, 1.2, 1.3],
+            "long_factor": [2.0, 2.5, 3.0, 4.0],
+        }
+        cases = (
+            (
+                llama,
+                {**base, "model_type": "llama"},
+                {"rope_theta": 500000.0},
+                {"rope_type": "default", "rope_theta": 500000.0},
+            ),
+            (
+                llama,
+                {**base, "model_type": "llama"},
+                {
+                    "rope_theta": 500000.0,
+                    "rope_scaling": {"rope_type": "llama3", **llama3},
+                },
+                {"rope_type": "llama3", "rope_theta": 500000.0, **llama3},
+            ),
+            (
+                granite,
+                granite_config,
+                {"rope_theta": 300000.0},
+                {"rope_type": "default", "rope_theta": 300000.0},
+            ),
+            (
+                exaone4,
+                exaone4_config,
+                {"rope_theta": 1000000.0, "rope_scaling": None},
+                {"rope_type": "default", "rope_theta": 1000000.0},
+            ),
+            (
+                phi3,
+                {**base, "model_type": "phi3"},
+                {
+                    "rope_theta": 250000.0,
+                    "partial_rotary_factor": 0.5,
+                    "original_max_position_embeddings": 32,
+                    "rope_scaling": {"type": "longrope", **longrope},
+                },
+                {
+                    "rope_type": "longrope",
+                    "rope_theta": 250000.0,
+                    "partial_rotary_factor": 0.5,
+                    "original_max_position_embeddings": 32,
+                    **longrope,
+                },
+            ),
+            (
+                gemma3_text,
+                gemma3_config,
+                {
+                    "rope_theta": 500000.0,
+                    "rope_local_base_freq": 20000.0,
+                    "rope_scaling": {"rope_type": "linear", "factor": 8.0},
+                },
+                {
+                    "full_attention": {
+                        "rope_type": "linear",
+                        "factor": 8.0,
+                        "rope_theta": 500000.0,
+                    },
+                    "sliding_attention": {
+                        "rope_type": "default",
+                        "rope_theta": 20000.0,
+                    },
+                },
+            ),
+        )
+        inputs = mx.arange(48)[None]
+        for module, config, flat, rope_parameters in cases:
+            expected = module.Model(module.ModelArgs.from_dict({**config, **flat}))
+            args = module.ModelArgs.from_dict(
+                {**config, "rope_parameters": rope_parameters}
+            )
+            self.assertEqual(args.rope_theta, flat["rope_theta"])
+            model = module.Model(args)
+            model.update(expected.parameters())
+            self.assertTrue(
+                mx.array_equal(model(inputs), expected(inputs)), config["model_type"]
+            )
 
     def test_qwen3_5_family_convert_then_load_norm_not_shift_twice(self):
         text_config = {
@@ -1948,6 +2577,219 @@ class TestModels(unittest.TestCase):
             ],
         )
 
+    def test_plamo3_yarn(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            hidden_size=128,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            sliding_window_pattern=2,
+            rope_scaling_factor=256.0,
+            initial_context_length=4096,
+            max_position_embeddings=262144,
+        )
+        full = plamo3.Attention(args, layer_idx=1)
+        local = plamo3.Attention(args, layer_idx=0)
+
+        dims = args.head_dim
+        freq = args.rope_theta ** (np.arange(0, dims, 2, dtype=np.float32) / dims)
+        low = (
+            dims * math.log(4096 / (32 * 2 * math.pi)) / (2 * math.log(args.rope_theta))
+        )
+        high = dims * math.log(4096 / (2 * math.pi)) / (2 * math.log(args.rope_theta))
+        ramp = np.clip(
+            (np.arange(dims // 2, dtype=np.float32) - low) / (high - low), 0, 1
+        )
+        inv_freq = ((1 - ramp) / freq + ramp / (256 * freq)).astype(np.float32)
+        np.testing.assert_allclose(1 / np.array(full.rope._freqs), inv_freq, rtol=3e-7)
+
+        x = mx.sin(mx.arange(6 * dims, dtype=mx.float32)).reshape(1, 2, 3, dims)
+        x_np = np.array(x)
+        rotated = np.concatenate(
+            (-x_np[..., dims // 2 :], x_np[..., : dims // 2]), axis=-1
+        )
+        for offset in (0, 4096):
+            phase = np.arange(offset, offset + 3, dtype=np.float32)[:, None] * inv_freq
+            phase = np.concatenate((phase, phase), axis=-1)
+            expected = (x_np * np.cos(phase) + rotated * np.sin(phase)) * (
+                1 + 0.1 * math.log(256)
+            )
+            np.testing.assert_allclose(
+                np.array(full.rope(x, offset=offset)), expected, atol=1e-3, rtol=2e-4
+            )
+        expected_local = nn.RoPE(dims, traditional=False, base=args.rope_local_theta)
+        self.assertTrue(mx.array_equal(local.rope(x), expected_local(x)))
+
+        with self.assertRaisesRegex(ValueError, "initial_context_length"):
+            plamo3.ModelArgs(rope_scaling_factor=256)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Metal is required")
+    def test_plamo3_fused_qk_norm_rope(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=128,
+            sliding_window_pattern=2,
+            rope_scaling_factor=256,
+            initial_context_length=4096,
+        )
+        mx.random.seed(0)
+        for dtype in (mx.float32, mx.float16, mx.bfloat16):
+            for layer_idx in (0, 1):
+                attention = plamo3.Attention(args, layer_idx)
+                attention.q_norm.weight = mx.random.normal((128,)) * 0.2
+                attention.k_norm.weight = mx.random.normal((128,)) * 0.2
+                attention.set_dtype(dtype)
+                attention.eval()
+                qkv = mx.random.normal((1, 1, 6 * 128)).astype(dtype)
+                q, k, _ = mx.split(qkv, [4 * 128, 5 * 128], axis=-1)
+                q = q.reshape(1, 4, 1, 128)
+                k = k.reshape(1, 1, 1, 128)
+                for offset in (0, 9, 2048, 4096, 262143):
+                    actual = plamo3._qk_norm_rope_kernel(
+                        inputs=[
+                            qkv,
+                            attention.q_norm.scale,
+                            attention.k_norm.scale,
+                            attention._rope_freqs,
+                            mx.array(offset),
+                            attention._norm_eps,
+                            attention._rope_mscale,
+                            attention._rope_base,
+                        ],
+                        template=[("T", dtype), ("NQ", 4), ("YARN", attention._yarn)],
+                        grid=(32 * 5, 1, 1),
+                        threadgroup=(32, 1, 1),
+                        output_shapes=[q.shape, k.shape],
+                        output_dtypes=[dtype, dtype],
+                    )
+                    expected = [
+                        attention.rope(attention.q_norm(q), offset=offset),
+                        attention.rope(attention.k_norm(k), offset=offset),
+                    ]
+                    for a, b in zip(actual, expected):
+                        self.assertTrue(
+                            mx.array_equal(a, b), (dtype, layer_idx, offset)
+                        )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Metal is required")
+    def test_plamo3_fused_residual_norm(self):
+        from mlx_lm.models import plamo3
+
+        mx.random.seed(0)
+        for dims in (128, 1536, 4096):
+            for dtype in (mx.float32, mx.float16, mx.bfloat16):
+                x = mx.random.normal((1, 1, dims)).astype(dtype)
+                residual = mx.random.normal(x.shape).astype(dtype)
+                post = mx.random.uniform(0.1, 0.3, (dims,)).astype(dtype)
+                pre = mx.random.uniform(0.8, 1.2, (dims,)).astype(dtype)
+                h = residual + mx.fast.rms_norm(x, post, 1e-6)
+                normalized = mx.fast.rms_norm(h, pre, 1e-6)
+                actual = plamo3._residual_norm_kernel(
+                    inputs=[x, residual, post, pre, mx.array(1e-6)],
+                    template=[("T", dtype), ("D", dims)],
+                    grid=(dims // 4, 1, 1),
+                    threadgroup=(dims // 4, 1, 1),
+                    output_shapes=[x.shape, x.shape],
+                    output_dtypes=[dtype, dtype],
+                )
+                for a, b in zip(actual, (h, normalized)):
+                    self.assertTrue(mx.array_equal(a, b), (dims, dtype))
+
+    def test_plamo3_fused_attention_fallback(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=128,
+            sliding_window_pattern=2,
+            rope_scaling_factor=256,
+            initial_context_length=4096,
+        )
+        for layer_idx in (0, 1):
+            attention = plamo3.Attention(args, layer_idx)
+            attention.eval()
+            cache = KVCache()
+            mx.eval(attention(mx.random.normal((1, 7, 64)), mask="causal", cache=cache))
+            baseline_cache = copy.deepcopy(cache)
+            x = mx.random.normal((1, 1, 64))
+            actual = attention(x, cache=cache)
+            with mock.patch.object(plamo3, "_qk_norm_rope_kernel", None):
+                expected = attention(x, cache=baseline_cache)
+            self.assertTrue(mx.array_equal(actual, expected))
+            attention.train()
+            # Several rows: MLX's single-query SDPA kernels have no VJP.
+            x = mx.random.normal((1, 64, 64))
+            grad = mx.grad(lambda x: attention(x).sum())(x)
+            self.assertTrue(mx.all(mx.isfinite(grad)))
+
+    def test_plamo3_sliding_window_cache_equivalence(self):
+        from mlx_lm.models import plamo3
+
+        for factor in (None, 1.0, 256.0):
+            with self.subTest(factor=factor):
+                args = plamo3.ModelArgs(
+                    hidden_size=64,
+                    intermediate_size=128,
+                    num_hidden_layers=2,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    head_dim=32,
+                    vocab_size=100,
+                    window_size=8,
+                    sliding_window_pattern=2,
+                    rope_scaling_factor=factor,
+                    initial_context_length=4096 if factor == 256 else None,
+                    tie_word_embeddings=False,
+                )
+                model = plamo3.Model(args)
+                model.eval()
+                window_size = 9 if factor is None else 8
+                self.assertEqual(model.make_cache()[0].max_size, window_size)
+                mask = model.make_cache()[0].make_mask(10, return_array=True)
+                self.assertEqual(int(mask[-1].sum()), window_size)
+                tokens = mx.random.randint(0, args.vocab_size, (1, 23))
+                expected = model(tokens)
+                for chunks in ([1] * 23, [7, 1, 6, 9], [11, 12]):
+                    cache = model.make_cache()
+                    outputs = []
+                    offset = 0
+                    for size in chunks:
+                        outputs.append(
+                            model(tokens[:, offset : offset + size], cache=cache)
+                        )
+                        offset += size
+                    actual = mx.concatenate(outputs, axis=1)
+                    self.assertTrue(mx.allclose(actual, expected, atol=2e-5, rtol=2e-5))
+
+    def test_plamo3_scaled_embeddings(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=100,
+            sliding_window_pattern=2,
+            scale_embedding=True,
+        )
+        model = plamo3.Model(args)
+        tokens = mx.array([[1, 2, 3]])
+        embeddings = model.model.embed_tokens(tokens) * args.hidden_size**0.5
+        self.assertTrue(
+            mx.array_equal(model(tokens), model(tokens, input_embeddings=embeddings))
+        )
+
     def test_stablelm(self):
         from mlx_lm.models import stablelm
 
@@ -2140,6 +2982,111 @@ class TestModels(unittest.TestCase):
         self.assertEqual(caches[3].size(), 6)
         self.assertEqual(caches[4].size(), args.sliding_window)
 
+    def test_step3p7(self):
+        from mlx_lm.models import step3p7
+
+        text_config = dict(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=4,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=[10000.0, 10000.0, 10000.0, 10000.0],
+            sliding_window=64,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            partial_rotary_factors=[0.5, 1.0, 1.0, 0.5],
+            attention_other_setting={
+                "num_attention_heads": 8,
+                "num_attention_groups": 2,
+            },
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3",
+        )
+        args = step3p7.ModelArgs(model_type="step3p7", text_config=text_config)
+        model = step3p7.Model(args)
+        self.assertIsInstance(model.make_cache()[1], RotatingKVCache)
+        self.model_test_runner(
+            model,
+            args.model_type,
+            text_config["vocab_size"],
+            text_config["num_hidden_layers"],
+        )
+
+    def test_step3p7_sanitize_drops_vision_and_nests_text(self):
+        from mlx_lm.models import step3p7
+
+        text_config = dict(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=4,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            sliding_window=64,
+            partial_rotary_factors=[1.0] * 4,
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3",
+        )
+        args = step3p7.ModelArgs(model_type="step3p7", text_config=text_config)
+        model = step3p7.Model(args)
+
+        weights = {
+            "vision_model.conv1.weight": mx.zeros((4, 4)),
+            "vision_model.transformer.resblocks.0.ln_1.weight": mx.zeros((4,)),
+            "vit_large_projector.weight": mx.zeros((4, 4)),
+            "model.embed_tokens.weight": mx.zeros((1024, 256)),
+            "lm_head.weight": mx.zeros((1024, 256)),
+            "model.norm.weight": mx.ones((256,)),
+            "model.layers.0.self_attn.q_proj.weight": mx.zeros((256, 256)),
+            "model.layers.0.self_attn.q_norm.weight": mx.zeros((64,)),
+            "model.layers.1.moe.gate.weight": mx.zeros((4, 256)),
+            "model.layers.1.moe.router_bias": mx.zeros((4,)),
+            "model.layers.1.moe.gate_proj.weight": mx.zeros((4, 256, 256)),
+            "model.layers.4.enorm.weight": mx.zeros((256,)),
+            "model.layers.4.self_attn.q_proj.weight": mx.zeros((256, 256)),
+        }
+
+        out = model.sanitize(weights)
+
+        self.assertFalse(any(k.startswith("vision_model") for k in out))
+        self.assertFalse(any("vit_large_projector" in k for k in out))
+        self.assertFalse(any("layers.4." in k for k in out))
+
+        self.assertTrue(all(k.startswith("language_model.") for k in out))
+        self.assertIn("language_model.lm_head.weight", out)
+        self.assertIn("language_model.model.embed_tokens.weight", out)
+
+        self.assertIn(
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight", out
+        )
+        self.assertIn("language_model.model.layers.1.mlp.gate.gate.weight", out)
+        self.assertIn("language_model.model.layers.1.mlp.gate.router_bias", out)
+
+        self.assertTrue(
+            mx.allclose(out["language_model.model.norm.weight"], mx.full((256,), 2.0))
+        )
+
     def test_cohere(self):
         from mlx_lm.models import cohere
 
@@ -2147,6 +3094,32 @@ class TestModels(unittest.TestCase):
             model_type="cohere",
         )
         model = cohere.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_cohere2_moe(self):
+        from mlx_lm.models import cohere2_moe
+
+        args = cohere2_moe.ModelArgs(
+            model_type="cohere2_moe",
+            hidden_size=64,
+            head_dim=16,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            sliding_window=4,
+            sliding_window_pattern=3,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_num_shared_experts=0,
+            first_k_dense_replace=1,
+            prefix_dense_intermediate_size=96,
+            rms_norm_eps=1e-5,
+        )
+        model = cohere2_moe.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -2300,6 +3273,37 @@ class TestModels(unittest.TestCase):
             vocab_size=10000,
         )
         model = falcon_h1.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_g9v3(self):
+        from mlx_lm.models import g9v3
+
+        args = g9v3.ModelArgs(
+            model_type="g9v3",
+            vocab_size=130560,
+            hidden_size=2048,
+            num_attention_heads=32,
+            head_dim=128,
+            num_key_value_heads=2,
+            use_gated_attention=False,
+            rope_theta=5000000,
+            rope_scaling=None,
+            first_k_dense_replace=1,
+            intermediate_size=8192,
+            n_routed_experts=320,
+            num_experts_per_tok=32,
+            routed_scaling_factor=3.66,
+            n_group=1,
+            topk_group=1,
+            norm_topk_prob=True,
+            moe_intermediate_size=512,
+            n_shared_experts=1,
+            rms_norm_eps=1e-06,
+            num_hidden_layers=38,
+        )
+        model = g9v3.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -2694,6 +3698,294 @@ class TestModels(unittest.TestCase):
             self.assertEqual(w.shape, shape)
             self.assertEqual(w.reshape(-1)[0].item(), value)
 
+    def test_deepseek_v32_indexer_keeps_attention_sinks(self):
+        # Regression test for #1443: once a sequence exceeds `index_topk`, the
+        # Indexer's learned top-k selection must never let the first few key
+        # positions (attention sinks) drop out, or sparse decoding collapses.
+        from mlx_lm.models import deepseek_v32
+
+        mx.random.seed(0)
+
+        args = deepseek_v32.ModelArgs(
+            model_type="deepseek_v32",
+            hidden_size=32,
+            index_head_dim=8,
+            index_n_heads=2,
+            index_topk=200,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+        )
+        indexer = deepseek_v32.Indexer(args)
+
+        b, s_total = 1, 400
+        x = mx.random.normal((b, s_total, args.hidden_size)) * 0.05
+        # A "distractor" block outside both the sink zone (0..3) and the local
+        # recency window competes for the ranking on raw score alone.
+        x = mx.concatenate([x[:, :50], x[:, 50:150] * 20.0, x[:, 150:]], axis=1)
+        qr = mx.random.normal((b, s_total, args.q_lora_rank))
+        mask = mx.tril(mx.ones((s_total, s_total), dtype=mx.bool_))
+
+        topk_indices = indexer(x, qr, mask, cache=None)
+        self.assertIsNotNone(topk_indices)
+
+        last_row = set(topk_indices[0, 0, -1].tolist())
+        self.assertEqual(last_row & set(range(4)), set(range(4)))
+
+    def test_deepseek_v32_indexer_keeps_padded_batch_sinks(self):
+        # Under BatchKVCache, offset/left_padding are per-sequence arrays, not
+        # a python scalar, and "sink" means the first real tokens of each
+        # sequence rather than buffer column 0 once left-padding shifts them.
+        from mlx_lm.models import deepseek_v32
+        from mlx_lm.models.base import create_causal_mask
+        from mlx_lm.models.cache import BatchKVCache
+
+        mx.random.seed(0)
+
+        args = deepseek_v32.ModelArgs(
+            model_type="deepseek_v32",
+            hidden_size=32,
+            index_head_dim=8,
+            index_n_heads=2,
+            index_topk=200,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+        )
+        indexer = deepseek_v32.Indexer(args)
+
+        b, s_total = 2, 400
+        left_padding = [0, 30]
+        x = mx.random.normal((b, s_total, args.hidden_size)) * 0.05
+        x = mx.concatenate([x[:, :50], x[:, 50:150] * 20.0, x[:, 150:]], axis=1)
+        qr = mx.random.normal((b, s_total, args.q_lora_rank))
+        mask = create_causal_mask(s_total, left_padding=mx.array(left_padding))
+
+        cache = BatchKVCache(left_padding)
+        topk_indices = indexer(x, qr, mask, cache=cache)
+        self.assertEqual(topk_indices.shape[0], b)
+
+        for i, pad in enumerate(left_padding):
+            real_sinks = set(range(pad, pad + 4))
+            last_row = set(topk_indices[i, 0, -1].tolist())
+            self.assertEqual(last_row & real_sinks, real_sinks)
+
+    def test_deepseek_v4_rope_inverse(self):
+        import math as _math
+
+        from mlx_lm.models.deepseek_v4 import DeepseekV4RoPE
+
+        scaling = {
+            "type": "yarn",
+            "factor": 16,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        }
+        rope = DeepseekV4RoPE(8, 160000, scaling)
+        x = mx.random.uniform(shape=(1, 2, 4, 8))
+        y = rope(x, offset=3)
+        z = rope(y, offset=3, inverse=True)
+        self.assertTrue(mx.allclose(x, z, rtol=1e-5, atol=1e-5))
+
+    def test_deepseek_v4_sinkhorn(self):
+        from mlx_lm.models.deepseek_v4 import hc_split_sinkhorn
+
+        hc = 4
+        n = 16
+        mix_hc = (2 + hc) * hc
+        mixes = mx.random.normal(shape=(n, mix_hc))
+        hc_scale = mx.ones((3,)) * 0.1
+        hc_base = mx.zeros((mix_hc,))
+        _pre, _post, comb = hc_split_sinkhorn(
+            mixes, hc_scale, hc_base, hc, 20, 1e-6
+        )
+        row_sums = comb.sum(axis=-1)
+        col_sums = comb.sum(axis=-2)
+        self.assertTrue(mx.all(mx.abs(row_sums - 1.0) < 1e-3))
+        self.assertTrue(mx.all(mx.abs(col_sums - 1.0) < 1e-3))
+
+    def test_deepseek_v4(self):
+        from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.cache import RotatingKVCache
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=64,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=32,
+            o_groups=2,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=8,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=4,
+            moe_intermediate_size=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=4,
+            max_position_embeddings=256,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 128,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        self.assertEqual(len(model.layers), args.num_hidden_layers)
+        self.assertEqual(model.model_type, args.model_type)
+
+        caches = model.make_cache()
+        from mlx_lm.models.cache import ArraysCache, CacheList
+        self.assertIsInstance(caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[1], RotatingKVCache)
+        self.assertIsInstance(caches[2], CacheList)
+        self.assertIsInstance(caches[2].caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[2].caches[1], ArraysCache)
+        self.assertIsInstance(caches[3], RotatingKVCache)
+
+        # Prefill-only path (no cache)
+        # Prefill length deliberately exceeds ``sliding_window=8`` so the
+        # RotatingKVCache's post-wrap / ring-buffer path, the compressed-KV
+        # buffer growth, and the stored-window-len > config-window case are
+        # all covered. Previous test used 7 tokens (< window) and missed an
+        # entire class of mask-size bugs.
+        inputs = mx.array(
+            [[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3]], dtype=mx.int32
+        )
+        out = model(inputs)
+        self.assertEqual(out.shape, (1, inputs.shape[1], args.vocab_size))
+
+        # Stepped-decode with cache matches one-shot prefill on the last token.
+        caches = model.make_cache()
+        last = None
+        for i in range(inputs.shape[1]):
+            last = model(inputs[:, i : i + 1], cache=caches)
+        diff = mx.max(mx.abs(out[0, -1] - last[0, -1])).item()
+        self.assertLess(diff, 1e-3)
+
+    def test_deepseek_v4_hash_gate(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=8,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=32,
+            o_groups=1,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=4,
+            compress_ratios=[0],
+            index_n_heads=2,
+            index_head_dim=32,
+            index_topk=2,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=16,
+            rope_scaling=None,
+        )
+        gate = deepseek_v4.MoEGate(args, layer_id=0)
+        # Force a known tid2eid table
+        table = mx.array(
+            [
+                [0, 1],
+                [1, 2],
+                [2, 3],
+                [3, 0],
+                [0, 2],
+                [1, 3],
+                [2, 0],
+                [3, 1],
+            ],
+            dtype=mx.int32,
+        )
+        gate.tid2eid = table
+        x = mx.random.normal(shape=(1, 4, args.hidden_size))
+        input_ids = mx.array([[0, 3, 5, 7]], dtype=mx.int32)
+        inds, _ = gate(x, input_ids)
+        inds = inds.reshape(-1, args.num_experts_per_tok)
+        expected = mx.stack([table[0], table[3], table[5], table[7]])
+        self.assertTrue(mx.all(inds == expected))
+
+    def test_glm_moe_dsa(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        args = glm_moe_dsa.ModelArgs(
+            model_type="glm_moe_dsa",
+            vocab_size=1024,
+            hidden_size=128,
+            index_head_dim=16,
+            index_n_heads=4,
+            index_topk=4,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_theta": 10000.0},
+            attention_bias=False,
+            index_topk_pattern="FSFSFS",
+        )
+        self.assertEqual(
+            args.indexer_types,
+            ["full", "shared", "full", "shared", "full", "shared"],
+        )
+        model = glm_moe_dsa.Model(args)
+
+        has_indexer = [l.self_attn.indexer is not None for l in model.model.layers]
+        self.assertEqual(has_indexer, [True, False, True, False, True, False])
+
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        cache = make_prompt_cache(model)
+        logits = model(prompt, cache=cache)
+        self.assertEqual(logits.shape, (1, 8, args.vocab_size))
+        nxt = mx.argmax(logits[0, -1:, :], keepdims=True)
+        logits = model(nxt, cache=cache)
+        self.assertEqual(logits.shape, (1, 1, args.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+        mx.eval([c.state for c in cache])
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
@@ -2712,6 +4004,48 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_gemma2_grouped_query_batched_mask(self):
+        # Under GQA, gemma2 makes 5-D scores but the mask stays 4-D.
+        # test_gemma2 has repeats == 1, so it does not use this path.
+        from mlx_lm.models import gemma2
+
+        args = gemma2.ModelArgs(
+            model_type="gemma2",
+            hidden_size=128,
+            num_hidden_layers=2,
+            intermediate_size=256,
+            num_attention_heads=8,
+            head_dim=16,
+            rms_norm_eps=1e-4,
+            vocab_size=128,
+            num_key_value_heads=4,   # repeats == 2
+        )
+        model = gemma2.Model(args)
+        mx.eval(model.parameters())
+
+        # A batch of n_kv_heads broadcasts without an error, but masks the
+        # wrong axis. Other batch sizes raise.
+        left_padding = [3, 1, 2, 0]
+        B, L = len(left_padding), 6
+        tokens = mx.broadcast_to(mx.arange(1, L + 1, dtype=mx.int32), (B, L))
+
+        batched = model(tokens, cache=[
+            BatchKVCache(left_padding) for _ in range(args.num_hidden_layers)
+        ])
+        mx.eval(batched)
+        self.assertEqual(batched.shape, (B, L, args.vocab_size))
+
+        # Each row on its own, with its padding dropped, is the reference.
+        for i, pad in enumerate(left_padding):
+            ref = model(tokens[i : i + 1, pad:], cache=[
+                KVCache() for _ in range(args.num_hidden_layers)
+            ])
+            mx.eval(ref)
+            self.assertTrue(
+                mx.allclose(batched[i, pad:], ref[0], atol=1e-4),
+                f"row {i} (left_padding={pad}) differs from the unbatched result",
+            )
 
     def test_gemma3_text(self):
         from mlx_lm.models import gemma3_text
@@ -3655,8 +4989,108 @@ class TestModels(unittest.TestCase):
         inputs = mx.array([[0, 1, 2, 3, 4, 5]])
         self.assertTrue(mx.allclose(model(inputs), scaled(inputs)))
 
+    def test_nemotron_labs_diffusion(self):
+        from mlx_lm.models import nemotron_labs_diffusion
+
+        args = nemotron_labs_diffusion.ModelArgs(
+            model_type="nemotron_labs_diffusion",
+            vocab_size=100,
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            tie_word_embeddings=False,
+            rope_parameters={
+                "rope_theta": 10000.0,
+                "llama_4_scaling_beta": 0.5,
+                "original_max_position_embeddings": 512,
+            },
+        )
+        model = nemotron_labs_diffusion.Model(args)
+        self.assertFalse(args.tie_word_embeddings)
+        self.assertIsNot(model.model.embed_tokens.weight, model.lm_head.weight)
+
+        reference = dict(tree_flatten(model.parameters()))
+
+        def check(weights):
+            m = nemotron_labs_diffusion.Model(args)
+            m.load_weights(list(m.sanitize(weights).items()), strict=True)
+            out = m(mx.array([[0, 1, 2]]))
+            self.assertEqual(out.shape, (1, 3, args.vocab_size))
+
+        # Native layout loads unchanged
+        check(dict(reference))
+
+        # NLD checkpoint layout: encoder.* backbone and diffusion_head.*
+        nld_raw = {}
+        for k, v in reference.items():
+            if k.startswith("model."):
+                nld_raw["encoder." + k[len("model.") :]] = v
+            elif k.startswith("lm_head."):
+                nld_raw["diffusion_head." + k[len("lm_head.") :]] = v
+            else:
+                nld_raw[k] = v
+        check(nld_raw)
+
+        # Community repack layout: language_model.* prefix
+        check({f"language_model.{k}": v for k, v in reference.items()})
+
     def test_all_models(self):
         test_configs = [
+            {
+                "model_type": "nemotron_labs_diffusion",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-5,
+                "max_position_embeddings": 512,
+                "tie_word_embeddings": False,
+                "rope_parameters": {
+                    "rope_theta": 10000.0,
+                    "llama_4_scaling_beta": 0.5,
+                    "original_max_position_embeddings": 512,
+                },
+            },
+            {
+                "model_type": "mimo_v2",
+                "vocab_size": 1000,
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "moe_intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 96,
+                "v_head_dim": 64,
+                "swa_num_attention_heads": 4,
+                "swa_num_key_value_heads": 2,
+                "swa_head_dim": 96,
+                "swa_v_head_dim": 64,
+                "swa_rope_theta": 1000.0,
+                "sliding_window_size": 32,
+                "add_full_attention_sink_bias": False,
+                "add_swa_attention_sink_bias": True,
+                "hybrid_layer_pattern": [0, 1, 1, 0],
+                "moe_layer_freq": [0, 1, 1, 1],
+                "n_routed_experts": 8,
+                "num_experts_per_tok": 2,
+                "n_group": 1,
+                "topk_group": 1,
+                "norm_topk_prob": True,
+                "topk_method": "noaux_tc",
+                "partial_rotary_factor": 0.334,
+                "attention_bias": False,
+                "attention_value_scale": 0.707,
+                "layernorm_epsilon": 1e-5,
+                "max_position_embeddings": 1000,
+                "rope_theta": 1000.0,
+            },
             {
                 "model_type": "afm7",
                 "vocab_size": 1000,
@@ -4160,6 +5594,45 @@ class TestModels(unittest.TestCase):
                 "attention_bias": False,
             },
             {
+                "model_type": "longcat2",
+                "attention_method": "MLA",
+                "zero_expert_type": "identity",
+                "hidden_size": 128,
+                "ffn_hidden_size": 128,
+                "moe_topk": 2,
+                "expert_ffn_hidden_size": 128,
+                "n_routed_experts": 2,
+                "zero_expert_num": 2,
+                "num_layers": 4,
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+                "max_position_embeddings": 1000,
+                "num_attention_heads": 4,
+                "kv_lora_rank": 16,
+                "q_lora_rank": 16,
+                "qk_rope_head_dim": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 8,
+                "routed_scaling_factor": 1.0,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "mla_scale_q_lora": True,
+                "mla_scale_kv_lora": True,
+                "attention_bias": False,
+                "use_longcat_dsa": True,
+                "index_head_dim": 8,
+                "index_n_heads": 2,
+                "index_topk": 4,
+                "index_init_tokens": 1,
+                "index_local_tokens": 2,
+                "index_k_norm_type": "rms",
+                "cli_factor": 2,
+                "oe_vocab_size_ratio": 2.5,
+                "oe_neighbor_num": 5,
+                "oe_split_num": 4,
+                "eos_token_id": 2,
+            },
+            {
                 "model_type": "mimo",
                 "hidden_size": 128,
                 "num_hidden_layers": 4,
@@ -4285,6 +5758,28 @@ class TestModels(unittest.TestCase):
                 },
                 "num_hidden_layers": 4,
                 "vocab_size": 1000,
+            },
+            {
+                "model_type": "sarvam_moe",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-6,
+                "head_dim": 32,
+                "vocab_size": 1000,
+                "num_experts": 4,
+                "num_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 64,
+                "first_k_dense_replace": 1,
+                "rope_theta": 1000.0,
+                "max_position_embeddings": 1000,
+                "tie_word_embeddings": False,
+                "use_qk_norm": True,
+                "moe_router_enable_expert_bias": True,
+                "routed_scaling_factor": 2.5,
             },
             {
                 "model_type": "seed_oss",
@@ -4434,6 +5929,26 @@ class TestModels(unittest.TestCase):
                 "num_experts": 4,
                 "num_experts_per_tok": 2,
                 "rms_norm_eps": 1e-5,
+                "max_position_embeddings": 1000,
+                "vocab_size": 1000,
+            },
+            {
+                "model_type": "zamba2",
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "mamba_d_conv": 4,
+                "mamba_d_state": 16,
+                "mamba_expand": 2,
+                "n_mamba_heads": 8,
+                "mamba_ngroups": 1,
+                "hybrid_layer_ids": [2, 5],
+                "adapter_rank": 32,
+                "num_mem_blocks": 2,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
                 "max_position_embeddings": 1000,
                 "vocab_size": 1000,
             },
@@ -4851,6 +6366,32 @@ class TestModels(unittest.TestCase):
                     "full_attention",
                 ],
             },
+            {
+                # full_attention_interval == num_hidden_layers exercises both
+                # a GDN (linear) cache and a KV cache in one forward.
+                "model_type": "interns2_mobius",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 8,
+                "num_experts_per_tok": 4,
+                "num_blocks": 2,
+                "moe_intermediate_size": 32,
+                "shared_expert_intermediate_size": 32,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 1000,
+                "rope_theta": 1e7,
+                "partial_rotary_factor": 0.25,
+                "max_position_embeddings": 1000,
+                "full_attention_interval": 4,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
@@ -4993,6 +6534,31 @@ class TestModels(unittest.TestCase):
         step = mx.concatenate(step, axis=1)
 
         self.assertTrue(mx.allclose(full, step, atol=1e-3, rtol=1e-3))
+
+    def test_interns2_mobius_router_topk(self):
+        from mlx_lm.models.interns2_mobius import router_topk
+
+        k = 4
+        for rows, n in [(1, 8), (16, 32), (128, 64)]:
+            logits = mx.random.normal(shape=(rows, n))
+            # Duplicate the first columns so tied logits exercise the tie-break.
+            logits = mx.concatenate([logits, logits[:, :4]], axis=-1)
+
+            k_inds, k_scores = router_topk(logits, k, use_kernel=True)
+            o_inds, o_scores = router_topk(logits, k, use_kernel=False)
+
+            # A tie straddling the k-boundary is picked either way (both are
+            # correct), so the index sets can differ; the selected *logit
+            # values* and their softmax weights are the invariant.
+            k_vals = mx.sort(mx.take_along_axis(logits, k_inds, axis=-1), axis=-1)
+            o_vals = mx.sort(mx.take_along_axis(logits, o_inds, axis=-1), axis=-1)
+            self.assertTrue(mx.allclose(k_vals, o_vals, atol=1e-6))
+            self.assertTrue(
+                mx.allclose(
+                    mx.sort(k_scores, axis=-1), mx.sort(o_scores, axis=-1), atol=1e-6
+                )
+            )
+            self.assertEqual(k_inds.dtype, mx.uint32)
 
     def test_ssm(self):
         # On the GPU, so the fused kernel is what's checked (on the CPU
@@ -5403,6 +6969,278 @@ class TestModels(unittest.TestCase):
         from_chunked = model(last, cache=chunked_cache)
         from_oneshot = model(last, cache=oneshot_cache)
         self.assertTrue(mx.allclose(from_chunked, from_oneshot, rtol=1e-4, atol=1e-4))
+
+    def encoder_model_test_runner(self, model, model_type, vocab_size, num_layers):
+        self.assertEqual(len(model.layers), num_layers)
+        self.assertEqual(model.model_type, model_type)
+
+        for t in [mx.float32, mx.float16]:
+            model.update(tree_map(lambda p: p.astype(t), model.parameters()))
+
+            inputs = mx.array([[0, 5, 6, 2]])
+            outputs = model(inputs)
+            self.assertEqual(outputs.shape, (1, 4, vocab_size))
+            self.assertEqual(outputs.dtype, t)
+
+            out = model.encode(inputs, output_hidden_states=True)
+            self.assertEqual(out.hidden_states.shape[0], num_layers + 1)
+            self.assertEqual(out.last_hidden_state.dtype, t)
+
+        outputs = model(mx.array([[0, 5, 6, 2], [0, 7, 8, 2]]))
+        self.assertEqual(outputs.shape, (2, 4, vocab_size))
+
+        copy.deepcopy(model)
+
+    def test_esmc(self):
+        from mlx_lm.models import esmc
+
+        args = esmc.ModelArgs(
+            model_type="esmc",
+            vocab_size=64,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+        )
+        model = esmc.Model(args)
+        self.encoder_model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # Pre-alignment field names, still carried by published checkpoints.
+        legacy = esmc.ModelArgs.from_dict({"d_model": 64, "n_heads": 4, "n_layers": 4})
+        self.assertEqual(legacy.hidden_size, args.hidden_size)
+        self.assertEqual(legacy.ffn_hidden, args.ffn_hidden)
+        self.assertEqual(esmc.ModelArgs(intermediate_size=128).ffn_hidden, 128)
+
+        ids, mask = esmc.batch_encode(["AC", "A"])
+        self.assertEqual(ids.tolist(), [[0, 5, 23, 2], [0, 5, 2, esmc.PAD_ID]])
+        self.assertEqual(mask.tolist(), [[1, 1, 1, 1], [1, 1, 1, 0]])
+
+        # Published "port" layout, with q/k/v and gate/up fused along dim 0.
+        named = model.sanitize(
+            {
+                "esmc.embed_tokens.weight": mx.zeros((1, 2)),
+                "esmc.norm.weight": mx.zeros((2,)),
+                "esmc.layers.0.input_layernorm.bias": mx.zeros((2,)),
+                "esmc.layers.0.post_attention_layernorm.bias": mx.zeros((2,)),
+                "esmc.layers.0.self_attn.q_norm.weight": mx.zeros((2,)),
+                "esmc.layers.0.self_attn.k_norm.weight": mx.zeros((2,)),
+                "esmc.layers.0.self_attn.o_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.self_attn.q_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.self_attn.k_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.self_attn.v_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.mlp.gate_proj.weight": mx.zeros((3, 2)),
+                "esmc.layers.0.mlp.up_proj.weight": mx.zeros((3, 2)),
+                "esmc.layers.0.mlp.down_proj.weight": mx.zeros((2, 3)),
+                "lm_head.dense.bias": mx.zeros((2,)),
+                "lm_head.layer_norm.bias": mx.zeros((2,)),
+                "lm_head.decoder.bias": mx.zeros((1,)),
+            }
+        )
+        b = "esmc.transformer.blocks.0."
+        self.assertEqual(
+            sorted(named),
+            sorted(
+                ["esmc.embed.weight", "esmc.transformer.norm.weight"]
+                + [f"lm_head.{i}.bias" for i in (0, 2, 3)]
+                + [
+                    b + k
+                    for k in (
+                        "attn.ln_qkv.bias",
+                        "ffn.ln.bias",
+                        "attn.q_ln.weight",
+                        "attn.k_ln.weight",
+                        "attn.out_proj.weight",
+                        "attn.qkv.weight",
+                        "ffn.fc1.weight",
+                        "ffn.fc2.weight",
+                    )
+                ]
+            ),
+        )
+        self.assertEqual(named[b + "attn.qkv.weight"].shape, (6, 2))
+        self.assertEqual(named[b + "ffn.fc1.weight"].shape, (6, 2))
+
+    def test_esmc_sae(self):
+        from mlx_lm.models import esmc, esmc_sae
+
+        sae = esmc_sae.SaeLayer(d_model=64, codebook_dim=128, k=4, layer=2)
+        sae.W_enc = mx.random.normal((64, 128))
+        sae.W_dec = mx.random.normal((128, 64))
+
+        features = sae(mx.random.normal((2, 5, 64)))
+        self.assertEqual(features.shape, (2, 5, 128))
+        self.assertTrue(mx.all(mx.sum(features > 0, axis=-1) <= sae.k))
+        self.assertEqual(sae.reconstruct(features).shape, (2, 5, 64))
+
+        model = esmc.Model(
+            esmc.ModelArgs(hidden_size=64, num_attention_heads=4, num_hidden_layers=4)
+        )
+        model.add_sae_layers([sae])
+        out = model.encode(mx.array([[0, 5, 6, 2]]))
+        self.assertEqual(out.sae_outputs[2].shape, (1, 4, 128))
+        # Only the SAE's own layer is collected when hidden states are not asked for.
+        self.assertIsNone(out.hidden_states)
+
+    def test_esmfold2(self):
+        from mlx_lm.models import esmc, esmfold2
+
+        n_tokens, n_atoms, d_inputs = 6, 12, 71
+        config = {
+            "d_pair": 8,
+            "d_single": 8,
+            "lm_d_model": 8,
+            "lm_num_layers": 2,
+            "inputs": {
+                "d_inputs": d_inputs,
+                "atom_encoder": {
+                    "d_atom": 16,
+                    "d_token": 8,
+                    "n_blocks": 1,
+                    "n_heads": 2,
+                    "swa_window_size": 8,
+                    "expansion_ratio": 2,
+                    "spatial_rope_base_frequency": 20.0,
+                    "n_spatial_rope_pairs_per_axis": 1,
+                    "n_uid_rope_pairs": 1,
+                    "uid_rope_base_frequency": 10000.0,
+                },
+            },
+            "folding_trunk": {"n_layers": 1},
+            "lm_encoder": {"n_layers": 1, "enabled": True},
+            "parcae": {"coda_n_layers": 1},
+            "structure_head": {
+                "distogram_bins": 4,
+                "diffusion_module": {
+                    "c_atom": 16,
+                    "c_token": 8,
+                    "c_z": 8,
+                    "c_s_inputs": d_inputs,
+                    "sigma_data": 16.0,
+                    "fourier_dim": 8,
+                    "atom_num_blocks": 1,
+                    "atom_num_heads": 2,
+                    "token_num_blocks": 1,
+                    "token_num_heads": 2,
+                    "transition_multiplier": 2,
+                },
+            },
+            "confidence_head": {
+                "enabled": True,
+                "distogram_bins": 4,
+                "num_plddt_bins": 4,
+                "num_pae_bins": 4,
+                "num_pde_bins": 4,
+                "folding_trunk": {"n_layers": 1},
+            },
+        }
+        model = esmfold2.ESMFold2Model(config)
+        model._esmc = esmc.Model(
+            esmc.ModelArgs(hidden_size=8, num_attention_heads=2, num_hidden_layers=2)
+        )
+        model.eval()
+
+        atoms_per_token = n_atoms // n_tokens
+        a2t = mx.repeat(mx.arange(n_tokens), atoms_per_token)[None]
+        chains = mx.array([[0] * 3 + [1] * 3])
+        feats = {
+            "token_index": mx.arange(n_tokens)[None],
+            "residue_index": mx.arange(n_tokens)[None],
+            "asym_id": chains,
+            "entity_id": chains,
+            "sym_id": mx.zeros((1, n_tokens), mx.int32),
+            "mol_type": mx.zeros((1, n_tokens), mx.int32),
+            "res_type": mx.arange(n_tokens)[None] + 4,
+            "input_ids": mx.arange(n_tokens)[None] + 4,
+            "token_bonds": mx.zeros((1, n_tokens, n_tokens, 1)),
+            "token_attention_mask": mx.ones((1, n_tokens), mx.bool_),
+            "ref_pos": mx.random.normal((1, n_atoms, 3)),
+            "ref_element": mx.full((1, n_atoms), 6, mx.int32),
+            "ref_charge": mx.zeros((1, n_atoms)),
+            "ref_atom_name_chars": mx.ones((1, n_atoms, 4), mx.int32),
+            "ref_space_uid": a2t,
+            "atom_attention_mask": mx.ones((1, n_atoms), mx.bool_),
+            "atom_to_token": a2t,
+            "distogram_atom_idx": (mx.arange(n_tokens) * atoms_per_token)[None],
+        }
+
+        for samples in (1, 3):
+            out = model.fold(
+                feats,
+                num_loops=1,
+                num_sampling_steps=2,
+                num_diffusion_samples=samples,
+                return_confidence=True,
+            )
+            mx.eval(out)
+            self.assertEqual(out["sample_atom_coords"].shape, (samples, n_atoms, 3))
+            self.assertEqual(out["plddt"].shape, (samples, n_tokens))
+            self.assertEqual(out["ptm"].shape, (samples,))
+            self.assertEqual(out["pair_chains_iptm"].shape, (samples, 2, 2))
+        self.assertEqual(out["distogram_logits"].shape, (1, n_tokens, n_tokens, 4))
+
+        # Chunking the pair transitions must not change the trunk output.
+        z0 = mx.zeros((1, n_tokens, n_tokens, config["d_pair"]))
+        full = model.trunk(feats, z0=z0, num_loops=1)[0]
+        model.set_chunk_size(2)
+        chunked = model.trunk(feats, z0=z0, num_loops=1)[0]
+        self.assertTrue(mx.allclose(full, chunked, atol=1e-4))
+
+    def test_esmfold2_port_layout_sanitize(self):
+        from mlx_lm.models.esmfold2 import sanitize_esmfold2
+
+        tt = "structure_head.token_transformer.layers.0."
+        cond = "structure_head.conditioning.single_transition_0.mlp."
+        out = sanitize_esmfold2(
+            {
+                "input_embedder.pair_init_1.weight": mx.zeros((2, 2)),
+                "parcae.log_state_decay": mx.zeros((2,)),
+                "language_model.layer_weights": mx.zeros((2,)),
+                "folding_trunk.layers.0.tri_mul_in.proj_gate.weight": mx.zeros((2, 2)),
+                cond + "gate_up_proj.weight": mx.zeros((4, 2)),
+                tt + "self_attn.q_proj.weight": mx.zeros((2, 2)),
+                tt + "self_attn.k_proj.weight": mx.zeros((2, 2)),
+                tt + "self_attn.v_proj.weight": mx.zeros((2, 2)),
+                tt + "mlp.gate_up_proj.weight": mx.zeros((4, 2)),
+            }
+        )
+        dm = "structure_head.diffusion_module."
+        self.assertEqual(
+            sorted(out),
+            sorted(
+                [
+                    "z_init_1.weight",
+                    "parcae_log_a",
+                    "language_model.base_z_combine",
+                    "folding_trunk.blocks.0.tri_mul_in.proj_gate.weight",
+                    dm + "conditioning.s_transitions.0.a_proj.weight",
+                    dm + "conditioning.s_transitions.0.b_proj.weight",
+                    dm + "token_transformer.attn_blocks.0.q_proj.weight",
+                    dm + "token_transformer.attn_blocks.0.kv_proj.weight",
+                    dm + "token_transformer.transition_blocks.0.lin_swish.weight",
+                ]
+            ),
+        )
+        kv = dm + "token_transformer.attn_blocks.0.kv_proj.weight"
+        self.assertEqual(out[kv].shape, (4, 2))
+        a_proj = dm + "conditioning.s_transitions.0.a_proj.weight"
+        self.assertEqual(out[a_proj].shape, (2, 2))
+        # A native-layout checkpoint only loses the `._engine.` trimul level.
+        engine = "folding_trunk.blocks.0.tri_mul_in._engine.proj_gate.weight"
+        native = {engine: mx.zeros((2, 2))}
+        self.assertEqual(
+            list(sanitize_esmfold2(native)),
+            ["folding_trunk.blocks.0.tri_mul_in.proj_gate.weight"],
+        )
+
+    def test_esmfold2_config_field_names(self):
+        from mlx_lm.models import esmfold2
+
+        self.assertEqual(esmfold2._get({"d_pair": 8}, "d_pair", "x"), 8)
+        self.assertEqual(esmfold2._get({"x": 8}, "d_pair", "x"), 8)
+        self.assertEqual(esmfold2._get({}, "d_pair", "x", 256), 256)
+        with self.assertRaises(KeyError):
+            esmfold2._get({}, "d_pair", "pairwise_hidden_size")
 
 
 class TestVLSanitize(unittest.TestCase):
