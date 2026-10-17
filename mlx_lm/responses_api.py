@@ -15,6 +15,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from . import anthropic_api
+
 # A custom (freeform) tool takes one string; the model calls it as a function
 # with this argument.
 CUSTOM_INPUT = "input"
@@ -85,50 +87,50 @@ def _messages(body: dict) -> List[dict]:
     if not isinstance(items, list) or not items:
         raise ValueError("Request did not contain input")
 
-    reasoning = ""
+    turn: Optional[dict] = None  # the assistant turn being built
+    reasoning = ""  # reasoning not yet given to an assistant turn
+    unanswered = set()  # call ids of the turn without their output yet
+    held: List[str] = []  # system text waiting for the call outputs
 
     def assistant() -> dict:
-        # Text and the tool calls after it are one assistant turn.
-        nonlocal reasoning
-        last = messages[-1] if messages else None
-        if last is None or last["role"] != "assistant" or last.get("_closed"):
-            last = {"role": "assistant", "content": ""}
-            messages.append(last)
+        nonlocal turn, reasoning
+        # Reasoning after the turn's text or calls starts the next turn.
+        if turn is None or (reasoning and (turn["content"] or turn.get("tool_calls"))):
+            turn = {"role": "assistant", "content": ""}
+            messages.append(turn)
         if reasoning:
-            last["reasoning_content"] = last.get("reasoning_content", "") + reasoning
+            turn["reasoning_content"] = reasoning
             reasoning = ""
-        return last
+        return turn
 
     def call(name, arguments, cid):
-        turn = assistant()
-        turn.setdefault("tool_calls", []).append(
-            {"id": call_id(cid), "type": "function", "function": {"name": name, "arguments": arguments}}
+        cid = call_id(cid)
+        unanswered.add(cid)
+        assistant().setdefault("tool_calls", []).append(
+            {"id": cid, "type": "function", "function": {"name": name, "arguments": arguments}}
         )
+
+    def system(text):
+        if unanswered:
+            held.append(text)
+        else:
+            anthropic_api._add_system(messages, text)
 
     for item in items:
         kind = item.get("type", "message")
         if kind == "message":
             role = item.get("role")
             if role == "assistant":
-                turn = assistant()
-                if turn.get("tool_calls"):
-                    # Text after a call starts the next turn.
-                    turn["_closed"] = True
-                    turn = assistant()
-                turn["content"] += _text_of(item.get("content"))
+                assistant()["content"] += _text_of(item.get("content"))
             elif role in ("system", "developer"):
-                text = _text_of(item.get("content"))
-                if messages and all(m["role"] == "system" for m in messages):
-                    messages[0]["content"] += "\n\n" + text
-                elif not messages:
-                    messages.append({"role": "system", "content": text})
-                else:
-                    messages.append({"role": "user", "content": text})
+                system(_text_of(item.get("content")))
             elif role == "user":
+                turn, reasoning = None, ""
                 messages.append({"role": "user", "content": _user_content(item.get("content"))})
             else:
                 raise ValueError(f"Unsupported message role: {role!r}")
         elif kind == "reasoning":
+            # The raw reasoning when the client sent it back, else its summary.
             reasoning += _text_of(item.get("content")) or _text_of(item.get("summary"))
         elif kind == "function_call":
             call(item.get("name", ""), item.get("arguments") or "{}", item.get("call_id"))
@@ -136,13 +138,19 @@ def _messages(body: dict) -> List[dict]:
             arguments = json.dumps({CUSTOM_INPUT: item.get("input", "")}, ensure_ascii=False)
             call(item.get("name", ""), arguments, item.get("call_id"))
         elif kind in ("function_call_output", "custom_tool_call_output"):
+            turn = None
+            unanswered.discard(item.get("call_id"))
             messages.append(
                 {"role": "tool", "tool_call_id": item.get("call_id", ""), "content": _tool_output(item.get("output"))}
             )
+            if not unanswered:
+                for text in held:
+                    anthropic_api._add_system(messages, text)
+                held = []
         else:
             raise ValueError(f"Unsupported input item: {kind!r}")
-    for m in messages:
-        m.pop("_closed", None)
+    for text in held:
+        anthropic_api._add_system(messages, text)
     if all(m["role"] == "system" for m in messages):
         raise ValueError("Request did not contain a user or assistant message")
     return messages
@@ -258,7 +266,13 @@ def _response(rid: str, created: int, model: str, body: dict, status: str, outpu
 
 
 def _reasoning_item(text: str) -> dict:
-    return {"type": "reasoning", "id": _id("rs"), "summary": [], "content": [{"type": "reasoning_text", "text": text}]}
+    # Clients show the summary; the raw text (content) comes back next turn.
+    return {
+        "type": "reasoning",
+        "id": _id("rs"),
+        "summary": [{"type": "summary_text", "text": text}],
+        "content": [{"type": "reasoning_text", "text": text}],
+    }
 
 
 def _message_item(text: str, status: str = "completed") -> dict:
@@ -271,7 +285,7 @@ def _message_item(text: str, status: str = "completed") -> dict:
     }
 
 
-def _call_item(call: dict, custom: set) -> dict:
+def _call_item(call: dict, custom: set, status: str = "completed") -> dict:
     fn = call.get("function", {})
     name, arguments = fn.get("name", ""), fn.get("arguments") or "{}"
     if name in custom:
@@ -279,9 +293,9 @@ def _call_item(call: dict, custom: set) -> dict:
             value = json.loads(arguments).get(CUSTOM_INPUT, "")
         except (ValueError, AttributeError):
             value = arguments
-        return {"type": "custom_tool_call", "id": _id("ctc"), "status": "completed",
+        return {"type": "custom_tool_call", "id": _id("ctc"), "status": status,
                 "call_id": call_id(call.get("id")), "name": name, "input": value}
-    return {"type": "function_call", "id": _id("fc"), "status": "completed",
+    return {"type": "function_call", "id": _id("fc"), "status": status,
             "call_id": call_id(call.get("id")), "name": name, "arguments": arguments}
 
 
@@ -298,7 +312,7 @@ def to_response(response: dict, model: str, body: dict) -> dict:
     if out.get("reasoning"):
         output.append(_reasoning_item(out["reasoning"]))
     if out.get("content") or not out.get("tool_calls"):
-        output.append(_message_item(out.get("content") or ""))
+        output.append(_message_item(out.get("content") or "", _status(choice.get("finish_reason"))))
     output.extend(_call_item(c, custom) for c in out.get("tool_calls") or [])
     usage = response.get("usage", {})
     return _response(
@@ -354,11 +368,13 @@ class ResponseStream:
                                {"item_id": item["id"], "output_index": index, "content_index": 0, "text": part["text"]})
             out += self._event("response.content_part.done",
                                {"item_id": item["id"], "output_index": index, "content_index": 0, "part": part})
-            item["status"] = "completed"
+            item["status"] = _status(self.finish_reason)
         elif item["type"] == "reasoning":
-            part = item["content"][0]
-            out += self._event("response.reasoning_text.done",
-                               {"item_id": item["id"], "output_index": index, "content_index": 0, "text": part["text"]})
+            part = item["summary"][0]
+            out += self._event("response.reasoning_summary_text.done",
+                               {"item_id": item["id"], "output_index": index, "summary_index": 0, "text": part["text"]})
+            out += self._event("response.reasoning_summary_part.done",
+                               {"item_id": item["id"], "output_index": index, "summary_index": 0, "part": part})
         return out + self._event("response.output_item.done", {"output_index": index, "item": item})
 
     def _begin(self, item: dict) -> bytes:
@@ -371,6 +387,10 @@ class ResponseStream:
             out += self._event("response.content_part.added",
                                {"item_id": item["id"], "output_index": index, "content_index": 0,
                                 "part": {"type": "output_text", "text": "", "annotations": []}})
+        elif item["type"] == "reasoning":
+            out += self._event("response.reasoning_summary_part.added",
+                               {"item_id": item["id"], "output_index": index, "summary_index": 0,
+                                "part": {"type": "summary_text", "text": ""}})
         return out
 
     def chunk(self, response: dict) -> bytes:
@@ -382,9 +402,10 @@ class ResponseStream:
         if delta.get("reasoning"):
             if self.open is None or self.open["type"] != "reasoning":
                 out += self._begin(_reasoning_item(""))
+            self.open["summary"][0]["text"] += delta["reasoning"]
             self.open["content"][0]["text"] += delta["reasoning"]
-            out += self._event("response.reasoning_text.delta",
-                               {"item_id": self.open["id"], "output_index": index(), "content_index": 0,
+            out += self._event("response.reasoning_summary_text.delta",
+                               {"item_id": self.open["id"], "output_index": index(), "summary_index": 0,
                                 "delta": delta["reasoning"]})
         if delta.get("content"):
             if self.open is None or self.open["type"] != "message":
@@ -396,17 +417,18 @@ class ResponseStream:
         for call in delta.get("tool_calls") or []:
             # The server sends a tool call whole, once it has closed.
             item = _call_item(call, self.custom)
+            added = dict(item, status="in_progress")
             out += self._close()
             self.output.append(item)
             i = index()
             if item["type"] == "custom_tool_call":
-                out += self._event("response.output_item.added", {"output_index": i, "item": dict(item, input="")})
+                out += self._event("response.output_item.added", {"output_index": i, "item": dict(added, input="")})
                 out += self._event("response.custom_tool_call_input.delta",
                                    {"item_id": item["id"], "output_index": i, "delta": item["input"]})
                 out += self._event("response.custom_tool_call_input.done",
                                    {"item_id": item["id"], "output_index": i, "input": item["input"]})
             else:
-                out += self._event("response.output_item.added", {"output_index": i, "item": dict(item, arguments="")})
+                out += self._event("response.output_item.added", {"output_index": i, "item": dict(added, arguments="")})
                 out += self._event("response.function_call_arguments.delta",
                                    {"item_id": item["id"], "output_index": i, "delta": item["arguments"]})
                 out += self._event("response.function_call_arguments.done",
@@ -417,7 +439,9 @@ class ResponseStream:
         return out
 
     def stop(self, output_tokens: int, stop_sequence: Optional[str] = None) -> bytes:
-        out = self._close()
+        # An empty answer still has a message, as a whole response does.
+        out = self._begin(_message_item("", status="in_progress")) if not self.output else b""
+        out += self._close()
         status = _status(self.finish_reason)
         name = "response.incomplete" if status == "incomplete" else "response.completed"
         snap = self._snapshot(status, _usage(self.prompt_tokens, output_tokens, self.cached))

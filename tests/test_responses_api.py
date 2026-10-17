@@ -89,6 +89,28 @@ class TestRequestConversion(unittest.TestCase):
         self.assertNotIn("tools", responses_api.to_chat_request({"input": "x", "tools": tools, "tool_choice": "none"}))
 
 
+    def test_turn_order(self):
+        msgs = responses_api.to_chat_request({"input": [
+            {"role": "user", "content": "go"},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "R1"}]},
+            {"type": "message", "role": "assistant", "content": "A"},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "R2"}]},
+            {"type": "function_call", "name": "f", "arguments": "{}", "call_id": "c1"},
+            {"type": "message", "role": "assistant", "content": " (running)"},
+            {"type": "message", "role": "developer", "content": "Mode changed."},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "stale"}]},
+            {"role": "user", "content": "next"},
+        ]})["messages"]
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "assistant", "tool", "user"])
+        self.assertEqual((msgs[1]["reasoning_content"], msgs[1]["content"]), ("R1", "A"))
+        # Text after a call stays in its turn, so the output still follows it.
+        self.assertEqual((msgs[2]["reasoning_content"], msgs[2]["content"]), ("R2", " (running)"))
+        # Instructions sent between a call and its output wait for the output.
+        self.assertEqual(msgs[3]["content"], "ok\n\nMode changed.")
+        self.assertNotIn("reasoning_content", msgs[4])
+
+
 class TestResponseConversion(unittest.TestCase):
     def test_whole_response(self):
         chat = {
@@ -114,6 +136,12 @@ class TestResponseConversion(unittest.TestCase):
         chat = {"choices": [{"finish_reason": "length", "message": {"content": "abc"}}], "usage": {}}
         r = responses_api.to_response(chat, "m", {"input": "x"})
         self.assertEqual((r["status"], r["incomplete_details"]), ("incomplete", {"reason": "max_output_tokens"}))
+        self.assertEqual(r["output"][0]["status"], "incomplete")
+
+    def test_empty_stream_has_a_message(self):
+        s = responses_api.ResponseStream("m", {"input": "x"})
+        got = events(s.start(1, 0) + s.chunk({"choices": [{"delta": {}, "finish_reason": "stop"}]}) + s.stop(0))
+        self.assertEqual(got[-1][1]["response"]["output"][0]["type"], "message")
 
     def test_stream_events(self):
         s = responses_api.ResponseStream("m", {"input": "x"})
