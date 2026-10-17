@@ -21,6 +21,7 @@ against 0.31.3 with mlx-community/gpt-oss-20b-MXFP4-Q8 via aider's
 whole-file-edit client).
 """
 
+import weakref
 import re
 
 HARMONY_CONTROL_TOKENS = ("<|channel|>", "<|message|>", "<|start|>", "<|end|>")
@@ -71,5 +72,19 @@ def has_harmony_format(tokenizer) -> bool:
     unrelated model that merely happens to use one of these token strings
     for something else.
     """
-    vocab = tokenizer.get_vocab()
-    return all(t in vocab for t in HARMONY_CONTROL_TOKENS)
+    # Asked on every reply: the vocabulary is read once per tokenizer.
+    try:
+        return _HAS_HARMONY[tokenizer]
+    except (KeyError, TypeError):
+        pass
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    vocab = get_vocab() if callable(get_vocab) else {}
+    found = all(t in vocab for t in HARMONY_CONTROL_TOKENS)
+    try:
+        _HAS_HARMONY[tokenizer] = found
+    except TypeError:
+        pass
+    return found
+
+
+_HAS_HARMONY = weakref.WeakKeyDictionary()

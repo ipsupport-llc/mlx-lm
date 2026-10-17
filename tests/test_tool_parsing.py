@@ -48,7 +48,8 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<function name="multiply"><param name="a">12234585</param><param name="b">48838483920</param></function>',
                 minicpm5,
-
+            ),
+            (
                 ']<]minimax[>[<tool_call>'
                 ']<]minimax[>[<invoke name="multiply">'
                 ']<]minimax[>[<a>12234585]<]minimax[>[</a>'
@@ -130,7 +131,8 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<function name="get_current_temperature"><param name="location">London</param></function>',
                 minicpm5,
-
+            ),
+            (
                 ']<]minimax[>[<tool_call>'
                 ']<]minimax[>[<invoke name="get_current_temperature">'
                 ']<]minimax[>[<location>London]<]minimax[>[</location>'
