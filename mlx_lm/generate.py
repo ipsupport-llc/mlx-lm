@@ -1272,7 +1272,8 @@ def mtp_generate_step(
                         if distribution is None:
                             d = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
                         else:
-                            last = logits[:, -1, :]
+                            # In float32: the ratios and the residual need it.
+                            last = logits[:, -1, :].astype(mx.float32)
                             q = distribution(last - mx.logsumexp(last, axis=-1, keepdims=True))
                             draft_q.append(q)
                             d = mx.random.categorical(q).reshape(1, 1)
@@ -1289,7 +1290,7 @@ def mtp_generate_step(
                     # The sampler's distribution, worked out once: the
                     # backbone's tokens are drawn from it and the drafts
                     # judged against it.
-                    logits = lm.logits_from_backbone(hid[0])
+                    logits = lm.logits_from_backbone(hid[0]).astype(mx.float32)
                     lps = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
                     p_all = distribution(lps)
                     toks = mx.random.categorical(p_all)
@@ -1311,7 +1312,9 @@ def mtp_generate_step(
                     accept = mx.log(mx.random.uniform(shape=(k,))) < log_ratio
                     # Where a draft is rejected the token comes from max(0, p - q).
                     residual = mx.maximum(mx.exp(p) - mx.exp(q), 0)
-                    replace = mx.random.categorical(mx.log(residual))
+                    # No residual mass left (rounding): p itself.
+                    empty = residual.sum(axis=-1, keepdims=True) <= 0
+                    replace = mx.random.categorical(mx.where(empty, p, mx.log(residual)))
                     mx.eval(toks, lps, draft_ids, accept, replace)
                 else:
                     mx.eval(toks, lps, draft_ids)
