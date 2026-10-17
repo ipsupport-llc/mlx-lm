@@ -145,6 +145,9 @@ def _supported(module):
 
 def _fused(module, x):
     """Run ``x`` through the kernel, or return None when it does not apply."""
+    # A Metal kernel without a VJP: inference on the GPU only.
+    if module.training or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
     rows = 1
     for dim in x.shape[:-1]:
         rows *= dim

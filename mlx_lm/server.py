@@ -2602,7 +2602,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         and (text or tool_calls or reasoning_text)
                     ):
                         formatted = send_calls(tool_calls)
-                        text, _ = tool_formatter.fold_unparsed(text, None)
+                        folded, _ = tool_formatter.fold_unparsed(text, None)
+                        # The next turn's warm-up holds what the client got.
+                        answer_text += folded[len(text):]
+                        text = folded
                         resp = self.generate_response(
                             text,
                             None,
@@ -2682,7 +2685,9 @@ class APIHandler(BaseHTTPRequestHandler):
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
             formatted = send_calls(tool_calls)
-            text, finish_reason = tool_formatter.fold_unparsed(text, finish_reason)
+            folded, finish_reason = tool_formatter.fold_unparsed(text, finish_reason)
+            answer_text += folded[len(text):]
+            text = folded
 
             if self.stream:
                 resp = self.generate_response(

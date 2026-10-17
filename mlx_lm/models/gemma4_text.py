@@ -200,15 +200,15 @@ class Attention(nn.Module):
 
         # K-eq-V for full attention layers (26B/31B models)
         self.use_k_eq_v = config.attention_k_eq_v and not self.is_sliding
+        # The global defaults first; a per-layer entry overrides what it names.
+        if self.layer_type == "full_attention" and config.global_head_dim:
+            self.head_dim = config.global_head_dim
+        if self.use_k_eq_v and config.num_global_key_value_heads is not None:
+            self.n_kv_heads = config.num_global_key_value_heads
         if config.per_layer_config is not None:
             layer_config = config.per_layer_config.get(layer_idx, {})
             self.head_dim = layer_config.get("head_dim", self.head_dim)
             self.n_kv_heads = layer_config.get("num_key_value_heads", self.n_kv_heads)
-        else:
-            if self.layer_type == "full_attention" and config.global_head_dim:
-                self.head_dim = config.global_head_dim
-            if self.use_k_eq_v and config.num_global_key_value_heads is not None:
-                self.n_kv_heads = config.num_global_key_value_heads
 
         self.scale = 1.0
 
