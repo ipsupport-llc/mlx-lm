@@ -153,6 +153,10 @@ class ToolCallFormatter:
         self._tool_parser = tool_parser
         self._tools = tools
         self._streaming = streaming
+        # Tool text the parser rejected: folded back into the content, so
+        # what the model wrote never vanishes (fold_unparsed).
+        self.unparsed: List[str] = []
+        self.made_valid_call = False
 
     def _format(self, tc):
         tc_id = tc.pop("id", None) or str(uuid.uuid4())
@@ -183,11 +187,23 @@ class ToolCallFormatter:
                     f"Failed to parse tool call ({type(e).__name__}: {e}); the model wrote: "
                     f"{json.dumps(snippet, ensure_ascii=False)}"
                 )
+                self.unparsed.append(tool_text)
                 continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
+            self.made_valid_call = True
         return result
+
+    def fold_unparsed(self, text, finish_reason):
+        """The content with the rejected tool text appended, and a
+        finish reason that says "tool_calls" only if a call parsed."""
+        if self.unparsed:
+            text = text + "".join(self.unparsed)
+            self.unparsed = []
+        if finish_reason == "tool_calls" and not self.made_valid_call:
+            finish_reason = "stop"
+        return text, finish_reason
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -2584,10 +2600,12 @@ class APIHandler(BaseHTTPRequestHandler):
                         and current_state != "tool"
                         and (text or tool_calls or reasoning_text)
                     ):
+                        formatted = send_calls(tool_calls)
+                        text, _ = tool_formatter.fold_unparsed(text, None)
                         resp = self.generate_response(
                             text,
                             None,
-                            tool_calls=send_calls(tool_calls),
+                            tool_calls=formatted,
                             reasoning_text=reasoning_text,
                         )
                         self._write_chunk(resp)
@@ -2662,12 +2680,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
+            formatted = send_calls(tool_calls)
+            text, finish_reason = tool_formatter.fold_unparsed(text, finish_reason)
 
             if self.stream:
                 resp = self.generate_response(
                     text,
                     finish_reason,
-                    tool_calls=send_calls(tool_calls),
+                    tool_calls=formatted,
                     reasoning_text=reasoning_text,
                 )
                 self._write_chunk(resp)
@@ -2703,7 +2723,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens=top_tokens,
                     tokens=tokens,
                     reasoning_text=reasoning_text,
-                    tool_calls=send_calls(tool_calls),
+                    tool_calls=formatted,
                 )
                 if self.anthropic is not None:
                     resp = anthropic_api.to_message(
