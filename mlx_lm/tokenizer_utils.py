@@ -669,6 +669,10 @@ def _infer_tool_parser(tokenizer):
             return "minicpm5"
         elif "[TOOL_CALLS]" in chat_template:
             return "mistral"
+        elif "<｜DSML｜tool_calls>" in chat_template:
+            return "deepseek_dsml"
+        elif "<function_calls>" in chat_template:
+            return "olmo3"
         elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
             return "json_tools"
 
