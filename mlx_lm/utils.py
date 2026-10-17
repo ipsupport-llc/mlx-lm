@@ -62,6 +62,7 @@ MODEL_REMAPPING = {
     "deepseek_v41_text": "deepseek_v41",
     "qwen3_5_text": "qwen3_5",
     "qwen3_5_moe_text": "qwen3_5_moe",
+    "nemotron_h_puzzle": "nemotron_h",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
