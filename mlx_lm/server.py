@@ -1089,6 +1089,9 @@ class ResponseGenerator:
 
         while not self._stop:
             request = None
+            # Queues of requests taken this round but not in batch_results
+            # yet: a failure must answer them too.
+            taken = []
             try:
                 if not drain_batch:
                     timeout = (
@@ -1111,6 +1114,7 @@ class ResponseGenerator:
                 # We got a request
                 if request is not None:
                     rqueue, request, args = request
+                    taken.append(rqueue)
 
                     # Can it be added to the current batch? A speculative one
                     # alone (the batch empty, nobody waiting) doesn't join: the
@@ -1229,6 +1233,7 @@ class ResponseGenerator:
                             # The speculative request goes on in the batch; the
                             # one waiting joins it next. Its own cache isn't
                             # kept past this (the batch has what it needs).
+                            taken.append(handoff.rqueue)
                             self._insert_handoff(batch_generator, batch_results, handoff, tokenizer)
                             handoff = None
                         else:
@@ -1327,6 +1332,8 @@ class ResponseGenerator:
 
                             if r.finish_reason is not None:
                                 result["rqueue"].put(None)
+                                # Answered: a later failure isn't its.
+                                result["done"] = True
                                 self.prompt_cache.insert_cache(
                                     current_model_key,
                                     r.all_tokens[:],
@@ -1353,10 +1360,14 @@ class ResponseGenerator:
             except Exception as e:
                 # One request must not stop the server: the requests in work
                 # get the error, the batch is dropped, serving goes on.
+                # Ranks must stay in step: in distributed mode it stays fatal.
+                if self._is_distributed:
+                    raise
                 logging.exception(f"Generation failed; the requests in work get the error: {e}")
-                failed = [r["rqueue"] for r in batch_results.values()]
-                if isinstance(request, tuple) and request and hasattr(request[0], "put"):
-                    failed.append(request[0])
+                failed = [r["rqueue"] for r in batch_results.values() if not r.get("done")]
+                # A request put back for later stays queued: not failed now.
+                waiting = [x[0] for x in unprocessed_requests if isinstance(x, tuple)]
+                failed += [q for q in taken if all(q is not f for f in failed + waiting)]
                 for rqueue in failed:
                     rqueue.put(e)
                 batch_results = {}
@@ -2950,6 +2961,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self.wire is None:
                     self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
+                self._response_done = True
             else:
                 resp = self.generate_response(
                     text,
@@ -2980,6 +2992,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(response_json)
                 self.wfile.flush()
+                self._response_done = True
             if finish_reason in ("stop", "tool_calls") and getattr(args, "cache_store", True):
                 # The answer as the client got it: a non-streamed harmony
                 # reply was split into content and reasoning (generate_response).
@@ -3008,10 +3021,13 @@ class APIHandler(BaseHTTPRequestHandler):
             # The generation failed midway (the generation thread passed its
             # error on): the client gets an error, not a dropped connection.
             logging.error(f"Request failed during generation: {e}")
-            try:
-                self._write_failure(str(e))
-            except OSError:
-                pass
+            # After the whole response (e.g. the next turn's warm-up): no
+            # second answer on it.
+            if not getattr(self, "_response_done", False):
+                try:
+                    self._write_failure(str(e))
+                except OSError:
+                    pass
         finally:
             ctx.stop()
             # One line per request that produced a token, for clients that
