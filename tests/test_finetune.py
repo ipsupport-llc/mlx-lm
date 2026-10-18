@@ -161,6 +161,30 @@ class TestLora(unittest.TestCase):
         )
         check_lora_layers(fp8_model, quantized=True)
 
+    def test_lora_switch_fuse_nvfp4_global_scale(self):
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+        from mlx_lm.tuner.lora import LoRASwitchLinear
+
+        mx.random.seed(0)
+        base = SwitchLinear(64, 32, 4, bias=False)
+        # Experts of very different magnitude, as each gets its own scale.
+        base.weight = base.weight * mx.array([1.0, 10.0, 100.0, 1000.0])[:, None, None]
+        quantized = base.to_quantized(
+            group_size=16, bits=4, mode="nvfp4", global_scale=True
+        )
+        lora = LoRASwitchLinear.from_base(quantized, r=4)
+        lora.lora_b = mx.zeros_like(lora.lora_b)
+
+        fused = lora.fuse(dequantize=True)
+        rel = mx.abs(fused.weight - base.weight).max(axis=(1, 2)) / mx.abs(
+            base.weight
+        ).max(axis=(1, 2))
+        self.assertTrue(mx.all(rel < 0.2))
+
+        requantized = lora.fuse()
+        self.assertIsInstance(requantized, QuantizedSwitchLinear)
+        self.assertIsNotNone(requantized.global_scale)
+
     def test_lora_embedding(self):
         num_embeddings = 256
         dims = 512

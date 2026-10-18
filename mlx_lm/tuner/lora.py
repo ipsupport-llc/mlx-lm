@@ -122,8 +122,24 @@ class LoRASwitchLinear(nn.Module):
         bias = "bias" in linear
         weight = linear.weight
         is_quantized = isinstance(linear, QuantizedSwitchLinear)
+        global_scale = getattr(linear, "global_scale", None) if is_quantized else None
 
-        if is_quantized:
+        if global_scale is not None:
+            # nvfp4 experts each have their own tensor scale.
+            weight = mx.stack(
+                [
+                    mx.dequantize(
+                        weight[e],
+                        linear.scales[e],
+                        group_size=linear.group_size,
+                        bits=linear.bits,
+                        mode=linear.mode,
+                        global_scale=global_scale[e],
+                    )
+                    for e in range(weight.shape[0])
+                ]
+            )
+        elif is_quantized:
             weight = mx.dequantize(
                 weight,
                 linear.scales,
@@ -143,7 +159,10 @@ class LoRASwitchLinear(nn.Module):
 
         if is_quantized and not dequantize:
             fused_linear = fused_linear.to_quantized(
-                group_size=linear.group_size, bits=linear.bits, mode=linear.mode
+                group_size=linear.group_size,
+                bits=linear.bits,
+                mode=linear.mode,
+                global_scale=global_scale is not None,
             )
 
         return fused_linear
