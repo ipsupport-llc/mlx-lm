@@ -1872,7 +1872,7 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         provider, prompt_cache, url = self._serve()
         self._chat(url, self._messages("An unrelated system prompt. " * 12))
         n_before, bytes_before = len(prompt_cache), prompt_cache.nbytes
-        with self.assertNoLogs(level="WARNING"), self._failing_eval({1}, "boom"):
+        with self.assertLogs(level="WARNING") as logs, self._failing_eval({1}, "boom"):
             try:
                 response = requests.post(
                     f"{url}/v1/chat/completions",
@@ -1885,6 +1885,8 @@ class TestServerSingleCheckpoints(unittest.TestCase):
                 self.assertNotEqual(response.status_code, 200)
             except requests.ConnectionError:
                 pass
+        # Only the request's own failure: no retry, no skipped checkpoint.
+        self.assertTrue(all("Request failed during generation" in m for m in logs.output), logs.output)
         self.assertEqual(len(prompt_cache), n_before)
         self.assertEqual(prompt_cache.nbytes, bytes_before)
 
