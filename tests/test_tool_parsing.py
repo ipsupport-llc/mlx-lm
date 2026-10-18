@@ -718,6 +718,33 @@ class TestToolParsing(unittest.TestCase):
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
 
+    def test_muse_spark_string_typed_args(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "postal_code": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            '<atem:invoke name="get_weather">'
+            '<atem:parameter name="postal_code">123</atem:parameter>'
+            '<atem:parameter name="days">3</atem:parameter>'
+            "</atem:invoke>"
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, tools),
+            {"name": "get_weather", "arguments": {"postal_code": "123", "days": 3}},
+        )
+
     def test_muse_spark(self):
         # The server strips the markers.
         test_case = (
