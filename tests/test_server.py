@@ -701,6 +701,40 @@ class TestServer(unittest.TestCase):
             self.assertTrue(all(isinstance(lp, float) for lp in logprobs))
             self.assertIn("logprobs", body["choices"][0])
 
+    def test_a_failing_batch_step_does_not_stop_the_server(self):
+        import sys
+
+        gen = sys.modules["mlx_lm.generate"]
+
+        real_next = gen.BatchGenerator.next
+        calls = {"n": 0}
+
+        def failing_next(self_):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return real_next(self_)
+
+        with mock.patch.object(gen.BatchGenerator, "next", failing_next):
+            status, _ = _complete(self.port, "Once upon a time")
+            self.assertNotEqual(status, 200)
+            self.assertTrue(self.response_generator.generation_available())
+            status, body = _complete(self.port, "Hello")
+            self.assertEqual(status, 200)
+            self.assertIn("choices", body)
+
+    def test_bad_bodies_answer_400(self):
+        url = f"http://localhost:{self.port}"
+        r = requests.post(url + "/v1/chat/completions", json={"model": "default_model"})
+        self.assertEqual(r.status_code, 400)
+        r = requests.post(url + "/v1/completions", json={"model": "default_model"})
+        self.assertEqual(r.status_code, 400)
+        r = requests.post(url + "/v1/chat/completions", json={
+            "model": "default_model", "max_tokens": 4, "stream": True, "stream_options": {"x": 1},
+            "messages": [{"role": "user", "content": "Hi"}]})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b"[DONE]", r.content)
+
     def test_max_tokens_zero_is_rejected(self):
         url = f"http://localhost:{self.port}/v1/completions"
         response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})

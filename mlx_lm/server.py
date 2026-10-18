@@ -125,6 +125,9 @@ from .utils import (
 )
 
 
+# The largest request body read (images come base64-encoded in it).
+MAX_BODY_BYTES = 512 * 1024 * 1024
+
 def _is_metal_oom(e):
     """A Metal command buffer that failed for lack of GPU memory. MLX raises
     it as RuntimeError: "[METAL] Command buffer execution failed:
@@ -1086,266 +1089,288 @@ class ResponseGenerator:
 
         while not self._stop:
             request = None
-            if not drain_batch:
-                timeout = (
-                    None
-                    if (batch_generator is not None and len(batch_results) > 0)
-                    else 0.1
-                )
-                request = get_next_request(timeout=timeout)
+            try:
+                if not drain_batch:
+                    timeout = (
+                        None
+                        if (batch_generator is not None and len(batch_results) > 0)
+                        else 0.1
+                    )
+                    request = get_next_request(timeout=timeout)
 
-            # Idle: prefill a finished request's next turn (warm_next_turn).
-            if (
-                request is None
-                and self._warm_jobs
-                and not drain_batch
-                and (batch_generator is None or len(batch_results) == 0)
-            ):
-                self._warm_next(self._warm_jobs.popleft(), generation_stream)
-                continue
-
-            # We got a request
-            if request is not None:
-                rqueue, request, args = request
-
-                # Can it be added to the current batch? A speculative one
-                # alone (the batch empty, nobody waiting) doesn't join: the
-                # batch drains and it runs on its own.
-                alone = len(batch_results) == 0 and not unprocessed_requests and not self._others_waiting()
+                # Idle: prefill a finished request's next turn (warm_next_turn).
                 if (
-                    batch_generator is not None
-                    and current_model == args.model
-                    and self._is_batchable(args, request, alone=alone)
+                    request is None
+                    and self._warm_jobs
+                    and not drain_batch
+                    and (batch_generator is None or len(batch_results) == 0)
                 ):
-                    try:
-                        prompt, segments, segment_types, initial_state = self._tokenize(
-                            current_tokenizer, request, args
-                        )
-                    except Exception as e:
-                        rqueue.put(e)
-                        continue
-
-                    stop_sequences, text_sm = self._make_state_machine(
-                        self.model_provider.model_key,
-                        current_tokenizer,
-                        args.stop_words,
-                    )
-
-                    self._log_cache_stats()
-                    cache, rest = self.prompt_cache.fetch_nearest_cache(
-                        current_model_key, prompt
-                    )
-                    # Stored by a speculative single request: without the
-                    # draft model's slots.
-                    cache = self._main_slots(cache)
-                    prompt_cache_count = len(prompt) - len(rest)
-                    self._log_cache_reuse(prompt_cache_count, len(prompt))
-                    segments, segment_types = self._junction_split(
-                        segments, segment_types, prompt_cache_count, len(prompt)
-                    )
-                    N = prompt_cache_count
-                    while N > 0:
-                        if N >= len(segments[0]):
-                            N -= len(segments.pop(0))
-                            segment_types.pop(0)
-                        else:
-                            segments[0] = segments[0][N:]
-                            break
-
-                    ctx = GenerationContext(
-                        has_tool_calling=current_tokenizer.has_tool_calling,
-                        has_thinking=current_tokenizer.has_thinking,
-                        tool_parser=current_tokenizer.tool_parser,
-                        text_sm=text_sm,
-                        initial_state=initial_state,
-                        prompt=prompt,
-                        prompt_cache_count=prompt_cache_count,
-                        model_key=self.model_provider.model_key,
-                    )
-                    rqueue.put(ctx)
-
-                    (uid,) = batch_generator.insert_segments(
-                        segments=[segments],
-                        max_tokens=[args.max_tokens],
-                        caches=[cache],
-                        all_tokens=[prompt[:prompt_cache_count]],
-                        samplers=[_make_sampler(args, current_tokenizer)],
-                        logits_processors=[_make_logits_processors(args, current_tokenizer)],
-                        stop_sequences=[stop_sequences],
-                    )
-                    batch_results[uid] = {
-                        "ctx": ctx,
-                        "rqueue": rqueue,
-                        "detokenizer": current_tokenizer.detokenizer,
-                        "segment_types": segment_types[::-1],
-                        "top_logprobs": args.top_logprobs,
-                        "logprobs": args.logprobs,
-                    }
-                    # just making sure we don't leave a reference around
-                    del cache
-
-                    self._trim_to_cap(batch_generator)
+                    self._warm_next(self._warm_jobs.popleft(), generation_stream)
                     continue
 
-                # No batch generator. Load the model and if it's not
-                # batchable serve sequential, o/w make a batch generaotr and
-                # serve batched
-                elif batch_generator is None:
-                    try:
-                        model, tokenizer = self.model_provider.load(
-                            args.model.model, args.model.adapter, args.model.draft
-                        )
-                    except Exception as e:
-                        rqueue.put(e)
-                        continue
+                # We got a request
+                if request is not None:
+                    rqueue, request, args = request
 
-                    alone = not unprocessed_requests and not self._others_waiting()
-                    handoff = None
-                    if not self._is_batchable(args, request, alone=alone):
-                        handoff = self._serve_single((rqueue, request, args), generation_stream)
-                        if handoff is None:
+                    # Can it be added to the current batch? A speculative one
+                    # alone (the batch empty, nobody waiting) doesn't join: the
+                    # batch drains and it runs on its own.
+                    alone = len(batch_results) == 0 and not unprocessed_requests and not self._others_waiting()
+                    if (
+                        batch_generator is not None
+                        and current_model == args.model
+                        and self._is_batchable(args, request, alone=alone)
+                    ):
+                        try:
+                            prompt, segments, segment_types, initial_state = self._tokenize(
+                                current_tokenizer, request, args
+                            )
+                        except Exception as e:
+                            rqueue.put(e)
                             continue
 
-                    current_model = args.model
-                    current_tokenizer = tokenizer
-                    current_model_key = self.model_provider.model_key
-                    batch_results = {}
-                    batch_generator = BatchGenerator(
-                        model,
-                        completion_batch_size=self.cli_args.decode_concurrency,
-                        prefill_batch_size=self.cli_args.prompt_concurrency,
-                        prefill_step_size=self.cli_args.prefill_step_size,
-                        stream=generation_stream,
-                        # The batch quantizes its KV cache as the unbatched
-                        # path does (from the first token).
-                        kv_bits=self.cli_args.kv_bits,
-                        kv_group_size=self.cli_args.kv_group_size,
-                    )
-                    if handoff is not None:
-                        # The speculative request goes on in the batch; the
-                        # one waiting joins it next. Its own cache isn't
-                        # kept past this (the batch has what it needs).
-                        self._insert_handoff(batch_generator, batch_results, handoff, tokenizer)
-                        handoff = None
-                    else:
-                        unprocessed_requests.append((rqueue, request, args))
-                    continue
-
-                # We have a batch but this request cannot be added to the
-                # batch so drain it to process the request.
-                else:
-                    drain_batch = True
-                    unprocessed_requests.append((rqueue, request, args))
-                    continue
-
-            # No request so serve from the current batch
-            elif batch_generator is not None:
-                if len(batch_results) == 0:
-                    self._busy = False
-                    if drain_batch:
-                        current_model = None
-                        current_tokenizer = None
-                        current_model_key = None
-                        batch_generator.close()
-                        batch_generator = None
-                        drain_batch = False
-                    continue
-
-                uids_to_remove = []
-                if not self._busy:
-                    self._busy = True
-                    self._touch_progress()
-                for _ in self._time_budget:
-                    prompt_responses, gen_responses = batch_generator.next()
-                    self._touch_progress()
-                    if not prompt_responses and not gen_responses:
-                        break
-
-                    # Progress report for prompt processing
-                    for r in prompt_responses:
-                        result = batch_results[r.uid]
-                        # A handed-off request is past its prompt: its
-                        # catching up isn't prompt progress to its client.
-                        if not result.get("handoff"):
-                            result["rqueue"].put(r.progress)
-                        if result["ctx"]._should_stop:
-                            uids_to_remove.append(r.uid)
-
-                    # Save the caches at end of segments
-                    eos_ids = [
-                        r.uid
-                        for r in prompt_responses
-                        if r.end_of_segment
-                        and not r.end_of_prompt
-                        and batch_results[r.uid]["segment_types"]
-                    ]
-                    caches = batch_generator.extract_cache(eos_ids)
-                    for uid, (cache, cache_key) in caches.items():
-                        self.prompt_cache.insert_cache(
+                        stop_sequences, text_sm = self._make_state_machine(
                             self.model_provider.model_key,
-                            cache_key[:],
-                            cache,
-                            cache_type=batch_results[uid]["segment_types"].pop(),
+                            current_tokenizer,
+                            args.stop_words,
                         )
-                    if caches:
+
+                        self._log_cache_stats()
+                        cache, rest = self.prompt_cache.fetch_nearest_cache(
+                            current_model_key, prompt
+                        )
+                        # Stored by a speculative single request: without the
+                        # draft model's slots.
+                        cache = self._main_slots(cache)
+                        prompt_cache_count = len(prompt) - len(rest)
+                        self._log_cache_reuse(prompt_cache_count, len(prompt))
+                        segments, segment_types = self._junction_split(
+                            segments, segment_types, prompt_cache_count, len(prompt)
+                        )
+                        N = prompt_cache_count
+                        while N > 0:
+                            if N >= len(segments[0]):
+                                N -= len(segments.pop(0))
+                                segment_types.pop(0)
+                            else:
+                                segments[0] = segments[0][N:]
+                                break
+
+                        ctx = GenerationContext(
+                            has_tool_calling=current_tokenizer.has_tool_calling,
+                            has_thinking=current_tokenizer.has_thinking,
+                            tool_parser=current_tokenizer.tool_parser,
+                            text_sm=text_sm,
+                            initial_state=initial_state,
+                            prompt=prompt,
+                            prompt_cache_count=prompt_cache_count,
+                            model_key=self.model_provider.model_key,
+                        )
+                        rqueue.put(ctx)
+
+                        (uid,) = batch_generator.insert_segments(
+                            segments=[segments],
+                            max_tokens=[args.max_tokens],
+                            caches=[cache],
+                            all_tokens=[prompt[:prompt_cache_count]],
+                            samplers=[_make_sampler(args, current_tokenizer)],
+                            logits_processors=[_make_logits_processors(args, current_tokenizer)],
+                            stop_sequences=[stop_sequences],
+                        )
+                        batch_results[uid] = {
+                            "ctx": ctx,
+                            "rqueue": rqueue,
+                            "detokenizer": current_tokenizer.detokenizer,
+                            "segment_types": segment_types[::-1],
+                            "top_logprobs": args.top_logprobs,
+                            "logprobs": args.logprobs,
+                        }
+                        # just making sure we don't leave a reference around
+                        del cache
+
                         self._trim_to_cap(batch_generator)
-                    del caches
+                        continue
 
-                    for r in gen_responses:
-                        result = batch_results[r.uid]
-
-                        # Don't decode the final stop token
-                        if r.finish_reason == "stop":
-                            result["detokenizer"].finalize()
-                            text = result["detokenizer"].last_segment
-                        elif r.finish_reason == "length":
-                            result["detokenizer"].add_token(r.token)
-                            result["detokenizer"].finalize()
-                            text = result["detokenizer"].last_segment
-                        else:
-                            result["detokenizer"].add_token(r.token)
-                            text = result["detokenizer"].last_segment
-
-                        result["rqueue"].put(
-                            Response(
-                                text,
-                                r.token,
-                                # .item() waits for the next step: only read when asked.
-                                (r.logprobs[r.token].item() if result["logprobs"] else None),
-                                r.finish_reason,
-                                _format_top_logprobs(
-                                    r.logprobs,
-                                    result["top_logprobs"],
-                                    current_tokenizer,
-                                ),
+                    # No batch generator. Load the model and if it's not
+                    # batchable serve sequential, o/w make a batch generaotr and
+                    # serve batched
+                    elif batch_generator is None:
+                        try:
+                            model, tokenizer = self.model_provider.load(
+                                args.model.model, args.model.adapter, args.model.draft
                             )
+                        except Exception as e:
+                            rqueue.put(e)
+                            continue
+
+                        alone = not unprocessed_requests and not self._others_waiting()
+                        handoff = None
+                        if not self._is_batchable(args, request, alone=alone):
+                            handoff = self._serve_single((rqueue, request, args), generation_stream)
+                            if handoff is None:
+                                continue
+
+                        current_model = args.model
+                        current_tokenizer = tokenizer
+                        current_model_key = self.model_provider.model_key
+                        batch_results = {}
+                        batch_generator = BatchGenerator(
+                            model,
+                            completion_batch_size=self.cli_args.decode_concurrency,
+                            prefill_batch_size=self.cli_args.prompt_concurrency,
+                            prefill_step_size=self.cli_args.prefill_step_size,
+                            stream=generation_stream,
+                            # The batch quantizes its KV cache as the unbatched
+                            # path does (from the first token).
+                            kv_bits=self.cli_args.kv_bits,
+                            kv_group_size=self.cli_args.kv_group_size,
                         )
+                        if handoff is not None:
+                            # The speculative request goes on in the batch; the
+                            # one waiting joins it next. Its own cache isn't
+                            # kept past this (the batch has what it needs).
+                            self._insert_handoff(batch_generator, batch_results, handoff, tokenizer)
+                            handoff = None
+                        else:
+                            unprocessed_requests.append((rqueue, request, args))
+                        continue
 
-                        if r.finish_reason is not None:
-                            result["rqueue"].put(None)
+                    # We have a batch but this request cannot be added to the
+                    # batch so drain it to process the request.
+                    else:
+                        drain_batch = True
+                        unprocessed_requests.append((rqueue, request, args))
+                        continue
+
+                # No request so serve from the current batch
+                elif batch_generator is not None:
+                    if len(batch_results) == 0:
+                        self._busy = False
+                        if drain_batch:
+                            current_model = None
+                            current_tokenizer = None
+                            current_model_key = None
+                            batch_generator.close()
+                            batch_generator = None
+                            drain_batch = False
+                        continue
+
+                    uids_to_remove = []
+                    if not self._busy:
+                        self._busy = True
+                        self._touch_progress()
+                    for _ in self._time_budget:
+                        prompt_responses, gen_responses = batch_generator.next()
+                        self._touch_progress()
+                        if not prompt_responses and not gen_responses:
+                            break
+
+                        # Progress report for prompt processing
+                        for r in prompt_responses:
+                            result = batch_results[r.uid]
+                            # A handed-off request is past its prompt: its
+                            # catching up isn't prompt progress to its client.
+                            if not result.get("handoff"):
+                                result["rqueue"].put(r.progress)
+                            if result["ctx"]._should_stop:
+                                uids_to_remove.append(r.uid)
+
+                        # Save the caches at end of segments
+                        eos_ids = [
+                            r.uid
+                            for r in prompt_responses
+                            if r.end_of_segment
+                            and not r.end_of_prompt
+                            and batch_results[r.uid]["segment_types"]
+                        ]
+                        caches = batch_generator.extract_cache(eos_ids)
+                        for uid, (cache, cache_key) in caches.items():
                             self.prompt_cache.insert_cache(
-                                current_model_key,
-                                r.all_tokens[:],
-                                r.prompt_cache,
-                                cache_type="assistant",
+                                self.model_provider.model_key,
+                                cache_key[:],
+                                cache,
+                                cache_type=batch_results[uid]["segment_types"].pop(),
                             )
+                        if caches:
                             self._trim_to_cap(batch_generator)
-                            del batch_results[r.uid]
+                        del caches
 
-                        if result["ctx"]._should_stop:
-                            uids_to_remove.append(r.uid)
+                        for r in gen_responses:
+                            result = batch_results[r.uid]
 
-                uids_to_remove = self._share_object(uids_to_remove)
-                if uids_to_remove:
-                    batch_generator.remove(uids_to_remove)
-                    for uid in uids_to_remove:
-                        # It may have already been removed during
-                        # generation
-                        batch_results.pop(uid, None)
-                # The budget holds while prefills grow, not only at inserts.
-                self._trim_to_cap(batch_generator)
-                # Idle work (a warm-up) between rounds isn't a request's.
-                self._busy = bool(batch_results)
+                            # Don't decode the final stop token
+                            if r.finish_reason == "stop":
+                                result["detokenizer"].finalize()
+                                text = result["detokenizer"].last_segment
+                            elif r.finish_reason == "length":
+                                result["detokenizer"].add_token(r.token)
+                                result["detokenizer"].finalize()
+                                text = result["detokenizer"].last_segment
+                            else:
+                                result["detokenizer"].add_token(r.token)
+                                text = result["detokenizer"].last_segment
+
+                            result["rqueue"].put(
+                                Response(
+                                    text,
+                                    r.token,
+                                    # .item() waits for the next step: only read when asked.
+                                    (r.logprobs[r.token].item() if result["logprobs"] else None),
+                                    r.finish_reason,
+                                    _format_top_logprobs(
+                                        r.logprobs,
+                                        result["top_logprobs"],
+                                        current_tokenizer,
+                                    ),
+                                )
+                            )
+
+                            if r.finish_reason is not None:
+                                result["rqueue"].put(None)
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    r.all_tokens[:],
+                                    r.prompt_cache,
+                                    cache_type="assistant",
+                                )
+                                self._trim_to_cap(batch_generator)
+                                del batch_results[r.uid]
+
+                            if result["ctx"]._should_stop:
+                                uids_to_remove.append(r.uid)
+
+                    uids_to_remove = self._share_object(uids_to_remove)
+                    if uids_to_remove:
+                        batch_generator.remove(uids_to_remove)
+                        for uid in uids_to_remove:
+                            # It may have already been removed during
+                            # generation
+                            batch_results.pop(uid, None)
+                    # The budget holds while prefills grow, not only at inserts.
+                    self._trim_to_cap(batch_generator)
+                    # Idle work (a warm-up) between rounds isn't a request's.
+                    self._busy = bool(batch_results)
+            except Exception as e:
+                # One request must not stop the server: the requests in work
+                # get the error, the batch is dropped, serving goes on.
+                logging.exception(f"Generation failed; the requests in work get the error: {e}")
+                failed = [r["rqueue"] for r in batch_results.values()]
+                if isinstance(request, tuple) and request and hasattr(request[0], "put"):
+                    failed.append(request[0])
+                for rqueue in failed:
+                    rqueue.put(e)
+                batch_results = {}
+                if batch_generator is not None:
+                    try:
+                        batch_generator.close()
+                    except Exception:
+                        pass
+                batch_generator = None
+                current_model = current_tokenizer = current_model_key = None
+                drain_batch = False
+                self._busy = False
+                gc.collect()
+                mx.clear_cache()
 
         # Make sure the model and prompt cache are destroyed in the generation
         # thread under same stream.
@@ -2163,12 +2188,20 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         try:
             content_length = int(content_length)
+            if content_length < 0:
+                raise ValueError
         except ValueError:
             self._set_completion_headers(400)
             self.end_headers()
             self.wfile.write(
                 self._error(400, "Invalid Content-Length header")
             )
+            return
+        # A body is read whole into memory: refused above the cap.
+        if content_length > MAX_BODY_BYTES:
+            self._set_completion_headers(413)
+            self.end_headers()
+            self.wfile.write(self._error(413, f"Request body over {MAX_BODY_BYTES} bytes"))
             return
         raw_body = self.rfile.read(content_length)
         try:
@@ -2236,6 +2269,8 @@ class APIHandler(BaseHTTPRequestHandler):
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
+        if self.stream_options is not None and not isinstance(self.stream_options, dict):
+            self.stream_options = None
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
@@ -2567,6 +2602,28 @@ class APIHandler(BaseHTTPRequestHandler):
             call["id"] = anthropic_api.tool_use_id(call.get("id"))
         return call
 
+    def _write_failure(self, message: str):
+        """An error for a request whose response has started: an error event
+        on a stream, else a 500 in place of the pending 200."""
+        if not self.stream:
+            self._headers_buffer = []
+            body = self._error(500, message)
+            self._set_completion_headers(500)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.anthropic is not None:
+            data = anthropic_api.error_body(500, message)
+            self.wfile.write(f"event: error\ndata: {json.dumps(data)}\n\n".encode())
+        elif self.responses_stream is not None:
+            snap = self.responses_stream._snapshot("failed")
+            snap["error"] = {"code": "server_error", "message": message}
+            self.wfile.write(self.responses_stream._event("response.failed", {"response": snap}))
+        else:
+            data = {"error": {"message": message, "type": "server_error"}}
+            self.wfile.write(f"data: {json.dumps(data)}\n\ndata: [DONE]\n\n".encode())
+        self.wfile.flush()
+
     def _write_chunk(self, resp: dict):
         if self.wire is not None:
             self.wfile.write(self.wire.chunk(resp))
@@ -2881,7 +2938,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 elif (
                     self.stream_options is not None
-                    and self.stream_options["include_usage"]
+                    and self.stream_options.get("include_usage")
                 ):
                     resp = self.completion_usage_response(
                         len(first_ctx.prompt),
@@ -2947,6 +3004,14 @@ class APIHandler(BaseHTTPRequestHandler):
             # stop cleanly instead of crashing the request thread.
             logging.info("Client disconnected during generation.")
             logging.debug(f"Disconnect: {e!r}")
+        except Exception as e:
+            # The generation failed midway (the generation thread passed its
+            # error on): the client gets an error, not a dropped connection.
+            logging.error(f"Request failed during generation: {e}")
+            try:
+                self._write_failure(str(e))
+            except OSError:
+                pass
         finally:
             ctx.stop()
             # One line per request that produced a token, for clients that
@@ -2995,7 +3060,8 @@ class APIHandler(BaseHTTPRequestHandler):
             mx.array: A mx.array of the tokenized prompt from the request body
         """
         body = self.body
-        assert "messages" in body, "Request did not contain messages"
+        if not isinstance(body.get("messages"), list):
+            raise ValueError("Request did not contain messages")
 
         # Determine response type
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -3024,7 +3090,8 @@ class APIHandler(BaseHTTPRequestHandler):
         # Determine response type
         self.request_id = f"cmpl-{uuid.uuid4()}"
         self.object_type = "text_completion"
-        assert "prompt" in self.body, "Request did not contain a prompt"
+        if not isinstance(self.body.get("prompt"), str):
+            raise ValueError("Request did not contain a prompt")
         return CompletionRequest(
             "text",
             self.body["prompt"],
