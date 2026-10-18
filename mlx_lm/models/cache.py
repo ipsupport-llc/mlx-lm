@@ -151,6 +151,16 @@ def create_attention_mask(
         return "causal"
 
 
+def fit_group_size(group_size: int, *dims: int) -> int:
+    """The largest of group_size, 128, 64 and 32 (not above group_size) that
+    divides all dims, or group_size if none does. Heads 96 wide (Phi-3) do
+    not quantize with the default group size of 64."""
+    for g in (group_size, 128, 64, 32):
+        if g <= group_size and all(d % g == 0 for d in dims):
+            return g
+    return group_size
+
+
 class _BaseCache:
     @property
     def state(self):
@@ -262,6 +272,8 @@ class QuantizedKVCache(_BaseCache):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
         prev = self.offset
+        if self.keys is None:
+            self.group_size = fit_group_size(self.group_size, k_head_dim, v_head_dim)
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
             el_per_int = 8 * mx.uint32.size // self.bits
@@ -394,6 +406,10 @@ class KVCache(_BaseCache):
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+        if self.keys is not None:
+            group_size = fit_group_size(
+                group_size, self.keys.shape[-1], self.values.shape[-1]
+            )
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
         if self.keys is not None:

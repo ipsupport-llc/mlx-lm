@@ -340,6 +340,25 @@ class TestPromptCache(unittest.TestCase):
         _, loaded_metadata = load_prompt_cache(cache_file, return_metadata=True)
         self.assertEqual(metadata, loaded_metadata)
 
+    def test_quantized_cache_fits_the_group_size(self):
+        # 96-wide heads (Phi-3) don't divide into the default group size 64.
+        keys = mx.random.normal((1, 2, 5, 96))
+        cache = KVCache()
+        cache.update_and_fetch(keys, keys)
+        quantized = cache.to_quantized(group_size=64, bits=4)
+        self.assertEqual(quantized.group_size, 32)
+        quantized.update_and_fetch(keys[..., :1, :], keys[..., :1, :])
+        self.assertEqual(quantized.offset, 6)
+
+        empty = QuantizedKVCache(group_size=64, bits=4)
+        empty.update_and_fetch(keys, keys)
+        self.assertEqual(empty.group_size, 32)
+
+        # A group size that already divides the heads is kept.
+        cache = KVCache()
+        cache.update_and_fetch(mx.zeros((1, 2, 3, 128)), mx.zeros((1, 2, 3, 128)))
+        self.assertEqual(cache.to_quantized(group_size=64).group_size, 64)
+
     def test_cache_to_quantized(self):
         model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
