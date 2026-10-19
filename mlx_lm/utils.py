@@ -1027,7 +1027,8 @@ def load_model(
 
     # Routed experts read from disk as they're needed, before anything is
     # evaluated: their stacked arrays are never loaded.
-    share = config.get("experts_on_disk")
+    # Only when asked for at load, never from a checkpoint's config.
+    share = (model_config or {}).get("experts_on_disk")
     if share is not None:
         from .expert_offload import offload_experts
 

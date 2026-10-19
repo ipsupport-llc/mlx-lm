@@ -24,7 +24,7 @@ import struct
 import sys
 import threading
 import weakref
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
@@ -67,20 +67,20 @@ def _file_prefix(module_path, index):
     if i < 0:
         return None
     tail = module_path[i:]
-    head = set(filter(None, module_path[:i].split(".")))
+    head = Counter(filter(None, module_path[:i].split(".")))
     found = []
     for k in index:
         if not k.endswith(".gate_proj.weight"):
             continue
         prefix = k[: -len(".gate_proj.weight")]
         j = prefix.find("layers.")
-        if j >= 0 and prefix[j:] == tail and set(filter(None, prefix[:j].split("."))) == head:
+        if j >= 0 and prefix[j:] == tail and Counter(filter(None, prefix[:j].split("."))) == head:
             found.append(prefix)
     return found[0] if len(found) == 1 else None
 
 
 def _close(pool, fds):
-    pool.shutdown(wait=False)
+    pool.shutdown(wait=True)
     for fd in fds.values():
         os.close(fd)
 

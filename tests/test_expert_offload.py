@@ -93,6 +93,8 @@ class TestFilePrefix(unittest.TestCase):
         self.assertEqual(_file_prefix("model.layers.0.mlp.switch_mlp", index), "model.layers.0.mlp.switch_mlp")
         self.assertEqual(_file_prefix("mtp.layers.0.mlp.switch_mlp", index), "mtp.layers.0.mlp.switch_mlp")
         self.assertIsNone(_file_prefix("other.layers.0.mlp.switch_mlp", index))
+        # A repeated name is not the same as one.
+        self.assertIsNone(_file_prefix("model.model.layers.0.mlp.switch_mlp", index))
 
 
 if __name__ == "__main__":
