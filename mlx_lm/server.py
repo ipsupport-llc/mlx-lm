@@ -3,6 +3,7 @@
 import argparse
 from collections import deque
 import gc
+import ipaddress
 import json
 import types
 import logging
@@ -3245,10 +3246,12 @@ def _run_http_server(
             **kwargs,
         ),
     )
-    warnings.warn(
-        "mlx_lm.server is not recommended for production as "
-        "it only implements basic security checks."
-    )
+    # Only reachable from this machine (the address bound): nothing to warn about.
+    if not ipaddress.ip_address(server_address[0]).is_loopback:
+        warnings.warn(
+            "mlx_lm.server is not recommended for production as "
+            "it only implements basic security checks."
+        )
     logging.info(f"Starting httpd at {host} on port {port}...")
     try:
         httpd.serve_forever()
