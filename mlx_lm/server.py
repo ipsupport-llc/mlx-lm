@@ -3245,10 +3245,12 @@ def _run_http_server(
             **kwargs,
         ),
     )
-    warnings.warn(
-        "mlx_lm.server is not recommended for production as "
-        "it only implements basic security checks."
-    )
+    # Only reachable from this machine: nothing to warn about.
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        warnings.warn(
+            "mlx_lm.server is not recommended for production as "
+            "it only implements basic security checks."
+        )
     logging.info(f"Starting httpd at {host} on port {port}...")
     try:
         httpd.serve_forever()
