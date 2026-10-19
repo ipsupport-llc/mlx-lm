@@ -564,6 +564,7 @@ class ModelProvider:
                         self.cli_args, "mmap_lookup_tables", False
                     ),
                     "lazy_towers": getattr(self.cli_args, "lazy_towers", False),
+                    "experts_on_disk": getattr(self.cli_args, "experts_on_disk", None),
                 },
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
@@ -3573,6 +3574,15 @@ def make_parser():
         "--lazy-towers",
         action="store_true",
         help="Load the image and audio towers on their first use",
+    )
+    parser.add_argument(
+        "--experts-on-disk",
+        type=float,
+        default=None,
+        metavar="SHARE",
+        help="Experimental: leave a MoE model's routed experts on disk and "
+        "keep SHARE (0-1) of each layer's in memory, read as needed. For a "
+        "model that doesn't fit memory; slower",
     )
     return parser
 

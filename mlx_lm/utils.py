@@ -1025,6 +1025,14 @@ def load_model(
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
 
+    # Routed experts read from disk as they're needed, before anything is
+    # evaluated: their stacked arrays are never loaded.
+    share = config.get("experts_on_disk")
+    if share:
+        from .expert_offload import offload_experts
+
+        offload_experts(model, str(model_path), float(share))
+
     if not lazy:
         # Towers for images or audio load from the files on first use.
         skip = set()
