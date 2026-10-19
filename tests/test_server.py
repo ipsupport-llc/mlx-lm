@@ -650,6 +650,34 @@ class TestServer(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("prompt=5 cached=2 first_token_s=2.000 tokens=4", lines[0])
         self.assertIn("decode_s=3.500 drafted=2", lines[0])
+        self.assertNotIn("client=", lines[0])
+
+    def test_request_stats_name_the_client(self):
+        ctx = GenerationContext(
+            has_tool_calling=False, has_thinking=False, tool_parser=None,
+            text_sm=TextStateMachine({}), initial_state="normal", prompt=[1], prompt_cache_count=0,
+        )
+        gens = [types.SimpleNamespace(text="a", token=1, logprob=0.0, finish_reason="stop", top_tokens=(),
+                                      from_draft=False, made_at=11.0)]
+        with mock.patch.object(
+            self.response_generator, "generate", return_value=(ctx, iter(gens))
+        ), self.assertLogs(level="INFO") as logs:
+            requests.post(
+                f"http://localhost:{self.port}/v1/chat/completions",
+                headers={"X-LLMTray-Client": "Claude Code; rm"},
+                json={"model": "default_model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+            )
+        line = next(l for l in logs.output if "Request stats:" in l)
+        self.assertTrue(line.endswith(" client=Claude Code rm"), line)
+
+    def test_client_suffix_cleaning(self):
+        from mlx_lm.server import _client_suffix
+
+        self.assertEqual(_client_suffix(None), "")
+        self.assertEqual(_client_suffix(" ;=\r\n "), "")
+        self.assertEqual(_client_suffix("Codex"), " client=Codex")
+        self.assertEqual(_client_suffix("caf\u00e9\u00b2 x"), " client=caf x")
+        self.assertEqual(_client_suffix("a" * 39 + " b"), " client=" + "a" * 39)
 
     def test_request_stats_use_generation_times(self):
         # A slow client doesn't stretch the decode time: tokens carry when
