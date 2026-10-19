@@ -3,6 +3,7 @@
 import argparse
 from collections import deque
 import gc
+import ipaddress
 import json
 import types
 import logging
@@ -3245,8 +3246,8 @@ def _run_http_server(
             **kwargs,
         ),
     )
-    # Only reachable from this machine: nothing to warn about.
-    if host not in ("127.0.0.1", "localhost", "::1"):
+    # Only reachable from this machine (the address bound): nothing to warn about.
+    if not ipaddress.ip_address(server_address[0]).is_loopback:
         warnings.warn(
             "mlx_lm.server is not recommended for production as "
             "it only implements basic security checks."
