@@ -360,6 +360,17 @@ class CompletionRequest:
 THINKING_BUDGET_NOTE = "\n\nI have to answer now.\n"
 
 
+def _client_suffix(name):
+    """ " client=<name>" for the stats line when a proxy (LLMTray) named the
+    client: letters, digits, spaces and ._- only, at most 40 characters,
+    last on the line (the name may have spaces)."""
+    if not name:
+        return ""
+    clean = "".join(c for c in str(name) if c.isalnum() or c in " ._-")
+    clean = clean.strip()[:40]
+    return f" client={clean}" if clean else ""
+
+
 def _now() -> float:
     """The clock of the per-request statistics (a test replaces it)."""
     return time.monotonic()
@@ -3042,6 +3053,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     f"first_token_s={first_token_at - started:.3f} "
                     f"tokens={n_tokens} decode_s={last_token_at - first_token_at:.3f} "
                     f"drafted={n_drafted}"
+                    f"{_client_suffix(self.headers.get('X-LLMTray-Client'))}"
                 )
 
     def completion_usage_response(
