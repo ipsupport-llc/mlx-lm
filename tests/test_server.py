@@ -670,6 +670,15 @@ class TestServer(unittest.TestCase):
         line = next(l for l in logs.output if "Request stats:" in l)
         self.assertTrue(line.endswith(" client=Claude Code rm"), line)
 
+    def test_client_suffix_cleaning(self):
+        from mlx_lm.server import _client_suffix
+
+        self.assertEqual(_client_suffix(None), "")
+        self.assertEqual(_client_suffix(" ;=\r\n "), "")
+        self.assertEqual(_client_suffix("Codex"), " client=Codex")
+        self.assertEqual(_client_suffix("caf\u00e9\u00b2 x"), " client=caf x")
+        self.assertEqual(_client_suffix("a" * 39 + " b"), " client=" + "a" * 39)
+
     def test_request_stats_use_generation_times(self):
         # A slow client doesn't stretch the decode time: tokens carry when
         # the generation thread made them.

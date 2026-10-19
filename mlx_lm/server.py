@@ -366,8 +366,8 @@ def _client_suffix(name):
     last on the line (the name may have spaces)."""
     if not name:
         return ""
-    clean = "".join(c for c in str(name) if c.isalnum() or c in " ._-")
-    clean = clean.strip()[:40]
+    clean = "".join(c for c in str(name) if c.isascii() and (c.isalnum() or c in " ._-"))
+    clean = clean.strip()[:40].strip()
     return f" client={clean}" if clean else ""
 
 
