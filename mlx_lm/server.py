@@ -531,6 +531,8 @@ class ModelProvider:
         self.image_inputs = None
 
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
+        if self.is_distributed and getattr(self.cli_args, "experts_on_disk", None) is not None:
+            raise ValueError("Experts on disk is not supported in distributed mode")
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
         ):

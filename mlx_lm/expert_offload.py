@@ -21,7 +21,9 @@ import json
 import logging
 import os
 import struct
+import sys
 import threading
+import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -58,36 +60,47 @@ def _tensor_index(model_path):
 
 
 def _file_prefix(module_path, index):
-    """The checkpoint's name for a module ("language_model.model.layers.3.
-    experts.switch_glu" may be "model.language_model.layers.3.experts.
-    switch_glu" on disk): the one ending in the same "layers.N...." part,
-    the closest in its other parts when there are several (an MTP head's
-    layer 0)."""
+    """The checkpoint's name for a module: the same "layers.N...." tail and
+    the same names before it in any order ("language_model.model" is
+    "model.language_model" on disk). None if not exactly one matches."""
     i = module_path.find("layers.")
     if i < 0:
         return None
     tail = module_path[i:]
-    suffix = "." + tail + ".gate_proj.weight"
-    found = [k[: -len(".gate_proj.weight")] for k in index if k.endswith(suffix) or k == tail + ".gate_proj.weight"]
-    if not found:
-        return None
-    head = set(module_path[:i].split("."))
-    return max(found, key=lambda k: len(head & set(k[: k.find("layers.")].split("."))))
+    head = set(filter(None, module_path[:i].split(".")))
+    found = []
+    for k in index:
+        if not k.endswith(".gate_proj.weight"):
+            continue
+        prefix = k[: -len(".gate_proj.weight")]
+        j = prefix.find("layers.")
+        if j >= 0 and prefix[j:] == tail and set(filter(None, prefix[:j].split("."))) == head:
+            found.append(prefix)
+    return found[0] if len(found) == 1 else None
+
+
+def _close(pool, fds):
+    pool.shutdown(wait=False)
+    for fd in fds.values():
+        os.close(fd)
 
 
 class _Reader:
-    """pread off the page cache, a file descriptor per file, from a pool."""
+    """pread from a pool, a file descriptor per file, past the page cache
+    on macOS. Closed with the model."""
 
     def __init__(self, threads=8):
         self.pool = ThreadPoolExecutor(threads)
         self.fds = {}
         self.lock = threading.Lock()
+        weakref.finalize(self, _close, self.pool, self.fds)
 
     def fd(self, f):
         with self.lock:
             if f not in self.fds:
                 fd = os.open(f, os.O_RDONLY)
-                fcntl.fcntl(fd, _F_NOCACHE, 1)
+                if sys.platform == "darwin":
+                    fcntl.fcntl(fd, _F_NOCACHE, 1)
                 self.fds[f] = fd
             return self.fds[f]
 
@@ -108,6 +121,7 @@ class _ExpertStore:
             for p in ("gate_proj", "up_proj", "down_proj")
         }
         self.reads = 0
+        self.lock = threading.Lock()
 
     def _read(self, e):
         return e, {
@@ -136,7 +150,7 @@ class _ExpertStore:
                 self.cache.move_to_end(e)
             elif keep:
                 self.cache[e] = got[e]
-        while len(self.cache) > max(self.capacity, len(used) if keep else 0):
+        while len(self.cache) > self.capacity:
             self.cache.popitem(last=False)
         return out
 
@@ -158,6 +172,10 @@ class OffloadedSwitchGLU(switch_layers.SwitchGLU):
     """A SwitchGLU whose experts are read from disk as they're needed."""
 
     def __call__(self, x, indices):
+        with self._expert_store.lock:
+            return self._call(x, indices)
+
+    def _call(self, x, indices):
         store = self._expert_store
         idx = np.array(indices)  # what the router chose: needed to read
         flat = idx.reshape(-1, idx.shape[-1])
@@ -211,6 +229,8 @@ def offload_experts(model, model_path, share):
             continue
         if any(getattr(getattr(m, p), "global_scale", None) is not None for p in ("gate_proj", "up_proj", "down_proj")):
             continue  # per-expert nvfp4 scales: not handled here
+        if any("bias" in getattr(m, p) for p in ("gate_proj", "up_proj", "down_proj")):
+            continue  # experts with a linear bias: kept in memory
         prefix = _file_prefix(name, index)
         if prefix is None:
             continue

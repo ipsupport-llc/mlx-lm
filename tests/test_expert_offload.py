@@ -72,7 +72,27 @@ class TestExpertOffload(unittest.TestCase):
                 self.assertTrue(mx.allclose(got, expected, atol=1e-3, rtol=1e-3).item(), f"share {share}")
                 # Never more experts kept than the share allows.
                 for m in layers:
-                    self.assertLessEqual(len(m._expert_store.cache), max(2, round(8 * share)))
+                    self.assertLessEqual(len(m._expert_store.cache), max(1, round(8 * share)))
+
+
+class TestFilePrefix(unittest.TestCase):
+    def test_names(self):
+        from mlx_lm.expert_offload import _file_prefix
+
+        index = {
+            "model.language_model.layers.3.experts.switch_glu.gate_proj.weight": 0,
+            "model.layers.0.mlp.switch_mlp.gate_proj.weight": 0,
+            "mtp.layers.0.mlp.switch_mlp.gate_proj.weight": 0,
+        }
+        # Wrapper names in another order.
+        self.assertEqual(
+            _file_prefix("language_model.model.layers.3.experts.switch_glu", index),
+            "model.language_model.layers.3.experts.switch_glu",
+        )
+        # An MTP head's layer 0 is not the model's.
+        self.assertEqual(_file_prefix("model.layers.0.mlp.switch_mlp", index), "model.layers.0.mlp.switch_mlp")
+        self.assertEqual(_file_prefix("mtp.layers.0.mlp.switch_mlp", index), "mtp.layers.0.mlp.switch_mlp")
+        self.assertIsNone(_file_prefix("other.layers.0.mlp.switch_mlp", index))
 
 
 if __name__ == "__main__":

@@ -1028,7 +1028,7 @@ def load_model(
     # Routed experts read from disk as they're needed, before anything is
     # evaluated: their stacked arrays are never loaded.
     share = config.get("experts_on_disk")
-    if share:
+    if share is not None:
         from .expert_offload import offload_experts
 
         offload_experts(model, str(model_path), float(share))
@@ -1140,6 +1140,8 @@ def load(
     """
     model_path = _download(path_or_hf_repo, revision=revision)
 
+    if adapter_path is not None and (model_config or {}).get("experts_on_disk") is not None:
+        raise ValueError("Experts on disk can't be used with adapters.")
     model, config = load_model(
         model_path,
         lazy,
