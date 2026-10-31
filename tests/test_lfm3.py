@@ -53,6 +53,16 @@ class TestLfm3(unittest.TestCase):
         # Past the sliding window too.
         np.testing.assert_allclose(np.array(stepped), np.array(full), atol=1e-4, rtol=1e-4)
 
+    def test_defaults(self):
+        args = lfm3.ModelArgs.from_dict({"model_type": "lfm3", "num_hidden_layers": 8, "tie_embedding": False})
+        self.assertEqual(args.layer_types[:5], ["conv", "conv", "full_attention", "conv", "sliding_attention"])
+        self.assertEqual(args.rope_parameters["full_attention"]["partial_rotary_factor"], 0.5)
+        self.assertFalse(args.tie_word_embeddings)
+        with self.assertRaises(ValueError):
+            lfm3.ModelArgs.from_dict(
+                {"model_type": "lfm3", "rope_parameters": {"full_attention": {"rope_type": "yarn", "rope_theta": 1e6}}}
+            )
+
     def test_sanitize(self):
         model = lfm3.Model(_args())
         w = {

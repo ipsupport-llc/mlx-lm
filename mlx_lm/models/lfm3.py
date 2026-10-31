@@ -19,36 +19,54 @@ from .cache import ArraysCache, KVCache, RotatingKVCache
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    norm_eps: float
-    conv_bias: bool
-    conv_L_cache: int
-    layer_types: List[str]
+    model_type: str = "lfm3"
+    vocab_size: int = 128_000
+    hidden_size: int = 2048
+    intermediate_size: int = 7680
+    num_hidden_layers: int = 24
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 4
+    norm_eps: float = 1e-5
+    conv_bias: bool = False
+    conv_L_cache: int = 7
+    layer_types: Optional[List[str]] = None
     head_dim: Optional[int] = None
     sliding_window: int = 256
     use_sandwich_norm: bool = True
     rope_parameters: Optional[Dict[str, Any]] = None
     tie_word_embeddings: bool = True
+    tie_embedding: Optional[bool] = None
 
     def __post_init__(self):
+        # Defaults as in the Hugging Face configuration.
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
         if self.rope_parameters is None:
-            self.rope_parameters = {}
+            self.rope_parameters = {
+                "full_attention": {"rope_theta": 1_000_000.0, "partial_rotary_factor": 0.5},
+                "sliding_attention": {"rope_theta": 10_000.0},
+            }
+        if self.layer_types is None:
+            self.layer_types = [
+                "full_attention" if i % 4 == 2 else "sliding_attention" if i % 4 == 0 and i > 0 else "conv"
+                for i in range(self.num_hidden_layers)
+            ]
+        if self.tie_embedding is not None:
+            self.tie_word_embeddings = self.tie_embedding
+        for t in set(self.layer_types) - {"conv"}:
+            params = self.rope_parameters.get(t)
+            if params is None:
+                raise ValueError(f"rope_parameters has no entry for the {t} layers")
+            if params.get("rope_type", "default") != "default":
+                raise ValueError(f"RoPE type {params['rope_type']} is not supported for LFM3")
 
 
 def _rope_freqs(args: ModelArgs, layer_type: str) -> mx.array:
     """RoPE periods for mx.fast.rope over the whole head. A partial rotary
     factor keeps the full head's frequency progression for the first pairs
     and leaves the others unrotated (an infinite period)."""
-    params = args.rope_parameters.get(layer_type, {})
-    base = params.get("rope_theta", 10000.0)
+    params = args.rope_parameters[layer_type]
+    base = params["rope_theta"]
     dim = args.head_dim
     angles = int(params.get("partial_rotary_factor", 1.0) * dim) // 2
     periods = base ** (mx.arange(0, 2 * angles, 2, dtype=mx.float32) / dim)
