@@ -576,6 +576,7 @@ class ModelProvider:
                     ),
                     "lazy_towers": getattr(self.cli_args, "lazy_towers", False),
                     "experts_on_disk": getattr(self.cli_args, "experts_on_disk", None),
+                    **looped_model_config(self.cli_args),
                 },
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
@@ -3451,6 +3452,21 @@ def run(
         response_generator.join()
 
 
+def looped_model_config(cli_args) -> dict:
+    """Config overrides for a looped model (Dory). A flag left out keeps the
+    model's own value."""
+    out = {}
+    loops = getattr(cli_args, "recurrent_loops", None)
+    if loops is not None:
+        if not 1 <= loops <= 4:
+            raise ValueError(f"--recurrent-loops must be 1-4, got {loops}")
+        out["n_recurrent_loops"] = loops
+    mode = getattr(cli_args, "recurrent_kv_cache", None)
+    if mode is not None:
+        out["recurrent_kv_cache_mode"] = mode
+    return out
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
@@ -3736,6 +3752,25 @@ def make_parser():
         "--lazy-towers",
         action="store_true",
         help="Load the image and audio towers on their first use",
+    )
+    parser.add_argument(
+        "--recurrent-loops",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Looped models (Dory): how many times the recurrent block runs "
+        "per token, 1-4. More loops, better answers, slower. Default: the "
+        "model's config",
+    )
+    parser.add_argument(
+        "--recurrent-kv-cache",
+        choices=["per_loop", "last_loop"],
+        default=None,
+        help="Looped models (Dory): per_loop keeps a KV cache for every loop "
+        "(the trained setting); last_loop keeps only the last loop's: less "
+        "memory at long contexts, but earlier loops then read the last "
+        "loop's KV, so output depends on prefill chunking. Default: the "
+        "model's config",
     )
     parser.add_argument(
         "--experts-on-disk",
