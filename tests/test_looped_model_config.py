@@ -221,6 +221,16 @@ class TestRequestLoopsOverHTTP(unittest.TestCase):
         self.assertEqual(self.provider.model_key[3], 1)
         self.assertEqual(len(self.provider.model.make_cache()), 8)
 
+    def test_default_by_number_joins_the_batch(self):
+        from mlx_lm.server import ModelDescription
+
+        self.complete()
+        same = self.generator._same_model
+        a = ModelDescription("default_model", "default_model", None)
+        self.assertTrue(same(a, ModelDescription(a.model, a.draft, None, loops=2)))
+        self.assertFalse(same(a, ModelDescription(a.model, a.draft, None, loops=3)))
+        self.assertFalse(same(None, a))
+
     def test_bad_loops_refused(self):
         for bad in (0, 5, "2", True, 2.5):
             status, body = self.complete(recurrent_loops=bad)

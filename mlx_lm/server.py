@@ -1046,6 +1046,16 @@ class ResponseGenerator:
             or getattr(self.model_provider, "draft_model", None) is not None
         )
 
+    def _same_model(self, a, b):
+        # The default loop count asked for by number is the same model.
+        default = getattr(self.model_provider, "default_loops", None)
+
+        def key(d):
+            loops = (getattr(d, "loops", None) or default) if default else None
+            return (d.model, d.draft, d.adapter, loops)
+
+        return a is not None and key(a) == key(b)
+
     def _is_batchable(self, args, request=None, alone=True):
         """Whether the request runs in the batch. A speculative one (MTP,
         draft model) runs on its own while it's `alone` -- the fastest for
@@ -1203,7 +1213,7 @@ class ResponseGenerator:
                     )
                     if (
                         batch_generator is not None
-                        and current_model == args.model
+                        and self._same_model(current_model, args.model)
                         and self._is_batchable(args, request, alone=alone)
                     ):
                         try:
