@@ -25,7 +25,7 @@ it lives in `generate.gemma4_mtp_generate_step`.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn

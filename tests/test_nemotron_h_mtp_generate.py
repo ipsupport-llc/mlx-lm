@@ -103,13 +103,19 @@ class TestNemotronHMTPGenerate(unittest.TestCase):
         model = Model(tiny_args())
         prompt = mx.random.randint(0, 64, (23,))
         one_shot = [
-            t for t, _, _ in nemotron_h_mtp_generate_step(prompt, model, max_tokens=12, prefill_step_size=4096)
+            t
+            for t, _, _ in nemotron_h_mtp_generate_step(
+                prompt, model, max_tokens=12, prefill_step_size=4096
+            )
         ]
         progress = []
         chunked = [
             t
             for t, _, _ in nemotron_h_mtp_generate_step(
-                prompt, model, max_tokens=12, prefill_step_size=5,
+                prompt,
+                model,
+                max_tokens=12,
+                prefill_step_size=5,
                 prompt_progress_callback=lambda n, total: progress.append((n, total)),
             )
         ]
@@ -282,14 +288,21 @@ class TestNemotronHMTPGenerate(unittest.TestCase):
             lp = (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).squeeze(0)
             tok = mx.argmax(lp).item()
             plain.append((tok, lp))
-            logits = model.lm_head(model.backbone(mx.array([[tok]]), cache=cache)[:, -1, :])
+            logits = model.lm_head(
+                model.backbone(mx.array([[tok]]), cache=cache)[:, -1, :]
+            )
 
         emitted = []
 
         def oracle(hidden_last, tok, mtp_cache):
             # `tok` is the last emitted token (already in `emitted`).
             seq = mx.concatenate([prompt, mx.array(emitted)])
-            nxt = mx.argmax(model.lm_head(model.backbone(seq[None], cache=model.make_cache())[:, -1, :]), axis=-1)
+            nxt = mx.argmax(
+                model.lm_head(
+                    model.backbone(seq[None], cache=model.make_cache())[:, -1, :]
+                ),
+                axis=-1,
+            )
             fake = mx.full((1, 1, 64), -5.0)
             fake[..., nxt.item()] = 5.0
             return fake, None
@@ -303,7 +316,10 @@ class TestNemotronHMTPGenerate(unittest.TestCase):
             accepted += from_draft
             self.assertEqual(tok, plain[i][0])
             # A 2-token verify pass vs 1-token steps: ~3e-3 of float noise.
-            self.assertTrue(mx.allclose(lp, plain[i][1], atol=1e-2).item(), f"token {i} (from_draft={from_draft})")
+            self.assertTrue(
+                mx.allclose(lp, plain[i][1], atol=1e-2).item(),
+                f"token {i} (from_draft={from_draft})",
+            )
             # Not the head's: its fake logits put ~0 on the drafted token.
             self.assertLess(lp[tok].item(), -0.5)
         self.assertGreater(accepted, 3, "the oracle should get drafts accepted")

@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 """MLX implementation of the ESM-C sparse autoencoders.
 
 Port of `esm.models.esmc.sae`. A published repo holds one SAE per backbone

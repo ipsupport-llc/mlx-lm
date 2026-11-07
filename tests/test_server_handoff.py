@@ -7,7 +7,6 @@ as if it had run alone to the end, the other request served at once."""
 import http.server
 import json
 import threading
-import time
 import unittest
 
 import requests
@@ -15,15 +14,21 @@ import requests
 from mlx_lm.generate import StopSequences
 from mlx_lm.models.cache import LRUPromptCache, make_prompt_cache
 from mlx_lm.server import APIHandler, ResponseGenerator, _ResumedStopSequences
-
 from tests.test_server import DummyModelProvider
 
 
 def _stream(port, prompt, max_tokens, out, key, started=None):
-    body = {"model": "chat_model", "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens, "temperature": 0.0, "stream": True}
+    body = {
+        "model": "chat_model",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": True,
+    }
     text = []
-    with requests.post(f"http://localhost:{port}/v1/chat/completions", json=body, stream=True) as r:
+    with requests.post(
+        f"http://localhost:{port}/v1/chat/completions", json=body, stream=True
+    ) as r:
         for line in r.iter_lines():
             if not line.startswith(b"data: ") or line == b"data: [DONE]":
                 continue
@@ -42,7 +47,9 @@ class TestBatchHandoff(unittest.TestCase):
     def setUpClass(cls):
         cls.provider = DummyModelProvider(with_draft=True)
         cls.generator = ResponseGenerator(cls.provider, LRUPromptCache())
-        cls.httpd = http.server.ThreadingHTTPServer(("localhost", 0), lambda *a, **k: APIHandler(cls.generator, *a, **k))
+        cls.httpd = http.server.ThreadingHTTPServer(
+            ("localhost", 0), lambda *a, **k: APIHandler(cls.generator, *a, **k)
+        )
         cls.port = cls.httpd.server_port
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
 
@@ -66,11 +73,14 @@ class TestBatchHandoff(unittest.TestCase):
     def test_the_batch_takes_the_models_slots_only(self):
         model = self.provider.model
         both = make_prompt_cache(model) + make_prompt_cache(self.provider.draft_model)
-        self.assertEqual(len(self.generator._main_slots(both)), len(make_prompt_cache(model)))
+        self.assertEqual(
+            len(self.generator._main_slots(both)), len(make_prompt_cache(model))
+        )
         self.assertIsNone(self.generator._main_slots(None))
 
     def test_distributed_never_switches_by_load(self):
         from queue import Queue
+
         gen = object.__new__(ResponseGenerator)
         gen.requests = Queue()
         gen.requests.put(("x", None, None))
@@ -88,7 +98,9 @@ class TestBatchHandoff(unittest.TestCase):
 
         out = {}
         started = threading.Event()
-        ta = threading.Thread(target=_stream, args=(self.port, prompt_a, 300, out, "a", started))
+        ta = threading.Thread(
+            target=_stream, args=(self.port, prompt_a, 300, out, "a", started)
+        )
         ta.start()
         self.assertTrue(started.wait(60))
         tb = threading.Thread(target=_stream, args=(self.port, prompt_b, 20, out, "b"))
@@ -96,23 +108,32 @@ class TestBatchHandoff(unittest.TestCase):
         ta.join(120)
         tb.join(120)
 
-        self.assertEqual(getattr(self.generator, "handoffs", 0), before + 1, "A moved into the batch")
+        self.assertEqual(
+            getattr(self.generator, "handoffs", 0), before + 1, "A moved into the batch"
+        )
         # Up to the move, what it sent alone; then it goes on from there --
         # nothing repeated or lost at the seam. (After it, the batch's 4-bit
         # numerics may pick another token than the single path would.)
         sent = self.generator.last_handoff_sent
         self.assertTrue(sent)
-        self.assertTrue(alone["a"].startswith(sent), "the single path's text up to the move")
+        self.assertTrue(
+            alone["a"].startswith(sent), "the single path's text up to the move"
+        )
         self.assertTrue(out["a"].startswith(sent))
         self.assertGreater(len(out["a"]), len(sent) + 20, "it went on in the batch")
         seam = len(sent)
         common = 0
-        while common < min(len(out["a"]), len(alone["a"])) and out["a"][common] == alone["a"][common]:
+        while (
+            common < min(len(out["a"]), len(alone["a"]))
+            and out["a"][common] == alone["a"][common]
+        ):
             common += 1
         self.assertGreaterEqual(common, seam)
         # The first tokens after the seam are the batch's own greedy picks
         # from the same context: identical to the single path's.
-        self.assertGreaterEqual(common, seam + 3, "the first words after the move match too")
+        self.assertGreaterEqual(
+            common, seam + 3, "the first words after the move match too"
+        )
         self.assertTrue(out["b"])
 
 

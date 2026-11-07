@@ -69,10 +69,14 @@ class MixtralAttention(nn.Module):
             self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias
         )
         self.k_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
         )
         self.v_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=args.attention_bias
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
         )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias
@@ -149,6 +153,7 @@ class MixtralSparseMoeBlock(nn.Module):
         y = (y * scores[..., None]).sum(axis=-2)
 
         return y
+
 
 class MixtralDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):

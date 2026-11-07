@@ -71,9 +71,7 @@ def make_model(moe=False, **overrides):
 
 
 def greedy_plain(model, prompt, n):
-    return [
-        t for t, _ in zip((t for t, _ in generate_step(prompt, model)), range(n))
-    ]
+    return [t for t, _ in zip((t for t, _ in generate_step(prompt, model)), range(n))]
 
 
 def close(a, b):
@@ -267,7 +265,9 @@ class TestQwen35MTP(unittest.TestCase):
             ]
             self.assertEqual(out, plain[:n])
             ref = model.make_cache()
-            model.language_model.backbone(mx.array(sequence[: len(prompt) + n])[None], cache=ref)
+            model.language_model.backbone(
+                mx.array(sequence[: len(prompt) + n])[None], cache=ref
+            )
             for a, b in zip(cache_state(cache), cache_state(ref)):
                 self.assertTrue(close(a, b), f"n={n}")
 
@@ -304,7 +304,9 @@ class TestQwen35MTP(unittest.TestCase):
         oracle.install()
         caches = []
         real_make = m.language_model.make_mtp_cache
-        m.language_model.make_mtp_cache = lambda: caches.append(real_make()) or caches[-1]
+        m.language_model.make_mtp_cache = (
+            lambda: caches.append(real_make()) or caches[-1]
+        )
         out = [
             t
             for t, _, _ in mtp_generate_step(
@@ -354,9 +356,19 @@ class TestQwen35MTP(unittest.TestCase):
                 got[tuple(t for t, *_ in fn())] += 1
             return got
 
-        mtp = pairs(lambda: mtp_generate_step(
-            prompt, model, num_draft_tokens=1, adaptive=False, max_tokens=2, sampler=sampler))
-        plain = pairs(lambda: generate_step(prompt, model, max_tokens=2, sampler=sampler))
+        mtp = pairs(
+            lambda: mtp_generate_step(
+                prompt,
+                model,
+                num_draft_tokens=1,
+                adaptive=False,
+                max_tokens=2,
+                sampler=sampler,
+            )
+        )
+        plain = pairs(
+            lambda: generate_step(prompt, model, max_tokens=2, sampler=sampler)
+        )
         tv = sum(abs(mtp[k] - plain[k]) for k in set(mtp) | set(plain)) / (2 * n)
         self.assertLess(tv, 0.08)
 
@@ -412,7 +424,9 @@ class TestQwen35MTP(unittest.TestCase):
             ]
             self.assertEqual(out, plain)
             ref = model.make_cache()
-            model.language_model.backbone(mx.array(sequence[: len(prompt) + 40])[None], cache=ref)
+            model.language_model.backbone(
+                mx.array(sequence[: len(prompt) + 40])[None], cache=ref
+            )
             for a, b in zip(cache_state(cache), cache_state(ref)):
                 self.assertTrue(close(a, b))
 
@@ -447,7 +461,9 @@ class TestQwen35MTP(unittest.TestCase):
                 ):
                     pass
                 for offset, quantized in seen:
-                    self.assertEqual(quantized, offset >= start, f"start={start} at {offset}")
+                    self.assertEqual(
+                        quantized, offset >= start, f"start={start} at {offset}"
+                    )
 
     def test_kv_cache_left_unquantized_below_the_start_at_any_stop(self):
         from mlx_lm.generate import kv_cache_quantized
@@ -464,15 +480,24 @@ class TestQwen35MTP(unittest.TestCase):
                 cache = m.make_cache()
                 # Stopped by the consumer (EOS, a stop sequence): it can be
                 # inside a block of accepted drafts.
-                gen = mtp_generate_step(prompt, m, num_draft_tokens=3, adaptive=False,
-                                        max_tokens=100, prompt_cache=cache, **kw)
+                gen = mtp_generate_step(
+                    prompt,
+                    m,
+                    num_draft_tokens=3,
+                    adaptive=False,
+                    max_tokens=100,
+                    prompt_cache=cache,
+                    **kw,
+                )
                 for i, _ in enumerate(gen):
                     if i + 1 == n:
                         break
                 gen.close()
                 offset = next(c.offset for c in cache if c.is_trimmable())
                 self.assertEqual(offset, len(prompt) + n)
-                self.assertEqual(kv_cache_quantized(cache), offset >= start, f"{start} {n}")
+                self.assertEqual(
+                    kv_cache_quantized(cache), offset >= start, f"{start} {n}"
+                )
 
     def test_last_token_fed_on_a_quantized_cache_past_the_start(self):
         from mlx_lm.generate import kv_cache_quantized
@@ -493,11 +518,21 @@ class TestQwen35MTP(unittest.TestCase):
                 return real(inputs, cache=cache, ssm_sink=ssm_sink)
 
             m.language_model.backbone = backbone
-            for _ in mtp_generate_step(prompt, m, num_draft_tokens=3, adaptive=False, max_tokens=20,
-                                       kv_bits=8, kv_group_size=32, quantized_kv_start=start):
+            for _ in mtp_generate_step(
+                prompt,
+                m,
+                num_draft_tokens=3,
+                adaptive=False,
+                max_tokens=20,
+                kv_bits=8,
+                kv_group_size=32,
+                quantized_kv_start=start,
+            ):
                 pass
             for offset, quantized in seen:
-                self.assertEqual(quantized, offset >= start, f"start={start} at {offset}")
+                self.assertEqual(
+                    quantized, offset >= start, f"start={start} at {offset}"
+                )
 
     def test_zero_drafts_never_run_the_head(self):
         model = make_model()
@@ -505,7 +540,12 @@ class TestQwen35MTP(unittest.TestCase):
         real = model.language_model.mtp_step
         model.language_model.mtp_step = lambda *a: calls.append(1) or real(*a)
         prompt = mx.random.randint(0, VOCAB, (9,))
-        out = [t for t, _, _ in mtp_generate_step(prompt, model, num_draft_tokens=0, max_tokens=8)]
+        out = [
+            t
+            for t, _, _ in mtp_generate_step(
+                prompt, model, num_draft_tokens=0, max_tokens=8
+            )
+        ]
         self.assertEqual(out, greedy_plain(model, prompt, 8))
         self.assertEqual(calls, [])
 
@@ -518,13 +558,29 @@ class TestQwen35MTP(unittest.TestCase):
             shapes.append(logprobs.shape[0])
             return mx.argmax(logprobs, axis=-1)
 
-        list(mtp_generate_step(prompt, model, num_draft_tokens=2, adaptive=False,
-                               max_tokens=8, sampler=sampler))
+        list(
+            mtp_generate_step(
+                prompt,
+                model,
+                num_draft_tokens=2,
+                adaptive=False,
+                max_tokens=8,
+                sampler=sampler,
+            )
+        )
         self.assertEqual(set(shapes), {1})
         shapes.clear()
         sampler.rows_independent = True
-        list(mtp_generate_step(prompt, model, num_draft_tokens=2, adaptive=False,
-                               max_tokens=8, sampler=sampler))
+        list(
+            mtp_generate_step(
+                prompt,
+                model,
+                num_draft_tokens=2,
+                adaptive=False,
+                max_tokens=8,
+                sampler=sampler,
+            )
+        )
         self.assertIn(3, shapes)
         self.assertTrue(make_sampler(temp=1.0, top_p=0.9).rows_independent)
         self.assertFalse(make_sampler(temp=1.0, xtc_probability=0.5).rows_independent)
@@ -544,8 +600,12 @@ class TestQwen35MTP(unittest.TestCase):
 
         gen.mtp_generate_step = spy
         try:
-            out = [r.token for r in stream_generate(model, Tokenizer(), prompt,
-                                                    max_tokens=6, num_draft_tokens=0)]
+            out = [
+                r.token
+                for r in stream_generate(
+                    model, Tokenizer(), prompt, max_tokens=6, num_draft_tokens=0
+                )
+            ]
         finally:
             gen.mtp_generate_step = real
         self.assertEqual(out, greedy_plain(model, prompt, 6))
@@ -563,10 +623,19 @@ class TestQwen35MTP(unittest.TestCase):
             if ".mtp." in k and ".switch_mlp." in k:
                 prefix, rest = k.split(".switch_mlp.")
                 for e in range(v.shape[0]):
-                    raw[f"model.{prefix[len('language_model.'):]}.experts.{e}.{rest}"] = v[e]
+                    raw[
+                        f"model.{prefix[len('language_model.'):]}.experts.{e}.{rest}"
+                    ] = v[e]
             elif ".mtp." in k:
                 # Raw names, raw (zero-centered) norms.
-                raw["model." + k[len("language_model."):]] = v - 1.0 if k.endswith(("norm.weight", "norm_hidden.weight", "norm_embedding.weight")) and v.ndim == 1 else v
+                raw["model." + k[len("language_model.") :]] = (
+                    v - 1.0
+                    if k.endswith(
+                        ("norm.weight", "norm_hidden.weight", "norm_embedding.weight")
+                    )
+                    and v.ndim == 1
+                    else v
+                )
             else:
                 raw[k] = v
         out = model.sanitize(raw)
@@ -579,10 +648,17 @@ class TestQwen35MTP(unittest.TestCase):
         (FrogNano's mtp.norm averages 2.6): told apart by the tensor names."""
         model = make_model()
         weights = dict(tree_flatten(model.parameters()))
-        norm_suffixes = ("layernorm.weight", "norm.weight", "pre_fc_norm_hidden.weight",
-                         "pre_fc_norm_embedding.weight")
-        head_norms = [k for k, v in weights.items() if ".mtp." in k and v.ndim == 1
-                      and k.endswith(norm_suffixes)]
+        norm_suffixes = (
+            "layernorm.weight",
+            "norm.weight",
+            "pre_fc_norm_hidden.weight",
+            "pre_fc_norm_embedding.weight",
+        )
+        head_norms = [
+            k
+            for k, v in weights.items()
+            if ".mtp." in k and v.ndim == 1 and k.endswith(norm_suffixes)
+        ]
         self.assertTrue(head_norms)
         for k in head_norms:
             weights[k] = weights[k] * 2.5  # a trained head's, converted (1 + w)
@@ -591,7 +667,7 @@ class TestQwen35MTP(unittest.TestCase):
         raw = {}
         for k, v in weights.items():
             if k.startswith("language_model.mtp."):
-                k2 = k[len("language_model."):]
+                k2 = k[len("language_model.") :]
                 raw[k2] = v - 1.0 if k in head_norms else v
             else:
                 raw[k] = v
@@ -602,6 +678,7 @@ class TestQwen35MTP(unittest.TestCase):
         out = make_model().sanitize(dict(weights))
         for k in head_norms:
             self.assertTrue(mx.array_equal(out[k], weights[k]), k)
+
 
 class TestDraftLength(unittest.TestCase):
     def feed(self, lengths, p, seconds, n=200):

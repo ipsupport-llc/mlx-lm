@@ -9,7 +9,7 @@ import mlx.core as mx
 try:
     from mlx_lm.evaluate import MLXLM
 except ImportError as e:  # lm_eval is an optional dependency
-    raise unittest.SkipTest(f"mlx_lm.evaluate needs lm_eval: {e}")
+    raise unittest.SkipTest(f"mlx_lm.evaluate needs lm_eval: {e}") from e
 
 
 class TestMLXLM(unittest.TestCase):

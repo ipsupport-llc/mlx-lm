@@ -26,7 +26,10 @@ from .cache import KVCache, RotatingKVCache
 # Glimmer answers in Muse Spark's message format (to=self / to=user
 # headers, <|eom|> between messages): its state machine transitions.
 # Stop on <|eot|>, not on <|eom|>.
-TOKENIZER_DEFAULTS = {"chat_template_type": "muse_spark", "eos_token_ids": [200001, 200008]}
+TOKENIZER_DEFAULTS = {
+    "chat_template_type": "muse_spark",
+    "eos_token_ids": [200001, 200008],
+}
 
 
 @dataclass

@@ -377,7 +377,9 @@ class PatchEmbedder(nn.Module):
         y_emb = mx.take(self.position_embedding_table[1], clamped[..., 1], axis=0)
         position_embeddings = x_emb + y_emb
         position_embeddings = mx.where(
-            padding_positions[..., None], mx.zeros_like(position_embeddings), position_embeddings
+            padding_positions[..., None],
+            mx.zeros_like(position_embeddings),
+            position_embeddings,
         )
         return hidden_states + position_embeddings
 

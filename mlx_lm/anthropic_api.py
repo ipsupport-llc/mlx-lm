@@ -50,7 +50,11 @@ def _user_messages(content) -> List[dict]:
             if block.get("is_error"):
                 text = f"Error: {text}"
             out.append(
-                {"role": "tool", "tool_call_id": block.get("tool_use_id", ""), "content": text}
+                {
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id", ""),
+                    "content": text,
+                }
             )
             # A tool message holds text only: its images go with the user part.
             if isinstance(result, list):
@@ -90,7 +94,9 @@ def _assistant_message(content) -> dict:
                     "type": "function",
                     "function": {
                         "name": block.get("name", ""),
-                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                        "arguments": json.dumps(
+                            block.get("input") or {}, ensure_ascii=False
+                        ),
                     },
                 }
             )
@@ -131,7 +137,9 @@ def _add_system(messages: List[dict], text: str):
         last["content"] = (last["content"] + "\n\n" + text) if last["content"] else text
     elif last["role"] == "user":
         if isinstance(last["content"], str):
-            last["content"] = (last["content"] + "\n\n" + text) if last["content"] else text
+            last["content"] = (
+                (last["content"] + "\n\n" + text) if last["content"] else text
+            )
         else:
             last["content"].append({"type": "text", "text": "\n\n" + text})
     else:
@@ -162,7 +170,11 @@ def to_chat_request(body: dict) -> dict:
             messages.append(_assistant_message(m.get("content")))
         elif m.get("role") == "system":
             text = _system_text(m.get("content"))
-            if messages and messages[-1]["role"] == "assistant" and messages[-1].get("tool_calls"):
+            if (
+                messages
+                and messages[-1]["role"] == "assistant"
+                and messages[-1].get("tool_calls")
+            ):
                 held.append(text)
             else:
                 _add_system(messages, text)
@@ -173,7 +185,10 @@ def to_chat_request(body: dict) -> dict:
     if all(m["role"] == "system" for m in messages):
         raise ValueError("Request did not contain a user or assistant message")
 
-    chat: Dict[str, Any] = {"messages": messages, "stream": bool(body.get("stream", False))}
+    chat: Dict[str, Any] = {
+        "messages": messages,
+        "stream": bool(body.get("stream", False)),
+    }
     for key in ("model", "max_tokens", "temperature", "top_p", "top_k"):
         if body.get(key) is not None:
             chat[key] = body[key]
@@ -187,7 +202,10 @@ def to_chat_request(body: dict) -> dict:
             chat["thinking_budget"] = budget
 
     tools = body.get("tools") or []
-    if any(not isinstance(t, dict) or not isinstance(t.get("name"), str) or not t["name"] for t in tools):
+    if any(
+        not isinstance(t, dict) or not isinstance(t.get("name"), str) or not t["name"]
+        for t in tools
+    ):
         raise ValueError("Every tool needs a name.")
     # Server tools (web search etc., they carry a "type") run on Anthropic's
     # side; a local model can't call them.
@@ -207,7 +225,8 @@ def to_chat_request(body: dict) -> dict:
                 "function": {
                     "name": t["name"],
                     "description": t.get("description", ""),
-                    "parameters": t.get("input_schema") or {"type": "object", "properties": {}},
+                    "parameters": t.get("input_schema")
+                    or {"type": "object", "properties": {}},
                 },
             }
             for t in tools
@@ -237,7 +256,12 @@ def _tool_use(call: dict) -> dict:
         arguments = json.loads(fn.get("arguments") or "{}")
     except json.JSONDecodeError:
         arguments = {}
-    return {"type": "tool_use", "id": tool_use_id(call.get("id")), "name": fn.get("name", ""), "input": arguments}
+    return {
+        "type": "tool_use",
+        "id": tool_use_id(call.get("id")),
+        "name": fn.get("name", ""),
+        "input": arguments,
+    }
 
 
 def tool_use_id(call_id: Optional[str]) -> str:
@@ -265,7 +289,9 @@ def to_message(response: dict, model: str, stop_sequence: Optional[str] = None) 
     out = choice.get("message", {})
     content = []
     if out.get("reasoning"):
-        content.append({"type": "thinking", "thinking": out["reasoning"], "signature": ""})
+        content.append(
+            {"type": "thinking", "thinking": out["reasoning"], "signature": ""}
+        )
     if out.get("content"):
         content.append({"type": "text", "text": out["content"]})
     content.extend(_tool_use(c) for c in out.get("tool_calls") or [])
@@ -320,15 +346,17 @@ class MessageStream:
             "stop_sequence": None,
             "usage": _usage(prompt_tokens, 0, cached),
         }
-        return _event("message_start", {"type": "message_start", "message": message}) + _event(
-            "ping", {"type": "ping"}
-        )
+        return _event(
+            "message_start", {"type": "message_start", "message": message}
+        ) + _event("ping", {"type": "ping"})
 
     def _close(self) -> bytes:
         if self.open is None:
             return b""
         self.open = None
-        return _event("content_block_stop", {"type": "content_block_stop", "index": self.index})
+        return _event(
+            "content_block_stop", {"type": "content_block_stop", "index": self.index}
+        )
 
     def _begin(self, block: dict) -> bytes:
         out = self._close()
@@ -336,7 +364,11 @@ class MessageStream:
         self.open = block["type"]
         return out + _event(
             "content_block_start",
-            {"type": "content_block_start", "index": self.index, "content_block": block},
+            {
+                "type": "content_block_start",
+                "index": self.index,
+                "content_block": block,
+            },
         )
 
     def _delta(self, delta: dict) -> bytes:
@@ -352,8 +384,12 @@ class MessageStream:
         out = b""
         if delta.get("reasoning"):
             if self.open != "thinking":
-                out += self._begin({"type": "thinking", "thinking": "", "signature": ""})
-            out += self._delta({"type": "thinking_delta", "thinking": delta["reasoning"]})
+                out += self._begin(
+                    {"type": "thinking", "thinking": "", "signature": ""}
+                )
+            out += self._delta(
+                {"type": "thinking_delta", "thinking": delta["reasoning"]}
+            )
         if delta.get("content"):
             if self.open != "text":
                 out += self._begin({"type": "text", "text": ""})
@@ -395,7 +431,5 @@ def error_body(status: int, message: str) -> dict:
         404: "not_found_error",
         411: "invalid_request_error",
         413: "request_too_large",
-    }.get(
-        status, "api_error"
-    )
+    }.get(status, "api_error")
     return {"type": "error", "error": {"type": kind, "message": message}}

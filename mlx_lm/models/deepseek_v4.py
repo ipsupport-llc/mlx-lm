@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -293,9 +295,7 @@ def hc_split_sinkhorn(
 ):
     if _hc_split_sinkhorn_kernel is None:
         eps_val = eps.item() if isinstance(eps, mx.array) else float(eps)
-        return _hc_split_sinkhorn_ops(
-            mixes, hc_scale, hc_base, hc_mult, iters, eps_val
-        )
+        return _hc_split_sinkhorn_ops(mixes, hc_scale, hc_base, hc_mult, iters, eps_val)
     eps_arr = eps if isinstance(eps, mx.array) else mx.array([eps], dtype=mx.float32)
     return _hc_split_sinkhorn_kernel(
         inputs=[mixes, hc_scale, hc_base, eps_arr],
@@ -341,6 +341,7 @@ def _hc_collapse(pre: mx.array, x: mx.array) -> mx.array:
 
 class HyperConnection(nn.Module):
     """Per-block mHC: projects an ``[..., hc, D]`` state to ``pre``/``post``/``comb``."""
+
     def __init__(
         self,
         dim: int,
@@ -385,6 +386,7 @@ class HyperConnection(nn.Module):
 
 class HyperHead(nn.Module):
     """Final head mHC: reduces ``[B, S, hc, D]`` -> ``[B, S, D]``"""
+
     def __init__(self, dim: int, hc_mult: int, norm_eps: float, hc_eps: float):
         super().__init__()
         self.dim = dim
@@ -403,8 +405,9 @@ class HyperHead(nn.Module):
 
 
 @mx.compile
-def _compressor_rope_concat(compressed_kv: mx.array, offset: int, rd: int,
-                             ratio: float, freqs: mx.array) -> mx.array:
+def _compressor_rope_concat(
+    compressed_kv: mx.array, offset: int, rd: int, ratio: float, freqs: mx.array
+) -> mx.array:
     """Slice last rd dims, apply strided rope, concat back. Compiled fuse."""
     rotated = mx.fast.rope(
         compressed_kv[..., -rd:],
@@ -612,9 +615,9 @@ class Compressor(nn.Module):
         score_win = score[:, :usable].reshape(B, W, ratio, -1) + self.ape.astype(
             score.dtype
         )
-        weights = mx.softmax(
-            score_win.astype(mx.float32), axis=2, precise=True
-        ).astype(kv_win.dtype)
+        weights = mx.softmax(score_win.astype(mx.float32), axis=2, precise=True).astype(
+            kv_win.dtype
+        )
         compressed = (kv_win * weights).sum(axis=2)[..., :d]
         compressed = self.norm(compressed)
 
@@ -657,7 +660,9 @@ class Compressor(nn.Module):
         if state_kv is None:
             n_slots = self._coff * ratio
             state_kv = mx.zeros((B, n_slots, coff_d), dtype=kv.dtype)
-            state_score = mx.full((B, n_slots, coff_d), float("-inf"), dtype=score.dtype)
+            state_score = mx.full(
+                (B, n_slots, coff_d), float("-inf"), dtype=score.dtype
+            )
 
         if offset == 0:
             remainder = S % ratio
@@ -689,7 +694,9 @@ class Compressor(nn.Module):
                 out_compressed = compressed
                 buf = state[slot_compressed]
                 state[slot_compressed] = (
-                    compressed if buf is None else mx.concatenate([buf, compressed], axis=1)
+                    compressed
+                    if buf is None
+                    else mx.concatenate([buf, compressed], axis=1)
                 )
 
             if remainder > 0:
@@ -715,7 +722,9 @@ class Compressor(nn.Module):
 
         # Decode path: offset > 0
         last_compressed = None
-        ape_cast = self.ape if self.ape.dtype == score.dtype else self.ape.astype(score.dtype)
+        ape_cast = (
+            self.ape if self.ape.dtype == score.dtype else self.ape.astype(score.dtype)
+        )
         for i in range(S):
             step_offset = offset + i
             pos_in_window = step_offset % ratio
@@ -735,7 +744,9 @@ class Compressor(nn.Module):
                 compressed = (state_kv * weights).sum(axis=1, keepdims=True)
                 compressed = compressed[..., :d]
             compressed = self.norm(compressed)
-            compressed = self._apply_compressor_rope(compressed, step_offset + 1 - ratio)
+            compressed = self._apply_compressor_rope(
+                compressed, step_offset + 1 - ratio
+            )
             last_compressed = compressed
             buf = state[slot_compressed]
             state[slot_compressed] = (
@@ -750,7 +761,6 @@ class Compressor(nn.Module):
         state[slot_kv_state] = state_kv
         state[slot_score_state] = state_score
         return out_compressed
-
 
 
 class Indexer(nn.Module):
@@ -773,7 +783,7 @@ class Indexer(nn.Module):
         self.rope_head_dim = args.qk_rope_head_dim
         self.index_topk = args.index_topk
         self.compress_ratio = compress_ratio
-        self.softmax_scale = self.head_dim ** -0.5
+        self.softmax_scale = self.head_dim**-0.5
         self.rope = rope
         self.wq_b = nn.Linear(
             args.q_lora_rank, self.n_heads * self.head_dim, bias=False
@@ -799,7 +809,9 @@ class Indexer(nn.Module):
         rd = self.rope_head_dim
 
         self.compressor(
-            x, state, offset,
+            x,
+            state,
+            offset,
             slot_compressed=_C_IDX_COMPRESSED,
             slot_kv_state=_C_IDX_KV_STATE,
             slot_score_state=_C_IDX_SCORE_STATE,
@@ -811,13 +823,11 @@ class Indexer(nn.Module):
         q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim)
         q = _attn_partial_rope(q, offset, rd, self.rope.freqs, False)
         score = _indexer_score(
-            q, idx_kv, self.weights_proj(x), self.softmax_scale * (self.n_heads ** -0.5)
+            q, idx_kv, self.weights_proj(x), self.softmax_scale * (self.n_heads**-0.5)
         )
 
         k = min(self.index_topk, idx_kv.shape[1])
-        return mx.argpartition(-score, kth=k - 1, axis=-1)[..., :k].astype(
-            mx.int32
-        )
+        return mx.argpartition(-score, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
 
 
 def _build_window_mask(
@@ -833,19 +843,15 @@ def _build_window_mask(
         end = off + S
         cache_k = mx.arange(window_len, dtype=mx.int32)
         raw_pos_at_k = end[:, None] - window_len + cache_k[None, :]
-        win_visible = (
-            (raw_pos_at_k[:, None, :] <= q_pos[:, :, None])
-            & (raw_pos_at_k[:, None, :] > q_pos[:, :, None] - window)
+        win_visible = (raw_pos_at_k[:, None, :] <= q_pos[:, :, None]) & (
+            raw_pos_at_k[:, None, :] > q_pos[:, :, None] - window
         )
     else:
-        q_pos = mx.broadcast_to(
-            offset + mx.arange(S, dtype=mx.int32)[None, :], (B, S)
-        )
+        q_pos = mx.broadcast_to(offset + mx.arange(S, dtype=mx.int32)[None, :], (B, S))
         cache_k = mx.arange(window_len, dtype=mx.int32)
         raw_pos_at_k = (offset + S) - window_len + cache_k
-        win_visible = (
-            (raw_pos_at_k[None, None, :] <= q_pos[:, :, None])
-            & (raw_pos_at_k[None, None, :] > q_pos[:, :, None] - window)
+        win_visible = (raw_pos_at_k[None, None, :] <= q_pos[:, :, None]) & (
+            raw_pos_at_k[None, None, :] > q_pos[:, :, None] - window
         )
     return win_visible[:, None, :, :]
 
@@ -861,33 +867,39 @@ def _compressed_visibility(
         off = offset.astype(mx.int32).reshape(-1)
         q_pos = off[:, None] + mx.arange(S, dtype=mx.int32)
     else:
-        q_pos = mx.broadcast_to(
-            offset + mx.arange(S, dtype=mx.int32)[None, :], (B, S)
-        )
+        q_pos = mx.broadcast_to(offset + mx.arange(S, dtype=mx.int32)[None, :], (B, S))
     k = mx.arange(compressed_len, dtype=mx.int32)
     comp_visible = (k + 1)[None, None, :] * ratio <= (q_pos + 1)[:, :, None]
     return comp_visible[:, None, :, :]
 
 
 @mx.compile
-def _attn_q_post_matmul(q: mx.array, n_heads: int, head_dim: int, eps: float) -> mx.array:
+def _attn_q_post_matmul(
+    q: mx.array, n_heads: int, head_dim: int, eps: float
+) -> mx.array:
     B, S = q.shape[0], q.shape[1]
     q = q.reshape(B, S, n_heads, head_dim).transpose(0, 2, 1, 3)
     return mx.fast.rms_norm(q, None, eps)
 
 
 @mx.compile
-def _attn_qslice_norm(qkv_a: mx.array, weight: mx.array, q_lora: int, eps: float) -> mx.array:
+def _attn_qslice_norm(
+    qkv_a: mx.array, weight: mx.array, q_lora: int, eps: float
+) -> mx.array:
     return mx.fast.rms_norm(qkv_a[..., :q_lora], weight, eps)
 
 
 @mx.compile
-def _attn_kvslice_norm(qkv_a: mx.array, weight: mx.array, q_lora: int, eps: float) -> mx.array:
+def _attn_kvslice_norm(
+    qkv_a: mx.array, weight: mx.array, q_lora: int, eps: float
+) -> mx.array:
     return mx.fast.rms_norm(qkv_a[..., q_lora:], weight, eps)
 
 
 @mx.compile
-def _indexer_score(q: mx.array, idx_kv: mx.array, weights_proj_out: mx.array, scale: float) -> mx.array:
+def _indexer_score(
+    q: mx.array, idx_kv: mx.array, weights_proj_out: mx.array, scale: float
+) -> mx.array:
     """Indexer score reduction: einsum + relu + per-head weight + sum-over-heads.
 
     Returns score [B, S, T] = sum_h(relu(q[b,s,h,:] @ idx_kv[b,t,:]) * weights_proj_out[b,s,h] * scale)
@@ -899,7 +911,9 @@ def _indexer_score(q: mx.array, idx_kv: mx.array, weights_proj_out: mx.array, sc
 
 
 @mx.compile
-def _attn_partial_rope(x: mx.array, offset, rd: int, freqs: mx.array, inverse: bool) -> mx.array:
+def _attn_partial_rope(
+    x: mx.array, offset, rd: int, freqs: mx.array, inverse: bool
+) -> mx.array:
     nope = x[..., :-rd]
     pe = mx.fast.rope(
         x[..., -rd:],
@@ -932,16 +946,16 @@ class V4Attention(nn.Module):
         self.o_lora_rank = args.o_lora_rank
         self.window = args.sliding_window
         self.eps = args.rms_norm_eps
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
         ratios = args.compress_ratios or []
         self.compress_ratio = ratios[layer_id] if layer_id < len(ratios) else 0
 
-        self.wqkv_a = nn.Linear(
-            self.dim, self.q_lora_rank + self.head_dim, bias=False
-        )
+        self.wqkv_a = nn.Linear(self.dim, self.q_lora_rank + self.head_dim, bias=False)
         self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=self.eps)
-        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.wq_b = nn.Linear(
+            self.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
         self.kv_norm = nn.RMSNorm(self.head_dim, eps=self.eps)
 
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
@@ -988,12 +1002,18 @@ class V4Attention(nn.Module):
 
         if isinstance(self.wo_a, nn.QuantizedLinear):
             out_g = out.transpose(2, 0, 1, 3)  # [G, B, S, group_feat]
-            weight = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)[:, None]
-            scales = self.wo_a.scales.reshape(self.n_groups, self.o_lora_rank, -1)[:, None]
+            weight = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)[
+                :, None
+            ]
+            scales = self.wo_a.scales.reshape(self.n_groups, self.o_lora_rank, -1)[
+                :, None
+            ]
             biases = (
                 None
                 if self.wo_a.biases is None
-                else self.wo_a.biases.reshape(self.n_groups, self.o_lora_rank, -1)[:, None]
+                else self.wo_a.biases.reshape(self.n_groups, self.o_lora_rank, -1)[
+                    :, None
+                ]
             )
             y = mx.quantized_matmul(
                 out_g,
@@ -1005,7 +1025,9 @@ class V4Attention(nn.Module):
                 bits=self.wo_a.bits,
                 mode=self.wo_a.mode,
             )
-            return y.transpose(1, 2, 0, 3).reshape(B, S, self.n_groups * self.o_lora_rank)
+            return y.transpose(1, 2, 0, 3).reshape(
+                B, S, self.n_groups * self.o_lora_rank
+            )
 
         wa = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, group_feat)
         y = mx.einsum("bsgd,grd->bsgr", out, wa)
@@ -1045,7 +1067,9 @@ class V4Attention(nn.Module):
             win_keys, _ = win_cache.update_and_fetch(k4, k4)
             window_kv = win_keys.squeeze(1)
             _ = self.compressor(
-                x, state_cache, offset,
+                x,
+                state_cache,
+                offset,
                 slot_compressed=_C_COMPRESSED,
                 slot_kv_state=_C_COMP_KV_STATE,
                 slot_score_state=_C_COMP_SCORE_STATE,
@@ -1070,9 +1094,7 @@ class V4Attention(nn.Module):
 
         window_len = window_kv.shape[1]
         # Decode (S=1) fast path
-        use_gather = (
-            S == 1 and compressed_len > 0 and indexer_topk is not None
-        )
+        use_gather = S == 1 and compressed_len > 0 and indexer_topk is not None
         if use_gather:
             d = compressed.shape[-1]
             expanded = mx.broadcast_to(
@@ -1109,8 +1131,12 @@ class V4Attention(nn.Module):
 
         kv_all_4d = kv_all[:, None, :, :]
         o = scaled_dot_product_attention(
-            q, kv_all_4d, kv_all_4d,
-            cache=None, scale=self.scale, mask=mask,
+            q,
+            kv_all_4d,
+            kv_all_4d,
+            cache=None,
+            scale=self.scale,
+            mask=mask,
             sinks=self._sink_for(q.dtype),
         )
 
@@ -1237,13 +1263,9 @@ class MoEGate(nn.Module):
         self.weight = mx.zeros((self.n_routed, args.hidden_size))
         self._route_scale_arr = mx.array([args.routed_scaling_factor], dtype=mx.float32)
         if self.hash:
-            self.tid2eid = mx.zeros(
-                (args.vocab_size, self.top_k), dtype=mx.int32
-            )
+            self.tid2eid = mx.zeros((args.vocab_size, self.top_k), dtype=mx.int32)
         else:
-            self.e_score_correction_bias = mx.zeros(
-                (self.n_routed,), dtype=mx.float32
-            )
+            self.e_score_correction_bias = mx.zeros((self.n_routed,), dtype=mx.float32)
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
         if (
@@ -1291,7 +1313,9 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV4MLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float = 0.0):
+    def __init__(
+        self, hidden_size: int, intermediate_size: int, swiglu_limit: float = 0.0
+    ):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
@@ -1393,9 +1417,7 @@ class DeepseekV4Model(nn.Module):
         self.args = args
         self.vocab_size = args.vocab_size
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [
-            DeepseekV4Block(args, i) for i in range(args.num_hidden_layers)
-        ]
+        self.layers = [DeepseekV4Block(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.hc_head = HyperHead(
             args.hidden_size, args.hc_mult, args.rms_norm_eps, args.hc_eps
@@ -1428,9 +1450,7 @@ class Model(nn.Module):
         self.model = DeepseekV4Model(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(
-        self, inputs: mx.array, cache: Optional[List[Any]] = None
-    ) -> mx.array:
+    def __call__(self, inputs: mx.array, cache: Optional[List[Any]] = None) -> mx.array:
         h = self.model(inputs, cache)
         return self.lm_head(h)
 
@@ -1450,6 +1470,7 @@ class Model(nn.Module):
                 or "attn_sink" in k
             )
             return not keep_fp32
+
         return pred
 
     def make_cache(self):
@@ -1463,7 +1484,6 @@ class Model(nn.Module):
                 state = ArraysCache(6)
                 caches.append(CacheList(win, state))
         return caches
-
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         n_layers = self.args.num_hidden_layers
@@ -1532,12 +1552,12 @@ class Model(nn.Module):
         weights = dequanted
 
         top_remap = {
-            "embed.weight":   "model.embed_tokens.weight",
-            "norm.weight":    "model.norm.weight",
-            "head.weight":    "lm_head.weight",
-            "hc_head_fn":     "model.hc_head.fn",
-            "hc_head_base":   "model.hc_head.base",
-            "hc_head_scale":  "model.hc_head.scale",
+            "embed.weight": "model.embed_tokens.weight",
+            "norm.weight": "model.norm.weight",
+            "head.weight": "lm_head.weight",
+            "hc_head_fn": "model.hc_head.fn",
+            "hc_head_base": "model.hc_head.base",
+            "hc_head_scale": "model.hc_head.scale",
         }
         for src, dst in top_remap.items():
             if src in weights:
@@ -1574,15 +1594,19 @@ class Model(nn.Module):
 
         for l in range(n_layers):
             prefix = f"model.layers.{l}.ffn.experts"
-            for src, dst in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+            for src, dst in [
+                ("w1", "gate_proj"),
+                ("w2", "down_proj"),
+                ("w3", "up_proj"),
+            ]:
                 key0 = f"{prefix}.0.{src}.weight"
                 if key0 in weights:
                     stack = [
                         weights.pop(f"{prefix}.{e}.{src}.weight")
                         for e in range(self.args.n_routed_experts)
                     ]
-                    weights[f"model.layers.{l}.ffn.switch_mlp.{dst}.weight"] = (
-                        mx.stack(stack)
+                    weights[f"model.layers.{l}.ffn.switch_mlp.{dst}.weight"] = mx.stack(
+                        stack
                     )
                 skey0 = f"{prefix}.0.{src}.scale"
                 if skey0 in weights:
@@ -1590,8 +1614,8 @@ class Model(nn.Module):
                         weights.pop(f"{prefix}.{e}.{src}.scale")
                         for e in range(self.args.n_routed_experts)
                     ]
-                    weights[
-                        f"model.layers.{l}.ffn.switch_mlp.{dst}.scales"
-                    ] = mx.stack(sstack)
+                    weights[f"model.layers.{l}.ffn.switch_mlp.{dst}.scales"] = mx.stack(
+                        sstack
+                    )
 
         return weights

@@ -59,9 +59,13 @@ class RotatedQuantizedLinear(nn.QuantizedLinear):
         return super().__call__(x)
 
     @classmethod
-    def from_linear(cls, linear_layer, group_size=None, bits=None, mode="affine", block=0):
+    def from_linear(
+        cls, linear_layer, group_size=None, bits=None, mode="affine", block=0
+    ):
         output_dims, input_dims = linear_layer.weight.shape
-        ql = cls(input_dims, output_dims, False, group_size, bits, mode=mode, block=block)
+        ql = cls(
+            input_dims, output_dims, False, group_size, bits, mode=mode, block=block
+        )
         ql.weight, ql.scales, *biases = mx.quantize(
             linear_layer.weight, group_size, bits, mode=mode
         )
@@ -89,7 +93,9 @@ class RotatedQuantizedEmbedding(nn.QuantizedEmbedding):
         return super().as_linear(x)
 
     @classmethod
-    def from_embedding(cls, embedding_layer, group_size=None, bits=None, mode="affine", block=0):
+    def from_embedding(
+        cls, embedding_layer, group_size=None, bits=None, mode="affine", block=0
+    ):
         num_embeddings, dims = embedding_layer.weight.shape
         ql = cls(num_embeddings, dims, group_size, bits, mode=mode, block=block)
         ql.weight, ql.scales, *biases = mx.quantize(
@@ -172,7 +178,9 @@ class Model(nn.Module):
     def sanitize(self, weights):
         # qwen3_5's own sanitize adds the 1 to an HF-layout checkpoint's norms
         # (conv1d not yet in mlx layout): only one of the two may.
-        hf_layout = any("conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items())
+        hf_layout = any(
+            "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
+        )
         shift = self.args.zero_centered_norms and not hf_layout
         sanitized = {}
         for key, value in weights.items():

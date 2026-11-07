@@ -43,12 +43,19 @@ class ModelArgs(BaseModelArgs):
             self.head_dim = self.hidden_size // self.num_attention_heads
         if self.rope_parameters is None:
             self.rope_parameters = {
-                "full_attention": {"rope_theta": 1_000_000.0, "partial_rotary_factor": 0.5},
+                "full_attention": {
+                    "rope_theta": 1_000_000.0,
+                    "partial_rotary_factor": 0.5,
+                },
                 "sliding_attention": {"rope_theta": 10_000.0},
             }
         if self.layer_types is None:
             self.layer_types = [
-                "full_attention" if i % 4 == 2 else "sliding_attention" if i % 4 == 0 and i > 0 else "conv"
+                (
+                    "full_attention"
+                    if i % 4 == 2
+                    else "sliding_attention" if i % 4 == 0 and i > 0 else "conv"
+                )
                 for i in range(self.num_hidden_layers)
             ]
         if self.tie_embedding is not None:
@@ -58,7 +65,9 @@ class ModelArgs(BaseModelArgs):
             if params is None:
                 raise ValueError(f"rope_parameters has no entry for the {t} layers")
             if params.get("rope_type", "default") != "default":
-                raise ValueError(f"RoPE type {params['rope_type']} is not supported for LFM3")
+                raise ValueError(
+                    f"RoPE type {params['rope_type']} is not supported for LFM3"
+                )
 
 
 def _rope_freqs(args: ModelArgs, layer_type: str) -> mx.array:
@@ -138,8 +147,12 @@ class ShortConv(nn.Module):
             groups=args.hidden_size,
             bias=args.conv_bias,
         )
-        self.in_proj = nn.Linear(args.hidden_size, 3 * args.hidden_size, bias=args.conv_bias)
-        self.out_proj = nn.Linear(args.hidden_size, args.hidden_size, bias=args.conv_bias)
+        self.in_proj = nn.Linear(
+            args.hidden_size, 3 * args.hidden_size, bias=args.conv_bias
+        )
+        self.out_proj = nn.Linear(
+            args.hidden_size, args.hidden_size, bias=args.conv_bias
+        )
 
     def __call__(self, x, mask=None, cache=None):
         B, C, x = mx.split(self.in_proj(x), 3, axis=-1)
@@ -149,7 +162,9 @@ class ShortConv(nn.Module):
         if cache is not None:
             state = cache[0]
             if state is None:
-                state = mx.zeros((Bx.shape[0], self.L_cache - 1, self.hidden_size), dtype=Bx.dtype)
+                state = mx.zeros(
+                    (Bx.shape[0], self.L_cache - 1, self.hidden_size), dtype=Bx.dtype
+                )
             Bx = mx.concatenate([state, Bx], axis=1)
             n_keep = self.L_cache - 1
             t = x.shape[1]
@@ -220,15 +235,23 @@ class Lfm3Model(nn.Module):
         self.first = {t: types.index(t) for t in set(types)}
 
     def __call__(self, inputs, cache=None, input_embeddings=None):
-        h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
+        h = (
+            input_embeddings
+            if input_embeddings is not None
+            else self.embed_tokens(inputs)
+        )
         if cache is None:
             cache = [None] * len(self.layers)
         masks = {}
         if "full_attention" in self.first:
-            masks["full_attention"] = create_attention_mask(h, cache[self.first["full_attention"]])
+            masks["full_attention"] = create_attention_mask(
+                h, cache[self.first["full_attention"]]
+            )
         if "sliding_attention" in self.first:
             masks["sliding_attention"] = create_attention_mask(
-                h, cache[self.first["sliding_attention"]], window_size=self.args.sliding_window
+                h,
+                cache[self.first["sliding_attention"]],
+                window_size=self.args.sliding_window,
             )
         if "conv" in self.first:
             masks["conv"] = create_ssm_mask(h, cache[self.first["conv"]])
@@ -260,7 +283,11 @@ class Model(nn.Module):
                 name = name[len("language_model.") :]
             if name.startswith("model.vision") or name.startswith("vision"):
                 continue
-            if "conv.weight" in name and param.ndim == 3 and param.shape[-1] > param.shape[1]:
+            if (
+                "conv.weight" in name
+                and param.ndim == 3
+                and param.shape[-1] > param.shape[1]
+            ):
                 param = param.transpose(0, 2, 1)
             if self.args.tie_word_embeddings and name.startswith("lm_head."):
                 continue

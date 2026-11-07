@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 # Tool parser for DeepSeek-V4's native DSML tool-call format. Deploy into
 # venv: mlx_lm/tool_parsers/deepseek_dsml.py, set tokenizer_config
 # "tool_parser_type": "deepseek_dsml", and use the official DSML chat template.
@@ -31,7 +33,9 @@ _PARAM = re.compile(
     r'\s+string="(?P<is_str>true|false)"\s*>(?P<val>.*?)</｜DSML｜parameter>',
     re.DOTALL,
 )
-_NAME_BODY = re.compile(r'\s*(?P<name>"[^"]*"|\'[^\']*\'|[^\s>]+)\s*>(?P<body>.*)', re.DOTALL)
+_NAME_BODY = re.compile(
+    r'\s*(?P<name>"[^"]*"|\'[^\']*\'|[^\s>]+)\s*>(?P<body>.*)', re.DOTALL
+)
 
 
 def _unquote(s):

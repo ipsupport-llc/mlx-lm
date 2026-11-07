@@ -1,18 +1,18 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
-from collections import deque
 import gc
 import ipaddress
 import json
-import types
 import logging
 import pickle
 import platform
 import socket
 import time
+import types
 import uuid
 import warnings
+from collections import deque
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,15 +38,15 @@ from huggingface_hub.errors import CacheNotFound
 from . import anthropic_api, responses_api
 from ._version import __version__
 from .generate import (
+    DEFAULT_PREFILL_SCORE_BYTES,
     DEFAULT_QUANTIZED_KV_START,
+    MIN_PREFILL_STEP,
     BatchGenerator,
+    PrefillBudget,
     TextStateMachine,
     _model_supports_nemotron_h_mtp,
     _mtp_language_model,
     kv_cache_quantized,
-    DEFAULT_PREFILL_SCORE_BYTES,
-    MIN_PREFILL_STEP,
-    PrefillBudget,
     make_prefill_step,
     make_stop_sequences,
     make_text_state_machine,
@@ -111,10 +111,10 @@ def _fraction(value):
     except ValueError:
         x = None
     if x is None or not 0 < x <= 1:
-        raise argparse.ArgumentTypeError(
-            f"must be a number in (0, 1], got {value!r}"
-        )
+        raise argparse.ArgumentTypeError(f"must be a number in (0, 1], got {value!r}")
     return x
+
+
 from .multimodal import extract_media, load_image_inputs
 from .multimodal import vision_spans as multimodal_vision_spans
 from .sample_utils import greedy_sampler, make_logits_processors, make_sampler
@@ -125,9 +125,9 @@ from .utils import (
     sharded_load,
 )
 
-
 # The largest request body read (images come base64-encoded in it).
 MAX_BODY_BYTES = 512 * 1024 * 1024
+
 
 def _is_metal_oom(e):
     """A Metal command buffer that failed for lack of GPU memory. MLX raises
@@ -189,7 +189,11 @@ class ToolCallFormatter:
             except (ValueError, json.JSONDecodeError) as e:
                 # What the model wrote, so the log says why (another
                 # format, a cut-off call): its start and end, one line.
-                snippet = tool_text if len(tool_text) <= 300 else tool_text[:200] + " … " + tool_text[-100:]
+                snippet = (
+                    tool_text
+                    if len(tool_text) <= 300
+                    else tool_text[:200] + " … " + tool_text[-100:]
+                )
                 logging.warning(
                     f"Failed to parse tool call ({type(e).__name__}: {e}); the model wrote: "
                     f"{json.dumps(snippet, ensure_ascii=False)}"
@@ -366,7 +370,9 @@ def _client_suffix(name):
     last on the line (the name may have spaces)."""
     if not name:
         return ""
-    clean = "".join(c for c in str(name) if c.isascii() and (c.isalnum() or c in " ._-"))
+    clean = "".join(
+        c for c in str(name) if c.isascii() and (c.isalnum() or c in " ._-")
+    )
     clean = clean.strip()[:40].strip()
     return f" client={clean}" if clean else ""
 
@@ -510,7 +516,7 @@ class ModelProvider:
         self._draft_model_map["default_model"] = self.cli_args.draft_model
         # getattr: a ModelProvider built from another parser's Namespace
         # (tests, embedders) has no model_alias.
-        for _alias in (getattr(self.cli_args, "model_alias", None) or []):
+        for _alias in getattr(self.cli_args, "model_alias", None) or []:
             self._model_map[_alias] = self.cli_args.model
             self._adapter_map[_alias] = self.cli_args.adapter_path
             self._draft_model_map[_alias] = self.cli_args.draft_model
@@ -531,7 +537,10 @@ class ModelProvider:
         self.image_inputs = None
 
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
-        if self.is_distributed and getattr(self.cli_args, "experts_on_disk", None) is not None:
+        if (
+            self.is_distributed
+            and getattr(self.cli_args, "experts_on_disk", None) is not None
+        ):
             raise ValueError("Experts on disk is not supported in distributed mode")
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
@@ -649,7 +658,13 @@ def _make_sampler(args, tokenizer):
 
 def _max_model_len(config):
     """The context length in the model config, or None."""
-    keys = ["max_position_embeddings", "max_seq_len", "max_sequence_length", "seq_length", "n_positions"]
+    keys = [
+        "max_position_embeddings",
+        "max_seq_len",
+        "max_sequence_length",
+        "seq_length",
+        "n_positions",
+    ]
     lengths = [
         c[k]
         for c in (config, config.get("text_config") or {})
@@ -740,7 +755,11 @@ class ResponseGenerator:
         # The generation thread can stay alive while blocked in native code
         # (a Metal allocation that never returns): no progress while busy.
         timeout = getattr(self.cli_args, "generation_stall_timeout", 300)
-        return bool(timeout) and self._busy and time.monotonic() - self._last_progress > timeout
+        return (
+            bool(timeout)
+            and self._busy
+            and time.monotonic() - self._last_progress > timeout
+        )
 
     def _junction_split(self, segments, segment_types, n_cached, n_prompt):
         """Split the segments where the nearest cached prompt diverged from
@@ -892,7 +911,12 @@ class ResponseGenerator:
                 )
             else:
                 prompt = tokenizer.encode(convert_chat(messages, role_mapping))
-                return prompt, [prompt], ["assistant"], getattr(tokenizer, "response_initial_state", None) or "normal"
+                return (
+                    prompt,
+                    [prompt],
+                    ["assistant"],
+                    getattr(tokenizer, "response_initial_state", None) or "normal",
+                )
         else:
             prompt = tokenizer.encode(request.prompt)
             return prompt, [prompt], ["assistant"], "normal"
@@ -909,7 +933,9 @@ class ResponseGenerator:
                 initial_state = "reasoning"
         # A model with its own answer format starts in its own state (e.g.
         # Muse Spark: a message header).
-        initial_state = getattr(tokenizer, "response_initial_state", None) or initial_state
+        initial_state = (
+            getattr(tokenizer, "response_initial_state", None) or initial_state
+        )
 
         segments = []
         segment_types = []
@@ -976,7 +1002,10 @@ class ResponseGenerator:
     def _uses_mtp(self, args):
         """Whether stream_generate would serve this request with the
         model's MTP head (the same conditions it checks)."""
-        if not getattr(self.model_provider, "supports_mtp", False) or getattr(self.cli_args, "max_kv_size", None) is not None:
+        if (
+            not getattr(self.model_provider, "supports_mtp", False)
+            or getattr(self.cli_args, "max_kv_size", None) is not None
+        ):
             return False
         if getattr(self.model_provider, "head_mtp", False):
             return args.num_draft_tokens != 0 and not _make_logits_processors(args)
@@ -988,7 +1017,10 @@ class ResponseGenerator:
         (an MTP head or the draft model)."""
         if getattr(request, "images", None) or getattr(request, "audios", None):
             return False
-        return self._uses_mtp(args) or getattr(self.model_provider, "draft_model", None) is not None
+        return (
+            self._uses_mtp(args)
+            or getattr(self.model_provider, "draft_model", None) is not None
+        )
 
     def _is_batchable(self, args, request=None, alone=True):
         """Whether the request runs in the batch. A speculative one (MTP,
@@ -997,7 +1029,9 @@ class ResponseGenerator:
         or wait."""
         # Image requests need their input embeddings built up front (see
         # _serve_single); BatchGenerator only takes token segments.
-        has_images = bool(getattr(request, "images", None) or getattr(request, "audios", None))
+        has_images = bool(
+            getattr(request, "images", None) or getattr(request, "audios", None)
+        )
         return (
             self.model_provider.is_batchable
             and args.seed is None
@@ -1035,13 +1069,17 @@ class ResponseGenerator:
         else:
             # The entry the request's own prefill stored (system / user
             # checkpoints), else from scratch.
-            self.prompt_cache.insert_cache(model_key, tokens[:], cache, cache_type="assistant")
+            self.prompt_cache.insert_cache(
+                model_key, tokens[:], cache, cache_type="assistant"
+            )
             cache, left = self.prompt_cache.fetch_nearest_cache(model_key, tokens[:-1])
             cache = self._main_slots(cache)
             n = len(tokens) - 1 - len(left) if cache is not None else 0
             history, rest = tokens[:n], tokens[n:]
-        stop_sequences, _ = self._make_state_machine(model_key, tokenizer, handoff.args.stop_words)
-        sent = tokens[len(handoff.ctx.prompt):]
+        stop_sequences, _ = self._make_state_machine(
+            model_key, tokenizer, handoff.args.stop_words
+        )
+        sent = tokens[len(handoff.ctx.prompt) :]
         # Its stop sequences go on from what it sent: one split by the move
         # still stops it.
         stop_sequences = _ResumedStopSequences(stop_sequences, sent)
@@ -1063,7 +1101,7 @@ class ResponseGenerator:
         )
         # For tests: how many moved, and the text the last one had sent.
         self.handoffs = getattr(self, "handoffs", 0) + 1
-        self.last_handoff_sent = tokenizer.decode(tokens[len(handoff.ctx.prompt):])
+        self.last_handoff_sent = tokenizer.decode(tokens[len(handoff.ctx.prompt) :])
         batch_results[uid] = {
             "ctx": handoff.ctx,
             "rqueue": handoff.rqueue,
@@ -1134,15 +1172,19 @@ class ResponseGenerator:
                     # Can it be added to the current batch? A speculative one
                     # alone (the batch empty, nobody waiting) doesn't join: the
                     # batch drains and it runs on its own.
-                    alone = len(batch_results) == 0 and not unprocessed_requests and not self._others_waiting()
+                    alone = (
+                        len(batch_results) == 0
+                        and not unprocessed_requests
+                        and not self._others_waiting()
+                    )
                     if (
                         batch_generator is not None
                         and current_model == args.model
                         and self._is_batchable(args, request, alone=alone)
                     ):
                         try:
-                            prompt, segments, segment_types, initial_state = self._tokenize(
-                                current_tokenizer, request, args
+                            prompt, segments, segment_types, initial_state = (
+                                self._tokenize(current_tokenizer, request, args)
                             )
                         except Exception as e:
                             rqueue.put(e)
@@ -1193,7 +1235,9 @@ class ResponseGenerator:
                             caches=[cache],
                             all_tokens=[prompt[:prompt_cache_count]],
                             samplers=[_make_sampler(args, current_tokenizer)],
-                            logits_processors=[_make_logits_processors(args, current_tokenizer)],
+                            logits_processors=[
+                                _make_logits_processors(args, current_tokenizer)
+                            ],
                             stop_sequences=[stop_sequences],
                         )
                         batch_results[uid] = {
@@ -1225,7 +1269,9 @@ class ResponseGenerator:
                         alone = not unprocessed_requests and not self._others_waiting()
                         handoff = None
                         if not self._is_batchable(args, request, alone=alone):
-                            handoff = self._serve_single((rqueue, request, args), generation_stream)
+                            handoff = self._serve_single(
+                                (rqueue, request, args), generation_stream
+                            )
                             if handoff is None:
                                 continue
 
@@ -1249,7 +1295,9 @@ class ResponseGenerator:
                             # one waiting joins it next. Its own cache isn't
                             # kept past this (the batch has what it needs).
                             taken.append(handoff.rqueue)
-                            self._insert_handoff(batch_generator, batch_results, handoff, tokenizer)
+                            self._insert_handoff(
+                                batch_generator, batch_results, handoff, tokenizer
+                            )
                             handoff = None
                         else:
                             unprocessed_requests.append((rqueue, request, args))
@@ -1335,7 +1383,11 @@ class ResponseGenerator:
                                     text,
                                     r.token,
                                     # .item() waits for the next step: only read when asked.
-                                    (r.logprobs[r.token].item() if result["logprobs"] else None),
+                                    (
+                                        r.logprobs[r.token].item()
+                                        if result["logprobs"]
+                                        else None
+                                    ),
                                     r.finish_reason,
                                     _format_top_logprobs(
                                         r.logprobs,
@@ -1378,11 +1430,17 @@ class ResponseGenerator:
                 # Ranks must stay in step: in distributed mode it stays fatal.
                 if self._is_distributed:
                     raise
-                logging.exception(f"Generation failed; the requests in work get the error: {e}")
-                failed = [r["rqueue"] for r in batch_results.values() if not r.get("done")]
+                logging.exception(
+                    f"Generation failed; the requests in work get the error: {e}"
+                )
+                failed = [
+                    r["rqueue"] for r in batch_results.values() if not r.get("done")
+                ]
                 # A request put back for later stays queued: not failed now.
                 waiting = [x[0] for x in unprocessed_requests if isinstance(x, tuple)]
-                failed += [q for q in taken if all(q is not f for f in failed + waiting)]
+                failed += [
+                    q for q in taken if all(q is not f for f in failed + waiting)
+                ]
                 for rqueue in failed:
                     rqueue.put(e)
                 batch_results = {}
@@ -1429,7 +1487,10 @@ class ResponseGenerator:
             image_inputs = None
             if request.images or request.audios:
                 image_inputs = self.model_provider.image_inputs
-                if request.images and (image_inputs is None or not getattr(image_inputs, "accepts_images", True)):
+                if request.images and (
+                    image_inputs is None
+                    or not getattr(image_inputs, "accepts_images", True)
+                ):
                     raise ValueError(
                         "This model does not accept image inputs (no vision "
                         "tower / image processor). Use a vision-capable model "
@@ -1491,8 +1552,7 @@ class ResponseGenerator:
             logits_processors = _make_logits_processors(args, tokenizer)
 
             use_draft = (
-                self.model_provider.draft_model is not None
-                and input_embeddings is None
+                self.model_provider.draft_model is not None and input_embeddings is None
             )
             n_main = len(make_prompt_cache(model))
             prompt_embeddings = input_embeddings
@@ -1532,9 +1592,7 @@ class ResponseGenerator:
                     if use_draft:
                         cache += make_prompt_cache(self.model_provider.draft_model)
 
-                self._log_prefill_step(
-                    model, len(cache_prompt), ctx.prompt_cache_count
-                )
+                self._log_prefill_step(model, len(cache_prompt), ctx.prompt_cache_count)
 
                 # Prefill up to the end of the system and user segments and
                 # save a checkpoint at each, as the batched path does. A
@@ -1559,8 +1617,7 @@ class ResponseGenerator:
                             stream,
                             progress,
                             ctx,
-                            step_divisor=self._opt("oom_retry_step_divisor")
-                            ** attempt,
+                            step_divisor=self._opt("oom_retry_step_divisor") ** attempt,
                         )
                     except RuntimeError as e:
                         if attempt or self._is_distributed or not _is_metal_oom(e):
@@ -1662,8 +1719,14 @@ class ResponseGenerator:
                         break
 
                     n_out += 1
-                    if handoff_ok and n_out < args.max_tokens and self._others_waiting():
-                        handoff = Handoff(rqueue, args, ctx, None, cache_key, args.max_tokens - n_out)
+                    if (
+                        handoff_ok
+                        and n_out < args.max_tokens
+                        and self._others_waiting()
+                    ):
+                        handoff = Handoff(
+                            rqueue, args, ctx, None, cache_key, args.max_tokens - n_out
+                        )
                         break
             finally:
                 # Closed here, not when collected: the cache then holds the
@@ -1696,7 +1759,16 @@ class ResponseGenerator:
         finally:
             self._busy = False
 
-    def warm_next_turn(self, model_key, request, args, content, tool_calls, reasoning="", echoes_reasoning=False):
+    def warm_next_turn(
+        self,
+        model_key,
+        request,
+        args,
+        content,
+        tool_calls,
+        reasoning="",
+        echoes_reasoning=False,
+    ):
         """After a chat request: the conversation with this answer, as the
         client will send it back, gets prefilled while the server is idle
         and stored as a cache entry. A model whose cache can't be trimmed
@@ -1709,20 +1781,29 @@ class ResponseGenerator:
         options or tools."""
         if not getattr(self.cli_args, "warm_next_turn", True) or self._is_distributed:
             return
-        if request.request_type != "chat" or getattr(request, "images", None) or getattr(request, "audios", None):
+        if (
+            request.request_type != "chat"
+            or getattr(request, "images", None)
+            or getattr(request, "audios", None)
+        ):
             return
-        message = self._answer_as_sent_back(request, content, tool_calls, reasoning, echoes_reasoning)
+        message = self._answer_as_sent_back(
+            request, content, tool_calls, reasoning, echoes_reasoning
+        )
         self._warm_jobs.append((model_key, request, args, message))
 
     @staticmethod
-    def _answer_as_sent_back(request, content, tool_calls, reasoning="", echoes_reasoning=False):
+    def _answer_as_sent_back(
+        request, content, tool_calls, reasoning="", echoes_reasoning=False
+    ):
         """The answer as the client's next request carries it."""
         message = {"role": "assistant", "content": content}
         # A client that sends the reasoning back (Anthropic clients send
         # their thinking blocks; others show it in earlier turns) gets it
         # rendered by a thinking template: the next turn has it too.
         echoes_reasoning = echoes_reasoning or any(
-            m.get("role") == "assistant" and m.get("reasoning_content") for m in request.messages
+            m.get("role") == "assistant" and m.get("reasoning_content")
+            for m in request.messages
         )
         if reasoning and echoes_reasoning:
             message["reasoning_content"] = reasoning
@@ -1740,11 +1821,15 @@ class ResponseGenerator:
             chat_template_args = {**chat_template_args, **args.chat_template_kwargs}
 
         def render(filler, role):
-            messages = json.loads(json.dumps(request.messages)) + [json.loads(json.dumps(message))]
+            messages = json.loads(json.dumps(request.messages)) + [
+                json.loads(json.dumps(message))
+            ]
             for m in messages:
                 content = m.get("content")
                 if isinstance(content, list):
-                    m["content"] = "".join(f.get("text", "") for f in content if f.get("type") == "text")
+                    m["content"] = "".join(
+                        f.get("text", "") for f in content if f.get("type") == "text"
+                    )
                 elif content is None:
                     m["content"] = ""
                 for tc in m.get("tool_calls") or []:
@@ -1755,7 +1840,11 @@ class ResponseGenerator:
                         func["arguments"] = json.loads(func["arguments"])
             if role == "tool":
                 messages += [
-                    {"role": "tool", "tool_call_id": tc.get("id", ""), "content": filler}
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", ""),
+                        "content": filler,
+                    }
                     for tc in message["tool_calls"]
                 ]
             else:
@@ -1796,14 +1885,25 @@ class ResponseGenerator:
         if not renders:
             raise error
         n = 0
-        while all(n < len(r) for r in renders) and all(r[n] == renders[0][n] for r in renders):
+        while all(n < len(r) for r in renders) and all(
+            r[n] == renders[0][n] for r in renders
+        ):
             n += 1
         # Text before the message can still merge with a message no probe
         # starts like: end the entry at a special token (never merged) when
         # one is near, else a token earlier.
         special = set(getattr(tokenizer, "all_special_ids", None) or [])
-        special |= set((getattr(tokenizer, "added_tokens_encoder", None) or {}).values())
-        cut = next((i + 1 for i in range(n - 1, max(n - 16, 0) - 1, -1) if renders[0][i] in special), None)
+        special |= set(
+            (getattr(tokenizer, "added_tokens_encoder", None) or {}).values()
+        )
+        cut = next(
+            (
+                i + 1
+                for i in range(n - 1, max(n - 16, 0) - 1, -1)
+                if renders[0][i] in special
+            ),
+            None,
+        )
         return list(renders[0][: cut if cut is not None else max(n - 1, 0)])
 
     def _warm_next(self, job, stream):
@@ -1822,11 +1922,13 @@ class ResponseGenerator:
         if model is None or self.model_provider.draft_model is not None:
             return
         if key != self.model_provider.model_key:
-            return   # another model is loaded now
+            return  # another model is loaded now
         try:
             if stays_trimmable(make_prompt_cache(model)):
-                return   # a trimmable cache reuses a longer entry anyway
-            tokens = self._next_turn_tokens(self.model_provider.tokenizer, request, args, message)
+                return  # a trimmable cache reuses a longer entry anyway
+            tokens = self._next_turn_tokens(
+                self.model_provider.tokenizer, request, args, message
+            )
         except Exception as e:
             logging.debug(f"Prompt cache: next turn not warmed: {e!r}")
             return
@@ -1848,7 +1950,9 @@ class ResponseGenerator:
             done = 0
             while done < len(rest):
                 if not self.requests.empty():
-                    logging.info("Prompt cache: next turn not warmed (a request came in)")
+                    logging.info(
+                        "Prompt cache: next turn not warmed (a request came in)"
+                    )
                     return
                 # The cache grows each chunk: still only into free memory.
                 nbytes = sum(c.nbytes for c in cache if c is not None)
@@ -1872,7 +1976,9 @@ class ResponseGenerator:
         cap = getattr(self.cli_args, "prompt_cache_bytes", None)
         if cap is not None:
             self.prompt_cache.trim_to(n_bytes=cap)
-        logging.info(f"Prompt cache: warmed the next turn: {len(rest)} tokens on top of {reused}")
+        logging.info(
+            f"Prompt cache: warmed the next turn: {len(rest)} tokens on top of {reused}"
+        )
 
     def _memory_shortfall(self, nbytes, budget):
         """checkpoint_room with the current memory in use, or None if the
@@ -2045,7 +2151,9 @@ class ResponseGenerator:
                 # positions past the last checkpoint, the sliding windows).
                 key = self.model_provider.model_key
                 nbytes = sum(c.nbytes for c in cache if c is not None)
-                added = lambda: self.prompt_cache.insert_nbytes(key, prompt[:end], cache)
+                added = lambda: self.prompt_cache.insert_nbytes(
+                    key, prompt[:end], cache
+                )
                 cap = getattr(cli_args, "prompt_cache_bytes", None)
                 if cap is not None:
                     if nbytes + added() > cap:
@@ -2208,9 +2316,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if content_length is None:
             self._set_completion_headers(411)
             self.end_headers()
-            self.wfile.write(
-                self._error(411, "Content-Length header is required")
-            )
+            self.wfile.write(self._error(411, "Content-Length header is required"))
             return
         try:
             content_length = int(content_length)
@@ -2219,15 +2325,15 @@ class APIHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._set_completion_headers(400)
             self.end_headers()
-            self.wfile.write(
-                self._error(400, "Invalid Content-Length header")
-            )
+            self.wfile.write(self._error(400, "Invalid Content-Length header"))
             return
         # A body is read whole into memory: refused above the cap.
         if content_length > MAX_BODY_BYTES:
             self._set_completion_headers(413)
             self.end_headers()
-            self.wfile.write(self._error(413, f"Request body over {MAX_BODY_BYTES} bytes"))
+            self.wfile.write(
+                self._error(413, f"Request body over {MAX_BODY_BYTES} bytes")
+            )
             return
         raw_body = self.rfile.read(content_length)
         try:
@@ -2236,9 +2342,7 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
             self._set_completion_headers(400)
             self.end_headers()
-            self.wfile.write(
-                self._error(400, f"Invalid JSON in request body: {e}")
-            )
+            self.wfile.write(self._error(400, f"Invalid JSON in request body: {e}"))
             return
 
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -2249,9 +2353,7 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.error(f"Invalid Request Body: {debug_body}")
             self._set_completion_headers(400)
             self.end_headers()
-            self.wfile.write(
-                self._error(400, "Request should be a JSON dictionary")
-            )
+            self.wfile.write(self._error(400, "Request should be a JSON dictionary"))
             return
 
         if self.route == "/tokenize":
@@ -2295,7 +2397,9 @@ class APIHandler(BaseHTTPRequestHandler):
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
-        if self.stream_options is not None and not isinstance(self.stream_options, dict):
+        if self.stream_options is not None and not isinstance(
+            self.stream_options, dict
+        ):
             self.stream_options = None
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
@@ -2384,8 +2488,11 @@ class APIHandler(BaseHTTPRequestHandler):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
         self._validate("max_tokens", int, min_val=1)
-        if self.thinking_budget is not None and (not isinstance(self.thinking_budget, int)
-                                                 or isinstance(self.thinking_budget, bool) or self.thinking_budget < 0):
+        if self.thinking_budget is not None and (
+            not isinstance(self.thinking_budget, int)
+            or isinstance(self.thinking_budget, bool)
+            or self.thinking_budget < 0
+        ):
             raise ValueError("thinking_budget must be a non-negative integer")
         if not isinstance(self.cache_store, bool):
             raise ValueError("cache_store must be true or false")
@@ -2599,12 +2706,26 @@ class APIHandler(BaseHTTPRequestHandler):
             if prompt is not None:
                 tokens = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
             else:
-                request = CompletionRequest("chat", "", messages, body.get("tools") or None, body.get("role_mapping"))
-                options = types.SimpleNamespace(chat_template_kwargs=body.get("chat_template_kwargs"))
-                tokens = self.response_generator._tokenize(tokenizer, request, options)[0]
+                request = CompletionRequest(
+                    "chat",
+                    "",
+                    messages,
+                    body.get("tools") or None,
+                    body.get("role_mapping"),
+                )
+                options = types.SimpleNamespace(
+                    chat_template_kwargs=body.get("chat_template_kwargs")
+                )
+                tokens = self.response_generator._tokenize(tokenizer, request, options)[
+                    0
+                ]
             response = {"tokens": list(tokens), "count": len(tokens)}
             args = getattr(provider.model, "args", None)
-            max_len = _max_model_len(vars(args)) if args is not None and hasattr(args, "__dict__") else None
+            max_len = (
+                _max_model_len(vars(args))
+                if args is not None and hasattr(args, "__dict__")
+                else None
+            )
             if max_len is not None:
                 response["max_model_len"] = max_len
             if return_token_strs:
@@ -2644,7 +2765,9 @@ class APIHandler(BaseHTTPRequestHandler):
         elif self.responses_stream is not None:
             snap = self.responses_stream._snapshot("failed")
             snap["error"] = {"code": "server_error", "message": message}
-            self.wfile.write(self.responses_stream._event("response.failed", {"response": snap}))
+            self.wfile.write(
+                self.responses_stream._event("response.failed", {"response": snap})
+            )
         else:
             data = {"error": {"message": message, "type": "server_error"}}
             self.wfile.write(f"data: {json.dumps(data)}\n\ndata: [DONE]\n\n".encode())
@@ -2764,12 +2887,13 @@ class APIHandler(BaseHTTPRequestHandler):
         answer_text = ""
         answer_reasoning = ""
         dropped_text = ""
-        answer_calls = []   # as sent to the client, with their ids
+        answer_calls = []  # as sent to the client, with their ids
 
         def send_calls(calls):
             formatted = tool_formatter(calls)
             answer_calls.extend(formatted)
             return formatted
+
         first_token_at = last_token_at = None
         n_tokens = n_drafted = 0
 
@@ -2783,8 +2907,12 @@ class APIHandler(BaseHTTPRequestHandler):
             provider = self.response_generator.model_provider
             tokenizer = provider.tokenizer
             budget = args.thinking_budget
-            if budget is not None and (request.images or request.audios or not getattr(tokenizer, "has_thinking", False)
-                                       or ctx.model_key != provider.model_key):
+            if budget is not None and (
+                request.images
+                or request.audios
+                or not getattr(tokenizer, "has_thinking", False)
+                or ctx.model_key != provider.model_key
+            ):
                 budget = None
             thought = 0
             budget_spent = False
@@ -2797,8 +2925,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     # itself (a partial match held in the buffer).
                     # (A token that ends the response -- EOS, a stop word --
                     # ends it as it would.)
-                    if (budget is not None and not budget_spent and prev_state == "reasoning"
-                            and thought >= budget and not sm_state[3] and gen.finish_reason is None):
+                    if (
+                        budget is not None
+                        and not budget_spent
+                        and prev_state == "reasoning"
+                        and thought >= budget
+                        and not sm_state[3]
+                        and gen.finish_reason is None
+                    ):
                         budget_spent = True
                         switched = True
                         break
@@ -2818,7 +2952,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         parts = [(current_state, "")]
                     elif gen.finish_reason == "length":
                         sm_state, parts = TextStateMachine.split(sm_state, gen.text)
-                        sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
+                        sm_state, flushed, current_state = TextStateMachine.flush(
+                            sm_state
+                        )
                         parts.append((current_state, flushed))
                     else:
                         sm_state, parts = TextStateMachine.split(sm_state, gen.text)
@@ -2858,7 +2994,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         formatted = send_calls(tool_calls)
                         folded, _ = tool_formatter.fold_unparsed(text, None)
                         # The next turn's warm-up holds what the client got.
-                        answer_text += folded[len(text):]
+                        answer_text += folded[len(text) :]
                         text = folded
                         resp = self.generate_response(
                             text,
@@ -2895,11 +3031,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 if len(tokens) + len(closing) > args.max_tokens:
                     finish_reason = "length"
                     break
-                logging.info(f"Thinking budget of {args.thinking_budget} tokens spent: the answer goes on.")
+                logging.info(
+                    f"Thinking budget of {args.thinking_budget} tokens spent: the answer goes on."
+                )
                 # Through the state machine as if generated, the note and
                 # then the close: the reasoning ends for the client too.
                 for piece in (THINKING_BUDGET_NOTE, tokenizer.think_end + "\n\n"):
-                    sm_state, clean_text, current_state = TextStateMachine.step(sm_state, piece)
+                    sm_state, clean_text, current_state = TextStateMachine.step(
+                        sm_state, piece
+                    )
                     if current_state == "reasoning":
                         reasoning_text += clean_text
                         answer_reasoning += clean_text
@@ -2920,15 +3060,19 @@ class APIHandler(BaseHTTPRequestHandler):
                     finish_reason = "length"
                     break
                 carried = CompletionRequest(
-                    request_type=request.request_type, prompt=request.prompt, messages=request.messages,
-                    tools=request.tools, role_mapping=request.role_mapping,
+                    request_type=request.request_type,
+                    prompt=request.prompt,
+                    messages=request.messages,
+                    tools=request.tools,
+                    role_mapping=request.role_mapping,
                     prompt_tokens=list(ctx.prompt) + tokens,
                 )
                 left = args.max_tokens - len(tokens)
                 # A seed goes on rather than repeating the first part's draws.
                 seed = None if args.seed is None else args.seed + 1
                 ctx, response = self.response_generator.generate(
-                    carried, replace(args, max_tokens=left, thinking_budget=None, seed=seed),
+                    carried,
+                    replace(args, max_tokens=left, thinking_budget=None, seed=seed),
                     progress_callback=keepalive_callback,
                 )
 
@@ -2939,12 +3083,17 @@ class APIHandler(BaseHTTPRequestHandler):
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
             # A model that skipped its format's header: its words, not nothing.
-            if not answer_text and not answer_reasoning and not made_tool_call and dropped_text.strip():
+            if (
+                not answer_text
+                and not answer_reasoning
+                and not made_tool_call
+                and dropped_text.strip()
+            ):
                 text += dropped_text
                 answer_text += dropped_text
             formatted = send_calls(tool_calls)
             folded, finish_reason = tool_formatter.fold_unparsed(text, finish_reason)
-            answer_text += folded[len(text):]
+            answer_text += folded[len(text) :]
             text = folded
 
             if self.stream:
@@ -2959,12 +3108,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self.wire is not None:
                     self.wfile.write(
                         self.wire.stop(
-                            len(tokens), self._matched_stop(finish_reason, tokens, stop_words)
+                            len(tokens),
+                            self._matched_stop(finish_reason, tokens, stop_words),
                         )
                     )
-                elif (
-                    self.stream_options is not None
-                    and self.stream_options.get("include_usage")
+                elif self.stream_options is not None and self.stream_options.get(
+                    "include_usage"
                 ):
                     resp = self.completion_usage_response(
                         len(first_ctx.prompt),
@@ -2997,7 +3146,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         self._matched_stop(finish_reason, tokens, stop_words),
                     )
                 elif self.responses_stream is not None:
-                    resp = responses_api.to_response(resp, self.responses_stream.model, self.responses_stream.body)
+                    resp = responses_api.to_response(
+                        resp, self.responses_stream.model, self.responses_stream.body
+                    )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
                     logging.debug(f"Outgoing Response: {response_debug}")
@@ -3008,15 +3159,21 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(response_json)
                 self.wfile.flush()
                 self._response_done = True
-            if finish_reason in ("stop", "tool_calls") and getattr(args, "cache_store", True):
+            if finish_reason in ("stop", "tool_calls") and getattr(
+                args, "cache_store", True
+            ):
                 # The answer as the client got it: a non-streamed harmony
                 # reply was split into content and reasoning (generate_response).
                 if not self.stream and answer_text:
                     tok = self.response_generator.model_provider.tokenizer
                     if tok is not None and has_harmony_format(tok):
-                        answer_text, harmony_reasoning = parse_harmony_response(answer_text)
+                        answer_text, harmony_reasoning = parse_harmony_response(
+                            answer_text
+                        )
                         if harmony_reasoning:
-                            answer_reasoning = (answer_reasoning or "") + harmony_reasoning
+                            answer_reasoning = (
+                                answer_reasoning or ""
+                            ) + harmony_reasoning
                 self.response_generator.warm_next_turn(
                     ctx.model_key,
                     request,
@@ -3137,7 +3294,10 @@ class APIHandler(BaseHTTPRequestHandler):
         Respond to a GET request from a client.
         """
         path = self.path.split("?", 1)[0]
-        if any(path == p or path.startswith(p + "/") for p in ("/v1/models", "/api/v0/models")):
+        if any(
+            path == p or path.startswith(p + "/")
+            for p in ("/v1/models", "/api/v0/models")
+        ):
             # /api/v0/models is LM Studio's own REST convention -- some
             # clients probe that shape by default. Same OpenAI-shaped
             # response as /v1/models, not LM Studio's richer schema, but
@@ -3175,7 +3335,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # the id for /api/v0/models, so it always listed nothing).
         path = unquote(self.path.split("?", 1)[0])
         prefix = "/api/v0/models" if path.startswith("/api/v0/models") else "/v1/models"
-        filter_repo_id = path[len(prefix):].strip("/") or None
+        filter_repo_id = path[len(prefix) :].strip("/") or None
 
         def probably_mlx_lm(repo):
             if repo.repo_type != "model":

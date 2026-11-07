@@ -48,19 +48,35 @@ class TestLfm3(unittest.TestCase):
         full = model(tokens)
         cache = model.make_cache()
         first = model(tokens[:, :3], cache=cache)
-        steps = [model(tokens[:, i : i + 1], cache=cache) for i in range(3, tokens.shape[1])]
+        steps = [
+            model(tokens[:, i : i + 1], cache=cache) for i in range(3, tokens.shape[1])
+        ]
         stepped = mx.concatenate([first] + steps, axis=1)
         # Past the sliding window too.
-        np.testing.assert_allclose(np.array(stepped), np.array(full), atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(
+            np.array(stepped), np.array(full), atol=1e-4, rtol=1e-4
+        )
 
     def test_defaults(self):
-        args = lfm3.ModelArgs.from_dict({"model_type": "lfm3", "num_hidden_layers": 8, "tie_embedding": False})
-        self.assertEqual(args.layer_types[:5], ["conv", "conv", "full_attention", "conv", "sliding_attention"])
-        self.assertEqual(args.rope_parameters["full_attention"]["partial_rotary_factor"], 0.5)
+        args = lfm3.ModelArgs.from_dict(
+            {"model_type": "lfm3", "num_hidden_layers": 8, "tie_embedding": False}
+        )
+        self.assertEqual(
+            args.layer_types[:5],
+            ["conv", "conv", "full_attention", "conv", "sliding_attention"],
+        )
+        self.assertEqual(
+            args.rope_parameters["full_attention"]["partial_rotary_factor"], 0.5
+        )
         self.assertFalse(args.tie_word_embeddings)
         with self.assertRaises(ValueError):
             lfm3.ModelArgs.from_dict(
-                {"model_type": "lfm3", "rope_parameters": {"full_attention": {"rope_type": "yarn", "rope_theta": 1e6}}}
+                {
+                    "model_type": "lfm3",
+                    "rope_parameters": {
+                        "full_attention": {"rope_type": "yarn", "rope_theta": 1e6}
+                    },
+                }
             )
 
     def test_sanitize(self):
@@ -71,7 +87,10 @@ class TestLfm3(unittest.TestCase):
             "lm_head.weight": mx.zeros((64, 32)),
         }
         out = model.sanitize(w)
-        self.assertEqual(sorted(out), ["model.embed_tokens.weight", "model.layers.0.conv.conv.weight"])
+        self.assertEqual(
+            sorted(out),
+            ["model.embed_tokens.weight", "model.layers.0.conv.conv.weight"],
+        )
 
 
 if __name__ == "__main__":

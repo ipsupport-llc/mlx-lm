@@ -137,7 +137,18 @@ def quantized_scaled_dot_product_attention(
     # memory for any context length; prompts short enough to fit take the identical
     # single-tile path (tile = L).
     budget = QDPA_SCORES_BUDGET_BYTES
-    tile = min(L, max(1, budget // (max(B, 1) * max(n_kv_heads, 1) * max(n_repeats, 1) * max(K, 1) * 4))) if budget > 0 else L
+    tile = (
+        min(
+            L,
+            max(
+                1,
+                budget
+                // (max(B, 1) * max(n_kv_heads, 1) * max(n_repeats, 1) * max(K, 1) * 4),
+            ),
+        )
+        if budget > 0
+        else L
+    )
     if n_repeats > 1:
         q_keys = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_keys)
         q_values = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_values)
@@ -163,7 +174,7 @@ def quantized_scaled_dot_product_attention(
             if isinstance(mask, str):
                 k_indices = mx.arange(K)
                 q_indices = mx.arange(K - L + s, K - L + e)
-                tmask = (q_indices[:, None] >= k_indices[None])
+                tmask = q_indices[:, None] >= k_indices[None]
             elif mask.ndim >= 2 and mask.shape[-2] == L:
                 tmask = mask[..., s:e, :]
             else:

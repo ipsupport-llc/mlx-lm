@@ -91,7 +91,6 @@ class Glm4MoeLiteAttention(nn.Module):
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        head_dim = self.qk_nope_head_dim + self.v_head_dim
         self._absorbed_dims = (
             self.kv_lora_rank,
             self.qk_nope_head_dim,

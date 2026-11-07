@@ -248,7 +248,13 @@ def test_text_image_parity():
     prefix = rng.integers(1, 200, size=(3,)).astype(np.int64)
     suffix = rng.integers(1, 200, size=(3,)).astype(np.int64)
     input_ids_np = np.concatenate(
-        [prefix, [BOI_TOKEN_ID], [IMAGE_TOKEN_ID] * n_soft_tokens, [EOI_TOKEN_ID], suffix]
+        [
+            prefix,
+            [BOI_TOKEN_ID],
+            [IMAGE_TOKEN_ID] * n_soft_tokens,
+            [EOI_TOKEN_ID],
+            suffix,
+        ]
     )[None].astype(np.int64)
 
     max_abs = _compare_logits(
@@ -284,7 +290,9 @@ def test_text_image_parity_bidirectional_vision():
     grid = 4
     n_patches = grid * grid
     patch_dim = 3 * VISION_CONFIG["patch_size"] ** 2
-    pixel_values_np = rng.uniform(0, 1, size=(2, n_patches, patch_dim)).astype(np.float32)
+    pixel_values_np = rng.uniform(0, 1, size=(2, n_patches, patch_dim)).astype(
+        np.float32
+    )
     xs, ys = np.meshgrid(np.arange(grid), np.arange(grid), indexing="xy")
     pos1 = np.stack([xs.reshape(-1), ys.reshape(-1)], axis=-1).astype(np.int64)
     pos_np = np.stack([pos1, pos1])
@@ -381,7 +389,13 @@ def test_text_audio_parity():
     prefix = rng.integers(1, 200, size=(3,)).astype(np.int64)
     suffix = rng.integers(1, 200, size=(3,)).astype(np.int64)
     input_ids_np = np.concatenate(
-        [prefix, [BOA_TOKEN_ID], [AUDIO_TOKEN_ID] * n_soft_tokens, [EOA_TOKEN_INDEX], suffix]
+        [
+            prefix,
+            [BOA_TOKEN_ID],
+            [AUDIO_TOKEN_ID] * n_soft_tokens,
+            [EOA_TOKEN_INDEX],
+            suffix,
+        ]
     )[None].astype(np.int64)
 
     max_abs = _compare_logits(

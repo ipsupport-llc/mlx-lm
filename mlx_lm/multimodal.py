@@ -93,7 +93,9 @@ MAX_JPEG_SCANS = 100
 class _HTTPOnlyRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if not newurl.startswith(("http://", "https://")):
-            raise ValueError(f"Image URL redirected to an unsupported scheme: {newurl[:32]}")
+            raise ValueError(
+                f"Image URL redirected to an unsupported scheme: {newurl[:32]}"
+            )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -106,7 +108,9 @@ class _RegisteringContext:
         self._context, self._register = context, register
 
     def wrap_socket(self, sock, **kwargs):
-        wrapped = self._context.wrap_socket(sock, do_handshake_on_connect=False, **kwargs)
+        wrapped = self._context.wrap_socket(
+            sock, do_handshake_on_connect=False, **kwargs
+        )
         self._register(wrapped)
         try:
             wrapped.do_handshake()
@@ -170,7 +174,9 @@ def _fetch(url: str) -> bytes:
             sock = None
             try:
                 sock = register(socket.socket(family, kind, proto))
-                sock.settimeout(min(timeout, left) if isinstance(timeout, (int, float)) else left)
+                sock.settimeout(
+                    min(timeout, left) if isinstance(timeout, (int, float)) else left
+                )
                 if source_address:
                     sock.bind(source_address)
                 sock.connect(addr)
@@ -198,7 +204,9 @@ def _fetch(url: str) -> bytes:
 
     class HTTPS(urllib.request.HTTPSHandler):
         def https_open(self, req):
-            return self.do_open(tracked(http.client.HTTPSConnection), req, context=self._context)
+            return self.do_open(
+                tracked(http.client.HTTPSConnection), req, context=self._context
+            )
 
     def expire():
         expired.set()
@@ -213,8 +221,14 @@ def _fetch(url: str) -> bytes:
     try:
         with opener.open(request, timeout=10) as resp:
             length = resp.headers.get("Content-Length")
-            if length is not None and length.isdigit() and int(length) > MAX_IMAGE_BYTES:
-                raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
+            if (
+                length is not None
+                and length.isdigit()
+                and int(length) > MAX_IMAGE_BYTES
+            ):
+                raise ValueError(
+                    f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes."
+                )
             chunks, total = [], 0
             while True:
                 chunk = resp.read1(64 * 1024)
@@ -222,11 +236,15 @@ def _fetch(url: str) -> bytes:
                     break
                 total += len(chunk)
                 if total > MAX_IMAGE_BYTES:
-                    raise ValueError(f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes.")
+                    raise ValueError(
+                        f"Image at {url[:64]} is larger than {MAX_IMAGE_BYTES} bytes."
+                    )
                 chunks.append(chunk)
-    except Exception:
+    except Exception as e:
         if expired.is_set() or time.monotonic() >= deadline:
-            raise ValueError(f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s.")
+            raise ValueError(
+                f"Fetching {url[:64]} took longer than {URL_FETCH_SECONDS}s."
+            ) from e
         raise
     finally:
         timer.cancel()
@@ -243,7 +261,11 @@ def _jpeg_scans(blob: bytes) -> int:
     rejected a valid image. Mirroring a decoder's resync over junk isn't
     attempted: past the metadata, every FF DA counts."""
     total, i, n = blob.count(b"\xff\xda"), 2, len(blob)
-    while i + 4 <= n and blob[i] == 0xFF and (0xE0 <= blob[i + 1] <= 0xEF or blob[i + 1] == 0xFE):
+    while (
+        i + 4 <= n
+        and blob[i] == 0xFF
+        and (0xE0 <= blob[i + 1] <= 0xEF or blob[i + 1] == 0xFE)
+    ):
         end = i + 2 + int.from_bytes(blob[i + 2 : i + 4], "big")
         if end > n or end < i + 4:
             break
@@ -257,7 +279,7 @@ def _image_bytes_from_url(url: str) -> bytes:
         try:
             _, b64 = url.split(",", 1)
         except ValueError:
-            raise ValueError("Malformed image data URI.")
+            raise ValueError("Malformed image data URI.") from None
         if len(b64) > MAX_IMAGE_BYTES * 4 // 3 + 4096:
             raise ValueError(f"Image is larger than {MAX_IMAGE_BYTES} bytes.")
         # validate=True: the default silently drops non-alphabet characters,
@@ -281,9 +303,9 @@ def _check_image(blob: bytes) -> int:
     """Refuses what isn't an image in IMAGE_FORMATS, or declares more than
     MAX_IMAGE_PIXELS -- from the header only, nothing decoded. Returns its
     pixel count."""
-    from PIL import Image
-
     import warnings
+
+    from PIL import Image
 
     try:
         # Pillow warns above its own limit; ours is lower and checked below.
@@ -292,11 +314,11 @@ def _check_image(blob: bytes) -> int:
             with Image.open(io.BytesIO(blob), formats=sorted(IMAGE_FORMATS)) as im:
                 width, height = im.size
     except Image.DecompressionBombError:
-        raise ValueError(f"Image is larger than {MAX_IMAGE_PIXELS} pixels.")
-    except Exception:
+        raise ValueError(f"Image is larger than {MAX_IMAGE_PIXELS} pixels.") from None
+    except Exception as e:
         raise ValueError(
             f"Unsupported or corrupt image data (accepted: {', '.join(sorted(IMAGE_FORMATS))})."
-        )
+        ) from e
     if width * height > MAX_IMAGE_PIXELS:
         raise ValueError(
             f"Image is {width}x{height} pixels; at most {MAX_IMAGE_PIXELS} are accepted."
@@ -335,31 +357,46 @@ def extract_media(messages: List[Any]) -> Tuple[List[bytes], List[np.ndarray]]:
                 if not isinstance(data, str):
                     raise ValueError("input_audio part is missing its data.")
                 if not isinstance(fmt, str) or fmt.lower() != "wav":
-                    raise ValueError("Only WAV audio is supported (input_audio format \"wav\").")
+                    raise ValueError(
+                        'Only WAV audio is supported (input_audio format "wav").'
+                    )
                 # As an image's: whitespace in the base64 is fine, the size
                 # is the decoded clip's.
                 data = "".join(data.split())
                 if len(data) > MAX_AUDIO_BYTES * 4 // 3 + 4:
-                    raise ValueError(f"An audio clip is over {MAX_AUDIO_BYTES // (1024 * 1024)} MB.")
+                    raise ValueError(
+                        f"An audio clip is over {MAX_AUDIO_BYTES // (1024 * 1024)} MB."
+                    )
                 try:
                     blob = base64.b64decode(data, validate=True)
                 except Exception as e:
                     raise ValueError(f"input_audio data isn't base64: {e}") from e
                 if len(blob) > MAX_AUDIO_BYTES:
-                    raise ValueError(f"An audio clip is over {MAX_AUDIO_BYTES // (1024 * 1024)} MB.")
+                    raise ValueError(
+                        f"An audio clip is over {MAX_AUDIO_BYTES // (1024 * 1024)} MB."
+                    )
                 wave_16k = decode_wav(blob)
                 seconds += len(wave_16k) / AUDIO_RATE
                 if seconds > MAX_AUDIO_SECONDS:
-                    raise ValueError(f"The audio adds up to more than {MAX_AUDIO_SECONDS} seconds.")
+                    raise ValueError(
+                        f"The audio adds up to more than {MAX_AUDIO_SECONDS} seconds."
+                    )
                 audios.append(wave_16k)
                 content[i] = {"type": "audio"}
     images = extract_images(messages)
     # A list with audio holds only what the template is given for it.
     for message in messages if isinstance(messages, list) else []:
         content = message.get("content") if isinstance(message, dict) else None
-        if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "audio" for p in content):
-            if not all(isinstance(p, dict) and p.get("type") in ("text", "image", "audio") for p in content):
-                raise ValueError("Only text, image_url and input_audio parts are supported together with audio.")
+        if isinstance(content, list) and any(
+            isinstance(p, dict) and p.get("type") == "audio" for p in content
+        ):
+            if not all(
+                isinstance(p, dict) and p.get("type") in ("text", "image", "audio")
+                for p in content
+            ):
+                raise ValueError(
+                    "Only text, image_url and input_audio parts are supported together with audio."
+                )
     return images, audios
 
 
@@ -373,14 +410,24 @@ def decode_wav(blob: bytes) -> np.ndarray:
     try:
         with wave.open(io.BytesIO(blob)) as w:
             channels, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
-            if not 1 <= channels <= 8 or not 1 <= width <= 4 or not 8_000 <= rate <= 192_000:
-                raise ValueError(f"Unsupported WAV: {channels} channel(s), {width * 8}-bit, {rate} Hz.")
+            if (
+                not 1 <= channels <= 8
+                or not 1 <= width <= 4
+                or not 8_000 <= rate <= 192_000
+            ):
+                raise ValueError(
+                    f"Unsupported WAV: {channels} channel(s), {width * 8}-bit, {rate} Hz."
+                )
             if w.getnframes() > rate * MAX_CLIP_SECONDS:
-                raise ValueError(f"An audio clip is longer than {MAX_CLIP_SECONDS} seconds.")
+                raise ValueError(
+                    f"An audio clip is longer than {MAX_CLIP_SECONDS} seconds."
+                )
             frames = w.readframes(w.getnframes())
             # A file shorter than its header says: cut off, refused.
             if len(frames) != w.getnframes() * channels * width:
-                raise ValueError("The WAV audio is cut off (shorter than its header says).")
+                raise ValueError(
+                    "The WAV audio is cut off (shorter than its header says)."
+                )
     except ValueError:
         raise
     except Exception as e:  # wave.Error, EOFError, RuntimeError on a bad chunk...
@@ -435,7 +482,10 @@ def extract_images(messages: List[Any]) -> List[bytes]:
         content = message.get("content")
         if not isinstance(content, list):
             continue
-        if not all(isinstance(part, dict) and isinstance(part.get("type"), str) for part in content):
+        if not all(
+            isinstance(part, dict) and isinstance(part.get("type"), str)
+            for part in content
+        ):
             raise ValueError("Each content part must be an object with a string type.")
         types = {part.get("type") for part in content}
         if "image" in types:
@@ -444,7 +494,9 @@ def extract_images(messages: List[Any]) -> List[bytes]:
             raise ValueError("Send images as image_url parts.")
         if "image_url" in types and not types <= {"text", "image_url", "audio"}:
             # They'd reach the chat template as raw special tokens.
-            raise ValueError("Only text, image_url and input_audio parts are supported together with images.")
+            raise ValueError(
+                "Only text, image_url and input_audio parts are supported together with images."
+            )
         for i, part in enumerate(content):
             if part.get("type") != "image_url":
                 continue
@@ -462,7 +514,9 @@ def extract_images(messages: List[Any]) -> List[bytes]:
                 raise ValueError(f"Could not load image_url: {e}") from e
             pixels += _check_image(blob)
             if pixels > MAX_REQUEST_PIXELS:
-                raise ValueError(f"The images add up to more than {MAX_REQUEST_PIXELS} pixels.")
+                raise ValueError(
+                    f"The images add up to more than {MAX_REQUEST_PIXELS} pixels."
+                )
             images.append(blob)
             content[i] = {"type": "image"}
     return images
@@ -485,7 +539,14 @@ class UnifiedImageProcessor:
     to `max_soft_tokens` (positions (x, y), (-1, -1) for padding). HF's
     16 px patches merged 3x3 come out in exactly this order and layout."""
 
-    def __init__(self, patch_size=16, max_soft_tokens=280, pooling_kernel_size=3, rescale_factor=1 / 255, **_):
+    def __init__(
+        self,
+        patch_size=16,
+        max_soft_tokens=280,
+        pooling_kernel_size=3,
+        rescale_factor=1 / 255,
+        **_,
+    ):
         self.side = patch_size * pooling_kernel_size
         self.max_soft_tokens = max_soft_tokens
         self.rescale = rescale_factor
@@ -494,7 +555,9 @@ class UnifiedImageProcessor:
         """HF's get_aspect_ratio_preserving_size, in merged-patch units."""
         side, n = self.side, self.max_soft_tokens
         factor = math.sqrt(n * side * side / (height * width))
-        h, w = int(math.floor(factor * height / side)), int(math.floor(factor * width / side))
+        h, w = int(math.floor(factor * height / side)), int(
+            math.floor(factor * width / side)
+        )
         if h == 0 and w == 0:
             raise ValueError(f"image {width}x{height} is too small to patch")
         if h == 0:
@@ -514,8 +577,14 @@ class UnifiedImageProcessor:
             a = np.asarray(image, dtype=np.float32) * self.rescale
             s = self.side
             gh, gw = h // s, w // s
-            patches = a.reshape(gh, s, gw, s, 3).transpose(0, 2, 1, 3, 4).reshape(gh * gw, s * s * 3)
-            pos = np.stack(np.meshgrid(np.arange(gw), np.arange(gh), indexing="xy"), -1).reshape(-1, 2)
+            patches = (
+                a.reshape(gh, s, gw, s, 3)
+                .transpose(0, 2, 1, 3, 4)
+                .reshape(gh * gw, s * s * 3)
+            )
+            pos = np.stack(
+                np.meshgrid(np.arange(gw), np.arange(gh), indexing="xy"), -1
+            ).reshape(-1, 2)
             pad = self.max_soft_tokens - len(patches)
             pixels.append(np.pad(patches, ((0, pad), (0, 0))))
             positions.append(np.pad(pos, ((0, pad), (0, 0)), constant_values=-1))
@@ -538,7 +607,9 @@ class ImageInputs:
             if k in cfg
         }
         if getattr(model, "unified", False):
-            self.processor = UnifiedImageProcessor(rescale_factor=cfg.get("rescale_factor", 1 / 255), **kwargs)
+            self.processor = UnifiedImageProcessor(
+                rescale_factor=cfg.get("rescale_factor", 1 / 255), **kwargs
+            )
         else:
             from transformers.models.gemma4.image_processing_pil_gemma4 import (
                 Gemma4ImageProcessorPil,
@@ -559,7 +630,11 @@ class ImageInputs:
         self.audio_extractor = None
         fe = processor_config.get("feature_extractor")
         if getattr(model, "embed_audio", None) is not None and isinstance(fe, dict):
-            fe = {k: v for k, v in fe.items() if k not in ("feature_extractor_type", "processor_class")}
+            fe = {
+                k: v
+                for k, v in fe.items()
+                if k not in ("feature_extractor_type", "processor_class")
+            }
             if self.unified:
                 from transformers.models.gemma4_unified.feature_extraction_gemma4_unified import (
                     Gemma4UnifiedAudioFeatureExtractor as Extractor,
@@ -572,8 +647,11 @@ class ImageInputs:
 
     @property
     def accepts_audio(self) -> bool:
-        return (self.audio_extractor is not None
-                and None not in (self.audio_token_id, self.boa_token_id, self.eoa_token_id))
+        return self.audio_extractor is not None and None not in (
+            self.audio_token_id,
+            self.boa_token_id,
+            self.eoa_token_id,
+        )
 
     @property
     def accepts_images(self) -> bool:
@@ -591,7 +669,10 @@ class ImageInputs:
         return int(mask.sum())
 
     def build(
-        self, prompt: List[int], images: List[bytes], audios: Optional[List[np.ndarray]] = None
+        self,
+        prompt: List[int],
+        images: List[bytes],
+        audios: Optional[List[np.ndarray]] = None,
     ) -> Tuple[List[int], mx.array, List[int]]:
         """Returns (expanded token ids, input embeddings [L, H], cache key).
         `audios`: 16 kHz mono clips (extract_media), one per audio placeholder."""
@@ -603,8 +684,14 @@ class ImageInputs:
                 f"for {len(images)} image(s)."
             )
         if audios and not self.accepts_audio:
-            raise ValueError("This model does not accept audio inputs (no audio tower / feature extractor).")
-        n_audio = sum(1 for t in prompt if self.audio_token_id is not None and t == self.audio_token_id)
+            raise ValueError(
+                "This model does not accept audio inputs (no audio tower / feature extractor)."
+            )
+        n_audio = sum(
+            1
+            for t in prompt
+            if self.audio_token_id is not None and t == self.audio_token_id
+        )
         if n_audio != len(audios):
             raise ValueError(
                 f"Chat template produced {n_audio} audio placeholder(s) for {len(audios)} audio clip(s)."
@@ -626,11 +713,19 @@ class ImageInputs:
         if audios:
             # Whole clips (each at most MAX_CLIP_SECONDS, extract_media):
             # never the extractor's own cut.
-            audio_feats = self.audio_extractor(audios, sampling_rate=AUDIO_RATE, return_tensors="np",
-                                               max_length=MAX_CLIP_SECONDS * AUDIO_RATE, truncation=False)
-            n_audio_soft = [self.audio_soft_tokens(m) for m in audio_feats["input_features_mask"]]
+            audio_feats = self.audio_extractor(
+                audios,
+                sampling_rate=AUDIO_RATE,
+                return_tensors="np",
+                max_length=MAX_CLIP_SECONDS * AUDIO_RATE,
+                truncation=False,
+            )
+            n_audio_soft = [
+                self.audio_soft_tokens(m) for m in audio_feats["input_features_mask"]
+            ]
             audio_keys = [
-                _AUDIO_KEY_BASE + int.from_bytes(hashlib.sha256(a.tobytes()).digest()[:5], "big")
+                _AUDIO_KEY_BASE
+                + int.from_bytes(hashlib.sha256(a.tobytes()).digest()[:5], "big")
                 for a in audios
             ]
 
@@ -641,13 +736,19 @@ class ImageInputs:
             if self.audio_token_id is not None and t == self.audio_token_id:
                 span = [self.audio_token_id] * n_audio_soft[aud]
                 expanded += [self.boa_token_id] + span + [self.eoa_token_id]
-                cache_key += [self.boa_token_id] + [audio_keys[aud]] * n_audio_soft[aud] + [self.eoa_token_id]
+                cache_key += (
+                    [self.boa_token_id]
+                    + [audio_keys[aud]] * n_audio_soft[aud]
+                    + [self.eoa_token_id]
+                )
                 aud += 1
             elif t == self.image_token_id:
                 span = [self.image_token_id] * n_soft[img]
                 expanded += [self.boi_token_id] + span + [self.eoi_token_id]
                 cache_key += (
-                    [self.boi_token_id] + [keys[img]] * n_soft[img] + [self.eoi_token_id]
+                    [self.boi_token_id]
+                    + [keys[img]] * n_soft[img]
+                    + [self.eoi_token_id]
                 )
                 img += 1
             else:
@@ -844,7 +945,9 @@ class Lfm2VlImageInputs:
 
     def _too_large(self, h: int, w: int) -> bool:
         f = self.patch * self.factor
-        h_bar, w_bar = max(self.patch, round(h / f) * f), max(self.patch, round(w / f) * f)
+        h_bar, w_bar = max(self.patch, round(h / f) * f), max(
+            self.patch, round(w / f) * f
+        )
         return h_bar * w_bar > self.max_tokens * f * f * self.tolerance
 
     def _grid(self, h: int, w: int) -> Tuple[int, int]:
@@ -854,7 +957,9 @@ class Lfm2VlImageInputs:
             diff = abs(aspect - cols / rows)
             if diff < best_diff:
                 best, best_diff = (cols, rows), diff
-            elif diff == best_diff and h * w > 0.5 * self.tile * self.tile * cols * rows:
+            elif (
+                diff == best_diff and h * w > 0.5 * self.tile * self.tile * cols * rows
+            ):
                 best = (cols, rows)
         return best
 
@@ -876,16 +981,33 @@ class Lfm2VlImageInputs:
         out = []
         if self._too_large(H, W) and not self.min_tiles == self.max_tiles == 1:
             cols, rows = self._grid(H, W)
-            big = image.resize((cols * self.tile, rows * self.tile), Image.Resampling(self.resample))
+            big = image.resize(
+                (cols * self.tile, rows * self.tile), Image.Resampling(self.resample)
+            )
             for r in range(rows):
                 for c in range(cols):
-                    box = (c * self.tile, r * self.tile, (c + 1) * self.tile, (r + 1) * self.tile)
+                    box = (
+                        c * self.tile,
+                        r * self.tile,
+                        (c + 1) * self.tile,
+                        (r + 1) * self.tile,
+                    )
                     out.append(self._patches(big.crop(box)))
             if self.thumbnail and rows * cols > 1:
-                out.append(self._patches(image.resize((new_w, new_h), Image.Resampling(self.resample))))
+                out.append(
+                    self._patches(
+                        image.resize((new_w, new_h), Image.Resampling(self.resample))
+                    )
+                )
         else:
-            out.append(self._patches(image.resize((new_w, new_h), Image.Resampling(self.resample))))
-        n = math.ceil(new_h // self.patch / self.factor) * math.ceil(new_w // self.patch / self.factor)
+            out.append(
+                self._patches(
+                    image.resize((new_w, new_h), Image.Resampling(self.resample))
+                )
+            )
+        n = math.ceil(new_h // self.patch / self.factor) * math.ceil(
+            new_w // self.patch / self.factor
+        )
         return out, rows, cols, n
 
     def build(
@@ -914,7 +1036,9 @@ class Lfm2VlImageInputs:
             if rows * cols > 1:
                 for r in range(rows):
                     for c in range(cols):
-                        spans.append((self.ids[f"<|img_row_{r + 1}_col_{c + 1}|>"], per_tile))
+                        spans.append(
+                            (self.ids[f"<|img_row_{r + 1}_col_{c + 1}|>"], per_tile)
+                        )
                 if self.thumbnail:
                     spans.append((self.ids["<|img_thumbnail|>"], n_image))
             else:
@@ -963,7 +1087,9 @@ class MuseSparkImageInputs:
             )
         pixel_values, counts = [], []
         for blob in images:
-            pixels, n = self.processor.preprocess_image(np.asarray(_decode(blob).convert("RGB")))
+            pixels, n = self.processor.preprocess_image(
+                np.asarray(_decode(blob).convert("RGB"))
+            )
             pixel_values.append(pixels)
             counts.append(n)
         keys = [
@@ -979,7 +1105,9 @@ class MuseSparkImageInputs:
             expanded += [self.start_id] + [self.patch_id] * counts[img] + [self.end_id]
             cache_key += [self.start_id] + [keys[img]] * counts[img] + [self.end_id]
             img += 1
-        embeddings = self.model.embed_inputs(mx.array(expanded), pixel_values=pixel_values)
+        embeddings = self.model.embed_inputs(
+            mx.array(expanded), pixel_values=pixel_values
+        )
         mx.eval(embeddings)
         return expanded, embeddings, cache_key
 
@@ -1038,7 +1166,11 @@ def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
         needed = {"<|image_start|>", "<|image_end|>", "<|img_thumbnail|>"}
         # A marker for every tile of every grid the settings allow.
         for cols, rows in inputs.ratios:
-            needed |= {f"<|img_row_{r + 1}_col_{c + 1}|>" for r in range(rows) for c in range(cols)}
+            needed |= {
+                f"<|img_row_{r + 1}_col_{c + 1}|>"
+                for r in range(rows)
+                for c in range(cols)
+            }
         if any(t not in ids for t in needed):
             return None
         return inputs
@@ -1055,7 +1187,10 @@ def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
     if getattr(model, "model_type", None) not in ("gemma4", "gemma4_unified"):
         return None
     # Images, audio or both.
-    if getattr(model, "embed_vision", None) is None and getattr(model, "embed_audio", None) is None:
+    if (
+        getattr(model, "embed_vision", None) is None
+        and getattr(model, "embed_audio", None) is None
+    ):
         return None
     from .utils import _download
 
