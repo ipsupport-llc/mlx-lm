@@ -55,6 +55,11 @@ class ModelArgs(BaseModelArgs):
             rp.get("full_attention", {}).get("rope_theta", 10000000.0)
         )
         assert self.recurrent_kv_cache_mode in ("per_loop", "last_loop")
+        n_io = self.n_input_layers + self.n_recurrent_layers + self.n_output_layers
+        assert n_io == self.num_hidden_layers, (
+            f"n_input_layers + n_recurrent_layers + n_output_layers ({n_io}) "
+            f"must equal num_hidden_layers ({self.num_hidden_layers})"
+        )
 
 
 _EPS = 1e-6
@@ -119,28 +124,27 @@ class DoryAttention(nn.Module):
             gate_init = math.sqrt(args.hidden_size)
         self._sqk_factor = math.sqrt(d) / std
         self._gate_factor = math.sqrt(gate_init) / std
-        self._scales = None
 
     def _get_scales(self):
-        if self.training or self._scales is None:
-            H, K, d = (
-                self.args.num_attention_heads,
-                self.args.num_key_value_heads,
-                self.args.head_dim,
-            )
-            sqk = self.sqk.astype(mx.float32) * self._sqk_factor
-            sg = self.s_gate.astype(mx.float32) * self._gate_factor
-            qk_scale = mx.concatenate(
-                [
-                    (sqk * sqk).reshape(1, H, 1, d),
-                    mx.ones((1, K, 1, d), dtype=mx.float32),
-                ],
-                axis=1,
-            )
-            self._scales = (qk_scale, sg * sg)
-            if not self.training:
-                mx.eval(self._scales)
-        return self._scales
+        # Recomputed every call, not cached: these derive from trainable
+        # parameters, and a cache keyed only on `self.training` goes stale
+        # the moment weights change under eval (e.g. a validation pass after
+        # a training step) -- the arrays are tiny, so this costs nothing.
+        H, K, d = (
+            self.args.num_attention_heads,
+            self.args.num_key_value_heads,
+            self.args.head_dim,
+        )
+        sqk = self.sqk.astype(mx.float32) * self._sqk_factor
+        sg = self.s_gate.astype(mx.float32) * self._gate_factor
+        qk_scale = mx.concatenate(
+            [
+                (sqk * sqk).reshape(1, H, 1, d),
+                mx.ones((1, K, 1, d), dtype=mx.float32),
+            ],
+            axis=1,
+        )
+        return qk_scale, sg * sg
 
     def __call__(self, x, cache=None):
         B, T, _ = x.shape
@@ -183,17 +187,11 @@ class DoryMLP(nn.Module):
         self.suv_gate = mx.ones((args.intermediate_size,))
         self.suv_up = mx.ones((args.intermediate_size,))
         self._s = math.sqrt(args.hidden_size)
-        self._scales = None
 
     def __call__(self, x):
-        if self.training or self._scales is None:
-            self._scales = (
-                self.suv_gate.astype(mx.float32) * self._s,
-                self.suv_up.astype(mx.float32) * self._s,
-            )
-            if not self.training:
-                mx.eval(self._scales)
-        sg, su = self._scales
+        # Recomputed every call -- see the comment in DoryAttention._get_scales.
+        sg = self.suv_gate.astype(mx.float32) * self._s
+        su = self.suv_up.astype(mx.float32) * self._s
         gu = self.gate_up_proj(x)
         return self.down_proj(mlp_act(gu[..., : self.I], gu[..., self.I :], sg, su))
 
@@ -204,7 +202,6 @@ class DoryLayer(nn.Module):
         self.is_attn = layer_type != "mlp"
         self.layer_type = layer_type
         self._alpha_scale = args.ngpt_alpha_init / args.initializer_range
-        self._alpha = None
         if self.is_attn:
             self.attn_alpha = mx.ones((args.hidden_size,))
             self.mixer = DoryAttention(args, layer_type == "sliding_attention")
@@ -213,13 +210,11 @@ class DoryLayer(nn.Module):
             self.mixer = DoryMLP(args)
 
     def __call__(self, h, cache=None):
-        if self.training or self._alpha is None:
-            a = self.attn_alpha if self.is_attn else self.mlp_alpha
-            self._alpha = mx.abs(a.astype(mx.float32) * self._alpha_scale)
-            if not self.training:
-                mx.eval(self._alpha)
+        # Recomputed every call -- see the comment in DoryAttention._get_scales.
+        a = self.attn_alpha if self.is_attn else self.mlp_alpha
+        alpha = mx.abs(a.astype(mx.float32) * self._alpha_scale)
         out = self.mixer(h, cache) if self.is_attn else self.mixer(h)
-        return slerp_norm(h, out, self._alpha)
+        return slerp_norm(h, out, alpha)
 
 
 class DoryBackbone(nn.Module):
@@ -238,7 +233,6 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         self.logit_scale = mx.ones((args.vocab_size,))
         self._plan = None
-        self._ls = None
 
     @property
     def layers(self):
@@ -323,11 +317,9 @@ class Model(nn.Module):
         for i in range(hi, a.num_hidden_layers):
             c = cache[plan[(i, 0)]] if layers[i].is_attn else None
             h = layers[i](h, c)
-        if self.training or self._ls is None:
-            self._ls = self.logit_scale.astype(mx.float32) / a.initializer_range
-            if not self.training:
-                mx.eval(self._ls)
-        return (self.lm_head(h).astype(mx.float32) * self._ls).astype(h.dtype)
+        # Recomputed every call -- see the comment in DoryAttention._get_scales.
+        ls = self.logit_scale.astype(mx.float32) / a.initializer_range
+        return (self.lm_head(h).astype(mx.float32) * ls).astype(h.dtype)
 
     def sanitize(self, weights):
         out = {}

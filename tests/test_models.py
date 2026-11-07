@@ -1209,6 +1209,43 @@ class TestModels(unittest.TestCase):
         # does between loops in last_loop mode.
         self.assertTrue(mx.allclose(run(False), run(True), rtol=1e-4, atol=1e-4))
 
+    def test_dory_sanitize_fuses_split_checkpoint_weights(self):
+        from mlx_lm.models import dory
+
+        args = self._dory_tiny_args()
+        mx.random.seed(0)
+        model = dory.Model(args)
+        params = dict(tree_flatten(model.parameters()))
+
+        H, K, d = args.num_attention_heads, args.num_key_value_heads, args.head_dim
+        I = args.intermediate_size
+        n_qk, n_v = (H + K) * d, K * d
+
+        # The real checkpoint stores q/k/v/g and gate/up as separate
+        # tensors; sanitize() fuses them into qkvg_proj/gate_up_proj.
+        # Split a fused model's own weights back apart and feed them
+        # through sanitize() to check it reassembles them in the exact
+        # [q|k|v|g] / [gate|up] order DoryAttention/DoryMLP expect.
+        split = {}
+        for k, v in params.items():
+            if k.endswith(".mixer.qkvg_proj.weight"):
+                p = k[: -len("qkvg_proj.weight")]
+                split[p + "q_proj.weight"] = v[: H * d]
+                split[p + "k_proj.weight"] = v[H * d : n_qk]
+                split[p + "v_proj.weight"] = v[n_qk : n_qk + n_v]
+                split[p + "g_proj.weight"] = v[n_qk + n_v :]
+            elif k.endswith(".mixer.gate_up_proj.weight"):
+                p = k[: -len("gate_up_proj.weight")]
+                split[p + "gate_proj.weight"] = v[:I]
+                split[p + "up_proj.weight"] = v[I:]
+            else:
+                split[k] = v
+
+        fused = model.sanitize(split)
+        self.assertEqual(set(fused.keys()), set(params.keys()))
+        for k, v in params.items():
+            self.assertTrue(mx.array_equal(fused[k], v), k)
+
     def test_lfm2(self):
         from mlx_lm.models import lfm2
 
