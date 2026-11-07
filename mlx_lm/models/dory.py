@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 
 
@@ -122,7 +122,7 @@ class DoryAttention(nn.Module):
         self._scales = None
 
     def _get_scales(self):
-        if self._scales is None:
+        if self.training or self._scales is None:
             H, K, d = (
                 self.args.num_attention_heads,
                 self.args.num_key_value_heads,
@@ -138,10 +138,11 @@ class DoryAttention(nn.Module):
                 axis=1,
             )
             self._scales = (qk_scale, sg * sg)
-            mx.eval(self._scales)
+            if not self.training:
+                mx.eval(self._scales)
         return self._scales
 
-    def __call__(self, x, cache=None, reset_to=None):
+    def __call__(self, x, cache=None):
         B, T, _ = x.shape
         H, K, d = (
             self.args.num_attention_heads,
@@ -154,8 +155,6 @@ class DoryAttention(nn.Module):
         qk = y[..., :n].reshape(B, T, H + K, d).transpose(0, 2, 1, 3)
         v = y[..., n : n + K * d].reshape(B, T, K, d).transpose(0, 2, 1, 3)
         g = y[..., n + K * d :]
-        if cache is not None and reset_to is not None:
-            cache.offset = reset_to  # last_loop: overwrite slots of the current chunk
         off = cache.offset if cache is not None else 0
         qk = qk_prep(
             self.rope(qk, offset=off), qk_scale
@@ -166,8 +165,8 @@ class DoryAttention(nn.Module):
         )
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
-        o = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=1.0 / math.sqrt(d), mask=mask
+        o = scaled_dot_product_attention(
+            q, k, v, cache=cache, scale=1.0 / math.sqrt(d), mask=mask
         )
         o = o.transpose(0, 2, 1, 3).reshape(B, T, H * d)
         return self.o_proj(gate_out(o, g, sg2))
@@ -187,12 +186,13 @@ class DoryMLP(nn.Module):
         self._scales = None
 
     def __call__(self, x):
-        if self._scales is None:
+        if self.training or self._scales is None:
             self._scales = (
                 self.suv_gate.astype(mx.float32) * self._s,
                 self.suv_up.astype(mx.float32) * self._s,
             )
-            mx.eval(self._scales)
+            if not self.training:
+                mx.eval(self._scales)
         sg, su = self._scales
         gu = self.gate_up_proj(x)
         return self.down_proj(mlp_act(gu[..., : self.I], gu[..., self.I :], sg, su))
@@ -212,12 +212,13 @@ class DoryLayer(nn.Module):
             self.mlp_alpha = mx.ones((args.hidden_size,))
             self.mixer = DoryMLP(args)
 
-    def __call__(self, h, cache=None, reset_to=None):
-        if self._alpha is None:
+    def __call__(self, h, cache=None):
+        if self.training or self._alpha is None:
             a = self.attn_alpha if self.is_attn else self.mlp_alpha
             self._alpha = mx.abs(a.astype(mx.float32) * self._alpha_scale)
-            mx.eval(self._alpha)
-        out = self.mixer(h, cache, reset_to) if self.is_attn else self.mixer(h)
+            if not self.training:
+                mx.eval(self._alpha)
+        out = self.mixer(h, cache) if self.is_attn else self.mixer(h)
         return slerp_norm(h, out, self._alpha)
 
 
@@ -297,30 +298,35 @@ class Model(nn.Module):
             h = layers[i](h, c)
         input_h = h
         state = input_h
+        T = input_h.shape[1]
         per_loop = a.recurrent_kv_cache_mode == "per_loop"
-        starts = {}
         for l in range(a.n_recurrent_loops):
             h = loop_inject(state, input_h)
             for i in range(lo, hi):
                 if layers[i].is_attn:
                     c = cache[plan[(i, l if per_loop else 0)]]
-                    reset = None
-                    if not per_loop and c is not None:
-                        if l == 0:
-                            starts[i] = c.offset
-                        else:
-                            reset = starts[i]
-                    h = layers[i](h, c, reset)
+                    h = layers[i](h, c)
                 else:
                     h = layers[i](h)
+            if not per_loop and l < a.n_recurrent_loops - 1:
+                # last_loop: undo this loop's writes through the cache's own
+                # trim() so the next loop overwrites the same chunk (trim()
+                # keeps every cache type's internal bookkeeping consistent,
+                # e.g. BatchKVCache's separate _idx write cursor).
+                for i in range(lo, hi):
+                    if layers[i].is_attn:
+                        c = cache[plan[(i, 0)]]
+                        if c is not None:
+                            c.trim(T)
             state = justnorm(h)
         h = state
         for i in range(hi, a.num_hidden_layers):
             c = cache[plan[(i, 0)]] if layers[i].is_attn else None
             h = layers[i](h, c)
-        if self._ls is None:
+        if self.training or self._ls is None:
             self._ls = self.logit_scale.astype(mx.float32) / a.initializer_range
-            mx.eval(self._ls)
+            if not self.training:
+                mx.eval(self._ls)
         return (self.lm_head(h).astype(mx.float32) * self._ls).astype(h.dtype)
 
     def sanitize(self, weights):

@@ -1166,6 +1166,49 @@ class TestModels(unittest.TestCase):
         ref, _ = run("last_loop", full_kv=True)
         self.assertTrue(mx.allclose(out, ref, rtol=1e-4, atol=1e-4))
 
+    def test_dory_last_loop_batch_cache(self):
+        from mlx.utils import tree_map_with_path
+
+        from mlx_lm.models import dory
+        from mlx_lm.models.cache import BatchKVCache, KVCache
+
+        def run(use_batch_cache):
+            args = self._dory_tiny_args(
+                sliding_window=8,
+                n_recurrent_loops=2,
+                recurrent_kv_cache_mode="last_loop",
+            )
+            mx.random.seed(0)
+            model = dory.Model(args)
+            names = {"sqk", "s_gate", "suv_gate", "suv_up", "attn_alpha"}
+            names |= {"mlp_alpha", "logit_scale"}
+            std = args.initializer_range
+            model.update(
+                tree_map_with_path(
+                    lambda p, v: (
+                        mx.full(v.shape, std) if p.split(".")[-1] in names else v
+                    ),
+                    model.parameters(),
+                )
+            )
+            inputs = mx.random.randint(0, args.vocab_size, (1, 40))
+            cache = model.make_cache()
+            if use_batch_cache:
+                # As BatchGenerator substitutes for batched decoding: a
+                # single-row BatchKVCache, which tracks its write cursor in
+                # `_idx` separately from `offset`.
+                cache = [
+                    BatchKVCache(left_padding=[0]) if type(c) is KVCache else c
+                    for c in cache
+                ]
+            outs = [model(inputs[:, i : i + 5], cache=cache) for i in range(0, 30, 5)]
+            outs += [model(inputs[:, i : i + 1], cache=cache) for i in range(30, 40)]
+            return mx.concatenate(outs, axis=1)
+
+        # A single-row BatchKVCache must rewind the same way plain KVCache
+        # does between loops in last_loop mode.
+        self.assertTrue(mx.allclose(run(False), run(True), rtol=1e-4, atol=1e-4))
+
     def test_lfm2(self):
         from mlx_lm.models import lfm2
 
