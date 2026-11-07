@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 """JANG repacks of prism-ml's Hadamard-rotated ternary Bonsai 2 checkpoints
 (prism.hadamard.v1 in config.json) load through prism_hadamard_qwen35, and
 nothing else is routed there."""
@@ -21,7 +23,10 @@ def repack_config():
         "hadamard": {
             "contract": "prism.hadamard.v1",
             "block_size": 1024,
-            "forward_modules": ["language_model.lm_head", "language_model.model.layers.0.mlp.up_proj"],
+            "forward_modules": [
+                "language_model.lm_head",
+                "language_model.model.layers.0.mlp.up_proj",
+            ],
             "inverse_modules": ["language_model.model.embed_tokens"],
             "gdn_v_grouped": True,
         },
@@ -29,8 +34,18 @@ def repack_config():
             "group_size": 128,
             "bits": 2,
             "mode": "affine",
-            "language_model.lm_head": {"group_size": 128, "bits": 2, "mode": "affine", "storage_bits": 2},
-            "vision_tower.blocks.0.attn.qkv": {"group_size": 128, "bits": 6, "mode": "affine", "storage_bits": 6},
+            "language_model.lm_head": {
+                "group_size": 128,
+                "bits": 2,
+                "mode": "affine",
+                "storage_bits": 2,
+            },
+            "vision_tower.blocks.0.attn.qkv": {
+                "group_size": 128,
+                "bits": 6,
+                "mode": "affine",
+                "storage_bits": 6,
+            },
         },
     }
 
@@ -39,24 +54,34 @@ class TestPrismHadamardRepack(unittest.TestCase):
     def adapt(self, config, jang_layout=None):
         with tempfile.TemporaryDirectory() as d:
             if jang_layout is not None:
-                Path(d, "jang_config.json").write_text(json.dumps({"layout": jang_layout}))
+                Path(d, "jang_config.json").write_text(
+                    json.dumps({"layout": jang_layout})
+                )
             utils._adapt_prism_hadamard_repack(config, Path(d))
         return config
 
     def test_repack_routed_to_prism(self):
-        config = self.adapt(repack_config(), {"language_norms": "zero-centered-runtime-plus-one"})
+        config = self.adapt(
+            repack_config(), {"language_norms": "zero-centered-runtime-plus-one"}
+        )
         self.assertEqual(config["model_type"], "prism_hadamard_qwen35")
         self.assertEqual(
             config["modules"],
             [
                 {"path": "lm_head", "block": 1024, "embedding": False},
-                {"path": "model.layers.0.mlp.up_proj", "block": 1024, "embedding": False},
+                {
+                    "path": "model.layers.0.mlp.up_proj",
+                    "block": 1024,
+                    "embedding": False,
+                },
                 {"path": "model.embed_tokens", "block": 1024, "embedding": True},
             ],
         )
         # Rotated modules are built quantized by the model; no per-layer
         # entries (and no storage_bits) reach nn.quantize.
-        self.assertEqual(config["quantization"], {"group_size": 128, "bits": 2, "mode": "affine"})
+        self.assertEqual(
+            config["quantization"], {"group_size": 128, "bits": 2, "mode": "affine"}
+        )
         self.assertTrue(config["zero_centered_norms"])
 
     def test_norm_convention_only_when_declared(self):
@@ -66,7 +91,10 @@ class TestPrismHadamardRepack(unittest.TestCase):
     def test_other_configs_untouched(self):
         plain = {"model_type": "qwen3_5", "quantization": {"bits": 4, "group_size": 64}}
         self.assertEqual(self.adapt(dict(plain)), plain)
-        prism_native = {"model_type": "prism_hadamard_qwen35", "modules": [{"path": "lm_head", "block": 1024}]}
+        prism_native = {
+            "model_type": "prism_hadamard_qwen35",
+            "modules": [{"path": "lm_head", "block": 1024}],
+        }
         self.assertEqual(self.adapt(dict(prism_native)), prism_native)
         other_contract = repack_config()
         other_contract["hadamard"]["contract"] = "something.else"
@@ -107,9 +135,14 @@ class TestPrismHadamardRepack(unittest.TestCase):
         ):
             self.assertEqual(shifted[key].tolist(), [1.0] * 4, key)
         # GatedDeltaNet's own norm has no +1 offset.
-        self.assertEqual(shifted["language_model.model.layers.0.linear_attn.norm.weight"].tolist(), [0.0] * 4)
+        self.assertEqual(
+            shifted["language_model.model.layers.0.linear_attn.norm.weight"].tolist(),
+            [0.0] * 4,
+        )
         # prism's own checkpoints: untouched.
-        self.assertEqual(run(False)["language_model.model.norm.weight"].tolist(), [0.0] * 4)
+        self.assertEqual(
+            run(False)["language_model.model.norm.weight"].tolist(), [0.0] * 4
+        )
 
 
 class TestPrismRepackRoundTrip(unittest.TestCase):
@@ -118,13 +151,17 @@ class TestPrismRepackRoundTrip(unittest.TestCase):
     `hadamard` block, and to add the norms' 1 a second time."""
 
     def test_adapted_config_is_stable(self):
-        config = TestPrismHadamardRepack.adapt(None, repack_config(), {"language_norms": "zero-centered-runtime-plus-one"})
+        config = TestPrismHadamardRepack.adapt(
+            None, repack_config(), {"language_norms": "zero-centered-runtime-plus-one"}
+        )
         self.assertNotIn("hadamard", config, "translated into modules")
         again = json.loads(json.dumps(config))
         TestPrismHadamardRepack.adapt(None, again)
         self.assertEqual(again, config)
         # Saved by an mlx-lm that kept the block: its norms already hold the 1.
-        old_save = dict(config, hadamard=repack_config()["hadamard"], zero_centered_norms=True)
+        old_save = dict(
+            config, hadamard=repack_config()["hadamard"], zero_centered_norms=True
+        )
         TestPrismHadamardRepack.adapt(None, old_save)
         self.assertEqual(old_save, dict(config, zero_centered_norms=False))
 
@@ -135,18 +172,27 @@ class TestPrismRepackRoundTrip(unittest.TestCase):
             "language_model.model.norm.weight": mx.zeros((4,)),
             "language_model.model.layers.0.input_layernorm.weight": mx.zeros((4,)),
             # HF layout (C, 1, K): qwen3_5's sanitize adds the norms' 1 itself.
-            "language_model.model.layers.0.linear_attn.conv1d.weight": mx.zeros((8, 1, 4)),
+            "language_model.model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                (8, 1, 4)
+            ),
         }
         text = SimpleNamespace(args=SimpleNamespace(tie_word_embeddings=False))
         fake = SimpleNamespace(
             args=SimpleNamespace(zero_centered_norms=True),
-            language_model=SimpleNamespace(sanitize=lambda w: qwen3_5.TextModel.sanitize(text, w)),
+            language_model=SimpleNamespace(
+                sanitize=lambda w: qwen3_5.TextModel.sanitize(text, w)
+            ),
         )
         out = prism.Model.sanitize(fake, dict(weights))
         self.assertEqual(out["language_model.model.norm.weight"].tolist(), [1.0] * 4)
-        self.assertEqual(out["language_model.model.layers.0.input_layernorm.weight"].tolist(), [1.0] * 4)
+        self.assertEqual(
+            out["language_model.model.layers.0.input_layernorm.weight"].tolist(),
+            [1.0] * 4,
+        )
         # MLX layout: prism's sanitize adds it (qwen3_5's doesn't).
-        weights["language_model.model.layers.0.linear_attn.conv1d.weight"] = mx.zeros((8, 4, 1))
+        weights["language_model.model.layers.0.linear_attn.conv1d.weight"] = mx.zeros(
+            (8, 4, 1)
+        )
         out = prism.Model.sanitize(fake, dict(weights))
         self.assertEqual(out["language_model.model.norm.weight"].tolist(), [1.0] * 4)
 
@@ -154,13 +200,17 @@ class TestPrismRepackRoundTrip(unittest.TestCase):
 class TestLayerQuantization(unittest.TestCase):
     def test_equal_storage_bits_dropped(self):
         self.assertEqual(
-            utils._layer_quantization("x", {"bits": 2, "group_size": 128, "storage_bits": 2}),
+            utils._layer_quantization(
+                "x", {"bits": 2, "group_size": 128, "storage_bits": 2}
+            ),
             {"bits": 2, "group_size": 128},
         )
 
     def test_different_storage_bits_refused(self):
         with self.assertRaises(ValueError):
-            utils._layer_quantization("x", {"bits": 3, "group_size": 64, "storage_bits": 4})
+            utils._layer_quantization(
+                "x", {"bits": 3, "group_size": 64, "storage_bits": 4}
+            )
 
     def test_other_entries_pass_through(self):
         self.assertIs(utils._layer_quantization("x", False), False)

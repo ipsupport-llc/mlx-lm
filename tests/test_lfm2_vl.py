@@ -178,7 +178,7 @@ class TestImageInputs(unittest.TestCase):
         # 320x240 -> 320x256 (x32), 10x8 tokens after the 2x2 unshuffle.
         self.assertEqual(ids, [1, 100] + [7] * 80 + [101, 2])
         self.assertEqual(len(key), len(ids))
-        (_, h, w), = [(c[0], c[1], c[2]) for c in self.model.seen[1]]
+        ((_, h, w),) = [(c[0], c[1], c[2]) for c in self.model.seen[1]]
         self.assertEqual((h, w), (16, 20))
 
     def test_large_image_is_tiled_with_thumbnail(self):
@@ -191,7 +191,9 @@ class TestImageInputs(unittest.TestCase):
         self.assertEqual(ids[0], 100)
         self.assertEqual(ids[1], 200)  # row 1 col 1
         self.assertIn(102, ids)  # thumbnail
-        self.assertEqual(ids.count(7), 256 * len(tiles) + (crops[-1][1] // 2) * (crops[-1][2] // 2))
+        self.assertEqual(
+            ids.count(7), 256 * len(tiles) + (crops[-1][1] // 2) * (crops[-1][2] // 2)
+        )
 
     def test_preprocessor_config_overrides(self):
         import json
@@ -204,8 +206,12 @@ class TestImageInputs(unittest.TestCase):
         tokens = ["<|image_start|>", "<|image_end|>", "<|img_thumbnail|>"]
         tokens += [f"<|img_row_{r}_col_{c}|>" for r in (1, 2) for c in (1, 2)]
         with tempfile.TemporaryDirectory() as d:
-            Path(d, "processor_config.json").write_text(json.dumps({"image_processor": {"max_tiles": 10}}))
-            Path(d, "preprocessor_config.json").write_text(json.dumps({"max_tiles": 2, "resample": 2}))
+            Path(d, "processor_config.json").write_text(
+                json.dumps({"image_processor": {"max_tiles": 10}})
+            )
+            Path(d, "preprocessor_config.json").write_text(
+                json.dumps({"max_tiles": 2, "resample": 2})
+            )
             # Without the image tokens: no image inputs, not a KeyError later.
             self.assertIsNone(load_image_inputs(model, d))
             # A tile marker short of the grids max_tiles 2 allows: still none.

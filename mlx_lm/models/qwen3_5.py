@@ -431,7 +431,10 @@ class MTP(nn.Module):
     def __call__(self, hidden, embeddings, cache):
         x = self.fc(
             mx.concatenate(
-                [self.pre_fc_norm_embedding(embeddings), self.pre_fc_norm_hidden(hidden)],
+                [
+                    self.pre_fc_norm_embedding(embeddings),
+                    self.pre_fc_norm_hidden(hidden),
+                ],
                 axis=-1,
             )
         )

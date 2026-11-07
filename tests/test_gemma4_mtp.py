@@ -127,9 +127,7 @@ class TestGemma4MTP(unittest.TestCase):
     def setUpClass(cls):
         cls.model = _main_model()
         cls.prompt = mx.array([(i * 7 + 3) % VOCAB for i in range(19)])  # > window
-        cls.ref = [
-            t for t, _ in generate_step(cls.prompt, cls.model, max_tokens=60)
-        ]
+        cls.ref = [t for t, _ in generate_step(cls.prompt, cls.model, max_tokens=60)]
 
     def _mtp(self, drafter, k, **kw):
         return [
@@ -259,7 +257,9 @@ class TestGemma4MTP(unittest.TestCase):
         self.assertEqual(
             [c.offset for c in cache], [len(self.prompt) + len(out)] * len(cache)
         )
-        _drafter_out = self._mtp(_drafter(), 3, kv_bits=8, kv_group_size=32, quantized_kv_start=0)
+        _drafter_out = self._mtp(
+            _drafter(), 3, kv_bits=8, kv_group_size=32, quantized_kv_start=0
+        )
         self.assertEqual(len(_drafter_out), 60)
 
     def test_rotating_cache_rollback_past_window(self):

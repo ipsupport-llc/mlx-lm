@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -79,7 +79,11 @@ class ModelArgs(BaseModelArgs):
             "raven": self.hybrid_raven_enabled,
             "gla": self.hybrid_gla_enabled,
         }
-        cycle = [b.strip().lower() for b in self.hybrid_layerwise_cycle if enabled.get(b.strip().lower())]
+        cycle = [
+            b.strip().lower()
+            for b in self.hybrid_layerwise_cycle
+            if enabled.get(b.strip().lower())
+        ]
         if not cycle:
             cycle = [name for name, on in enabled.items() if on] or ["quasar"]
         order = sorted(self.hybrid_attention_layers)
@@ -113,7 +117,12 @@ class GroupRMSNorm(nn.Module):
 
 
 def quasar_rope(
-    x: mx.array, offset: int, rope_dim: int, base: float, nope_after: int, use_nope: bool
+    x: mx.array,
+    offset: int,
+    rope_dim: int,
+    base: float,
+    nope_after: int,
+    use_nope: bool,
 ) -> mx.array:
     """Partial NeoX-style RoPE on x[..., :rope_dim], identity for pos >= nope_after.
 
@@ -123,8 +132,8 @@ def quasar_rope(
     half = rope_dim // 2
     pos = (offset + mx.arange(L)).astype(mx.float32)
     inv_freq = base ** (-(mx.arange(0, rope_dim, 2).astype(mx.float32)) / rope_dim)
-    freqs = pos[:, None] * inv_freq[None, :]            # (L, half)
-    emb = mx.concatenate([freqs, freqs], axis=-1)       # (L, rope_dim)
+    freqs = pos[:, None] * inv_freq[None, :]  # (L, half)
+    emb = mx.concatenate([freqs, freqs], axis=-1)  # (L, rope_dim)
     cos = mx.cos(emb)
     sin = mx.sin(emb)
     if use_nope:
@@ -177,7 +186,9 @@ class MoEGate(nn.Module):
         group_scores = mx.topk(scores_g, 2, axis=-1).sum(axis=-1, keepdims=True)
         k = ng - tg
         group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-        scores_g = mx.put_along_axis(scores_g, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2)
+        scores_g = mx.put_along_axis(
+            scores_g, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+        )
         scores = mx.flatten(scores_g, -2, -1)
 
         k = self.top_k
@@ -193,7 +204,9 @@ class SparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.gate = MoEGate(args)
-        self.switch_mlp = SwitchGLU(args.hidden_size, args.moe_intermediate_size, args.num_experts)
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size, args.moe_intermediate_size, args.num_experts
+        )
         self.shared_experts = MLP(
             args.hidden_size, args.moe_intermediate_size * args.num_shared_experts
         )
@@ -218,7 +231,7 @@ def _gla_recurrence(q, k, v, g, scale, state=None):
     q = q.transpose(0, 2, 1, 3) * scale
     k = k.transpose(0, 2, 1, 3)
     v = v.transpose(0, 2, 1, 3)
-    g = g.transpose(0, 2, 1)                                   # (B,H,L)
+    g = g.transpose(0, 2, 1)  # (B,H,L)
     S = mx.zeros((B, H, K, V), dtype=mx.float32) if state is None else state
     outs = []
     for i in range(L):
@@ -226,7 +239,7 @@ def _gla_recurrence(q, k, v, g, scale, state=None):
         kv = k[:, :, i, :, None] * v[:, :, i, None, :]
         S = S * gate + kv
         outs.append((q[:, :, i, :, None] * S).sum(axis=-2))
-    o = mx.stack(outs, axis=2).transpose(0, 2, 1, 3)          # (B,L,H,V)
+    o = mx.stack(outs, axis=2).transpose(0, 2, 1, 3)  # (B,L,H,V)
     return o, S
 
 
@@ -248,7 +261,7 @@ def _gsa_recurrence(q, k, v, s, g, scale, state=None):
         gi = mx.exp(g[:, :, i])
         hk = hk * gi[:, :, None, :] + k[:, :, i, :, None] * s[:, :, i, None, :]
         ok.append(((q[:, :, i] * scale)[:, :, :, None] * hk).sum(axis=-2))
-    ok = mx.stack(ok, axis=2)                                  # (B,H,L,M)
+    ok = mx.stack(ok, axis=2)  # (B,H,L,M)
     qv = mx.softmax(ok, axis=-1)
     hv = mx.zeros((B, H, M, P), dtype=mx.float32) if state is None else state[1]
     ov = []
@@ -256,7 +269,7 @@ def _gsa_recurrence(q, k, v, s, g, scale, state=None):
         gi = mx.exp(g[:, :, i])
         hv = hv * gi[:, :, :, None] + s[:, :, i, :, None] * v[:, :, i, None, :]
         ov.append((qv[:, :, i, :, None] * hv).sum(axis=-2))
-    o = mx.stack(ov, axis=2).transpose(0, 2, 1, 3)            # (B,L,H,P)
+    o = mx.stack(ov, axis=2).transpose(0, 2, 1, 3)  # (B,L,H,P)
     return o, (hk, hv)
 
 
@@ -288,22 +301,34 @@ class GLABranch(nn.Module):
         self.rope_dim = int(self.head_dim * args.partial_rotary_factor)
 
         self.query_key_value = nn.Linear(
-            args.hidden_size, (self.n_heads + 2 * self.n_kv) * self.head_dim, bias=args.use_qkv_bias
+            args.hidden_size,
+            (self.n_heads + 2 * self.n_kv) * self.head_dim,
+            bias=args.use_qkv_bias,
         )
         if args.use_qk_norm:
             self.query_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
             self.key_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        self.dense = nn.Linear(self.n_heads * self.head_dim, args.hidden_size, bias=args.use_bias)
-        self.g_proj = nn.Linear(args.hidden_size, self.n_heads * self.head_dim, bias=False)
-        self.g_norm = GroupRMSNorm(self.n_heads * self.head_dim, self.n_heads, eps=args.rms_norm_eps)
+        self.dense = nn.Linear(
+            self.n_heads * self.head_dim, args.hidden_size, bias=args.use_bias
+        )
+        self.g_proj = nn.Linear(
+            args.hidden_size, self.n_heads * self.head_dim, bias=False
+        )
+        self.g_norm = GroupRMSNorm(
+            self.n_heads * self.head_dim, self.n_heads, eps=args.rms_norm_eps
+        )
         slope = -_build_slopes(self.n_heads)
         if args.num_hidden_layers > 1 and layer_idx is not None:
-            slope = slope * (1 - max(layer_idx - 1, 0) / (args.num_hidden_layers - 1) + 1e-5)
+            slope = slope * (
+                1 - max(layer_idx - 1, 0) / (args.num_hidden_layers - 1) + 1e-5
+            )
         self.slope = slope
 
     def __call__(self, x, offset=0, state=None):
         B, L, _ = x.shape
-        qkv = self.query_key_value(x).reshape(B, L, self.n_heads + 2 * self.n_kv, self.head_dim)
+        qkv = self.query_key_value(x).reshape(
+            B, L, self.n_heads + 2 * self.n_kv, self.head_dim
+        )
         q = qkv[:, :, : self.n_heads]
         k = qkv[:, :, self.n_heads : self.n_heads + self.n_kv]
         v = qkv[:, :, self.n_heads + self.n_kv :]
@@ -311,19 +336,39 @@ class GLABranch(nn.Module):
             q = self.query_layernorm(q)
             k = self.key_layernorm(k)
         # RoPE (unsqueeze over heads); operate in (B,H,L,D)
-        q = quasar_rope(q.transpose(0, 2, 1, 3), offset, self.rope_dim, self.args.rope_theta,
-                        self.args.nope_after_position, self.args.use_nope).transpose(0, 2, 1, 3)
-        k = quasar_rope(k.transpose(0, 2, 1, 3), offset, self.rope_dim, self.args.rope_theta,
-                        self.args.nope_after_position, self.args.use_nope).transpose(0, 2, 1, 3)
+        q = quasar_rope(
+            q.transpose(0, 2, 1, 3),
+            offset,
+            self.rope_dim,
+            self.args.rope_theta,
+            self.args.nope_after_position,
+            self.args.use_nope,
+        ).transpose(0, 2, 1, 3)
+        k = quasar_rope(
+            k.transpose(0, 2, 1, 3),
+            offset,
+            self.rope_dim,
+            self.args.rope_theta,
+            self.args.nope_after_position,
+            self.args.use_nope,
+        ).transpose(0, 2, 1, 3)
         if self.groups > 1:
             k = mx.repeat(k, self.groups, axis=2)
             v = mx.repeat(v, self.groups, axis=2)
 
         scale = self.head_dim**-0.5
-        decay = self.slope.astype(mx.float32)                 # (H,) negative
-        g = mx.broadcast_to(decay[None, None, :], (B, L, self.n_heads))  # (B,L,H) log-gate
-        o, S = _gla_recurrence(q.astype(mx.float32), k.astype(mx.float32),
-                               v.astype(mx.float32), g, scale, state)  # o: (B,L,H,V)
+        decay = self.slope.astype(mx.float32)  # (H,) negative
+        g = mx.broadcast_to(
+            decay[None, None, :], (B, L, self.n_heads)
+        )  # (B,L,H) log-gate
+        o, S = _gla_recurrence(
+            q.astype(mx.float32),
+            k.astype(mx.float32),
+            v.astype(mx.float32),
+            g,
+            scale,
+            state,
+        )  # o: (B,L,H,V)
         o = o.reshape(B, L, -1).astype(x.dtype)
         o = self.g_norm(o)
         o = o * mx.sigmoid(self.g_proj(x))
@@ -339,7 +384,7 @@ class RavenBranch(nn.Module):
         self.n_heads = args.num_attention_heads
         self.n_kv = args.num_key_value_heads
         self.groups = self.n_heads // self.n_kv
-        self.head_dim = args.head_dim          # head_k_dim == head_v_dim == 128
+        self.head_dim = args.head_dim  # head_k_dim == head_v_dim == 128
         self.num_slots = args.hybrid_raven_slots
         self.topk = args.hybrid_raven_topk
         key_dim = self.n_heads * self.head_dim
@@ -348,7 +393,9 @@ class RavenBranch(nn.Module):
         self.q_proj = nn.Linear(args.hidden_size, key_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, kv_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, kv_dim, bias=False)
-        self.r_proj = nn.Linear(args.hidden_size, self.n_heads * self.num_slots, bias=False)
+        self.r_proj = nn.Linear(
+            args.hidden_size, self.n_heads * self.num_slots, bias=False
+        )
         self.a_proj = nn.Linear(args.hidden_size, self.n_heads, bias=False)
         self.A_log = mx.zeros((self.n_heads,))
         self.dt_bias = mx.zeros((self.n_heads,))
@@ -367,7 +414,9 @@ class RavenBranch(nn.Module):
 
         # Mamba2 decay: f = -exp(A_log) * softplus(a_proj + dt_bias), per-head scalar
         a = self.a_proj(x).astype(mx.float32) + self.dt_bias
-        f_head = (-mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(a))[..., None]  # (B,L,H,1)
+        f_head = (-mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(a))[
+            ..., None
+        ]  # (B,L,H,1)
 
         # swish feature map on q,k then qk-norm
         q = nn.silu(q)
@@ -377,14 +426,14 @@ class RavenBranch(nn.Module):
         v = nn.silu(v)
 
         # sigmoid top-k slot router
-        scores = mx.sigmoid(router.astype(mx.float32))                 # (B,L,H,M)
+        scores = mx.sigmoid(router.astype(mx.float32))  # (B,L,H,M)
         idx = mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[..., : self.topk]
         w = mx.take_along_axis(scores, idx, axis=-1)
         w = w / (w.sum(axis=-1, keepdims=True) + 1e-9)
         s_multihot = mx.put_along_axis(mx.zeros_like(scores), idx, w, axis=-1)
 
-        f = f_head * s_multihot          # (B,L,H,M)  decay (<=0) on selected slots
-        s = 1.0 - mx.exp(f)              # (B,L,H,M)  slot scores
+        f = f_head * s_multihot  # (B,L,H,M)  decay (<=0) on selected slots
+        s = 1.0 - mx.exp(f)  # (B,L,H,M)  slot scores
 
         # expand kv heads 4 -> 16
         if self.groups > 1:
@@ -392,9 +441,14 @@ class RavenBranch(nn.Module):
             v = mx.repeat(v, self.groups, axis=2)
 
         o, new_state = _gsa_recurrence(
-            q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32),
-            s.astype(mx.float32), f.astype(mx.float32), scale=1.0, state=state,
-        )                                                           # o: (B,L,H,P)
+            q.astype(mx.float32),
+            k.astype(mx.float32),
+            v.astype(mx.float32),
+            s.astype(mx.float32),
+            f.astype(mx.float32),
+            scale=1.0,
+            state=state,
+        )  # o: (B,L,H,P)
         o = o.reshape(B, L, -1).astype(x.dtype)
         o = _rms_norm(nn.silu(o), self.g_norm.weight, self.args.rms_norm_eps)
         return self.o_proj(o), new_state
@@ -440,15 +494,19 @@ class QuasarBranch(nn.Module):
         H, P = self.n_heads, self.head_dim
         # branch-local rms-normalize of the input (no learnable weight)
         xf = x.astype(mx.float32)
-        xn = (xf * mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + 1e-6)).astype(x.dtype)
+        xn = (xf * mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + 1e-6)).astype(
+            x.dtype
+        )
 
         q = nn.silu(self.q_proj(xn)).reshape(B, L, H, P)
         k = nn.silu(self.k_proj(xn)).reshape(B, L, H, P)
         v = nn.silu(self.v_proj(xn)).reshape(B, L, H, P)
-        beta = mx.sigmoid(self.b_proj(xn).astype(mx.float32))            # (B,L,H)
+        beta = mx.sigmoid(self.b_proj(xn).astype(mx.float32))  # (B,L,H)
         fg = self.f_proj(xn).reshape(B, L, H, P).astype(mx.float32)
         fg = fg + self.dt_bias.reshape(H, P)[None, None]
-        psi = -mx.exp(self.A_log.astype(mx.float32))[None, None, :, None] * nn.softplus(fg)  # (B,L,H,P)
+        psi = -mx.exp(self.A_log.astype(mx.float32))[None, None, :, None] * nn.softplus(
+            fg
+        )  # (B,L,H,P)
 
         # l2-norm q,k then scale q
         qf = q.astype(mx.float32)
@@ -463,28 +521,28 @@ class QuasarBranch(nn.Module):
         kf = kf.transpose(0, 2, 1, 3)
         vf = vf.transpose(0, 2, 1, 3)
         psi = psi.transpose(0, 2, 1, 3)
-        beta = beta.transpose(0, 2, 1)                                   # (B,H,L)
+        beta = beta.transpose(0, 2, 1)  # (B,H,L)
 
         if state is None:
-            S = mx.zeros((B, H, P, P), dtype=mx.float32)                 # (key x value)
+            S = mx.zeros((B, H, P, P), dtype=mx.float32)  # (key x value)
         else:
             S = state
         outs = []
         for i in range(L):
-            k_i = kf[:, :, i, :]                                         # (B,H,P)
+            k_i = kf[:, :, i, :]  # (B,H,P)
             v_i = vf[:, :, i, :]
             q_i = qf[:, :, i, :]
             knorm2 = mx.maximum((k_i * k_i).sum(-1, keepdims=True), 0.05)  # (B,H,1)
             alpha = (1.0 - mx.exp(-beta[:, :, i, None] * knorm2)) / (knorm2 + 1e-8)
-            decay = mx.exp(psi[:, :, i, :])                              # (B,H,P) over key axis
+            decay = mx.exp(psi[:, :, i, :])  # (B,H,P) over key axis
             S = S * decay[:, :, :, None]
-            v_pred = (k_i[:, :, :, None] * S).sum(axis=-2)               # (B,H,V)
+            v_pred = (k_i[:, :, :, None] * S).sum(axis=-2)  # (B,H,V)
             delta = v_i - v_pred
             S = S + alpha[:, :, :, None] * (k_i[:, :, :, None] * delta[:, :, None, :])
-            o = (q_i[:, :, :, None] * S).sum(axis=-2)                    # (B,H,V)
+            o = (q_i[:, :, :, None] * S).sum(axis=-2)  # (B,H,V)
             outs.append(o)
-        o = mx.stack(outs, axis=2)                                      # (B,H,L,P)
-        o = o.transpose(0, 2, 1, 3).astype(x.dtype)                     # (B,L,H,P)
+        o = mx.stack(outs, axis=2)  # (B,H,L,P)
+        o = o.transpose(0, 2, 1, 3).astype(x.dtype)  # (B,L,H,P)
 
         # gated rms-norm output: rms(o)*weight * sigmoid(g_proj(x))
         gate = self.g_proj[1](self.g_proj[0](x)).reshape(B, L, H, P)
@@ -512,9 +570,13 @@ class HybridAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.rope_dim = int(self.head_dim * args.partial_rotary_factor)
         self.query_key_value = nn.Linear(
-            args.hidden_size, (self.n_heads + 2 * self.n_kv) * self.head_dim, bias=args.use_qkv_bias
+            args.hidden_size,
+            (self.n_heads + 2 * self.n_kv) * self.head_dim,
+            bias=args.use_qkv_bias,
         )
-        self.dense = nn.Linear(self.n_heads * self.head_dim, args.hidden_size, bias=args.use_bias)
+        self.dense = nn.Linear(
+            self.n_heads * self.head_dim, args.hidden_size, bias=args.use_bias
+        )
         if args.use_qk_norm:
             self.query_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
             self.key_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
@@ -524,7 +586,9 @@ class HybridAttention(nn.Module):
             return
         rank = args.hybrid_output_adapter_rank
         alpha = args.hybrid_output_adapter_alpha
-        self.adapter_scale = (alpha if alpha is not None else max(rank, 1)) / max(rank, 1)
+        self.adapter_scale = (alpha if alpha is not None else max(rank, 1)) / max(
+            rank, 1
+        )
         self.replace_alpha_raw = mx.zeros((1,))
         self.branch_mix_logits = mx.zeros((3,))
         self.branch_output_gain = mx.ones((1,))
@@ -542,7 +606,9 @@ class HybridAttention(nn.Module):
 
     def _gqa(self, x, mask=None, cache=None):
         B, L, _ = x.shape
-        qkv = self.query_key_value(x).reshape(B, L, self.n_heads + 2 * self.n_kv, self.head_dim)
+        qkv = self.query_key_value(x).reshape(
+            B, L, self.n_heads + 2 * self.n_kv, self.head_dim
+        )
         q = qkv[:, :, : self.n_heads]
         k = qkv[:, :, self.n_heads : self.n_heads + self.n_kv]
         v = qkv[:, :, self.n_heads + self.n_kv :]
@@ -553,12 +619,20 @@ class HybridAttention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
         offset = cache.offset if cache is not None else 0
-        rope = lambda t: quasar_rope(t, offset, self.rope_dim, self.args.rope_theta,
-                                     self.args.nope_after_position, self.args.use_nope)
+        rope = lambda t: quasar_rope(
+            t,
+            offset,
+            self.rope_dim,
+            self.args.rope_theta,
+            self.args.nope_after_position,
+            self.args.use_nope,
+        )
         q, k = rope(q), rope(k)
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
-        out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask)
+        out = scaled_dot_product_attention(
+            q, k, v, cache=cache, scale=self.scale, mask=mask
+        )
         return self.dense(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
     def __call__(self, x, mask=None, cache=None):
@@ -614,7 +688,9 @@ class DecoderLayer(nn.Module):
         else:
             self.mlp = MLP(args.hidden_size, args.intermediate_size)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
 
     def __call__(self, x, mask=None, cache=None):
         h = x + self.attention(self.input_layernorm(x), mask=mask, cache=cache)
@@ -666,12 +742,13 @@ class Model(nn.Module):
             if branch is None:
                 caches.append(KVCache())
             else:
-                caches.append(CacheList(KVCache(), ArraysCache(size=_BRANCH_STATE_SIZE[branch])))
+                caches.append(
+                    CacheList(KVCache(), ArraysCache(size=_BRANCH_STATE_SIZE[branch]))
+                )
         return caches
 
     def sanitize(self, weights):
         new = {}
-        E = self.args.num_experts
         inter = self.args.moe_intermediate_size
         for k, v in weights.items():
             if k.endswith("rotary_emb.inv_freq"):
@@ -695,7 +772,12 @@ class Model(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            if path.endswith("gate") or "adapter" in path or path.endswith("a_proj") or path.endswith("b_proj"):
+            if (
+                path.endswith("gate")
+                or "adapter" in path
+                or path.endswith("a_proj")
+                or path.endswith("b_proj")
+            ):
                 return False
             return True
 

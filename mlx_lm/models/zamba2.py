@@ -88,10 +88,7 @@ class Zamba2RMSNormGated(nn.Module):
     """RMSNorm w/ optional SiLU gating, following Zamba2 pattern."""
 
     def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-5,
-        norm_before_gate: bool = False
+        self, hidden_size: int, eps: float = 1e-5, norm_before_gate: bool = False
     ):
         super().__init__()
         self.weight = mx.ones((hidden_size,))
@@ -626,7 +623,7 @@ class Zamba2Model(nn.Module):
         attn_mask = create_attention_mask(h, attn_cache)
         ssm_mask = create_ssm_mask(h, mamba_cache)
 
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+        for layer, c in zip(self.layers, cache):
             if isinstance(layer, Zamba2HybridLayer):
                 if c is not None:
                     mamba_c, attn_c = c[0], c[1]

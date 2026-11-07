@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 # MLX port of Qwen3.8-Flash-Next (HF model_type: qwen4_exp)
 # New compared to qwen3_next: QSA sparse attention, gated residual
 # (hyper-connections), sharded n-gram / PLE embedding, split deltanet projections.
@@ -1086,7 +1088,7 @@ class Model(nn.Module):
 
     def make_cache(self):
         caches = []
-        for i, t in enumerate(self.args.text.layer_types):
+        for t in self.args.text.layer_types:
             if t == "full_attention":
                 caches.append(_AttnCache())
             else:

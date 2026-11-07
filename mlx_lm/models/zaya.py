@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 from __future__ import annotations
 
 import re
@@ -9,8 +11,9 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import ArraysCache, CacheList, KVCache
-from .switch_layers import SwitchGLU
 from .rope_utils import initialize_rope
+from .switch_layers import SwitchGLU
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -93,7 +96,9 @@ class ModelArgs(BaseModelArgs):
         if "type" in self.rope_parameters and "rope_type" not in self.rope_parameters:
             self.rope_parameters["rope_type"] = self.rope_parameters.pop("type")
         self.rope_parameters.setdefault("rope_theta", self.rope_theta)
-        self.rope_parameters.setdefault("partial_rotary_factor", self.partial_rotary_factor)
+        self.rope_parameters.setdefault(
+            "partial_rotary_factor", self.partial_rotary_factor
+        )
 
 
 class ZayaArraysCache(ArraysCache):
@@ -106,10 +111,7 @@ class ZayaArraysCache(ArraysCache):
 
     def extract(self, idx):
         cache = type(self)(size=len(self.cache))
-        cache.cache = [
-            None if c is None else c[idx : idx + 1]
-            for c in self.cache
-        ]
+        cache.cache = [None if c is None else c[idx : idx + 1] for c in self.cache]
         return cache
 
 
@@ -146,7 +148,8 @@ class ResidualScaling(nn.Module):
 
     def __call__(self, residual: Optional[mx.array], hidden_states: mx.array):
         hidden_states = (
-            hidden_states.astype(mx.float32) + self.hidden_states_bias.astype(mx.float32)
+            hidden_states.astype(mx.float32)
+            + self.hidden_states_bias.astype(mx.float32)
         ) * self.hidden_states_scale.astype(mx.float32)
         if self.not_first_layer and residual is not None:
             residual = (
@@ -368,7 +371,7 @@ class ZayaRouter(nn.Module):
         # first router layer_n == 1 as no-EDA
         self.use_eda = bool(args.zaya_use_eda and layer_n != 1)
         self.rmsnorm_eda = nn.RMSNorm(self.mlp_expansion, eps=args.norm_epsilon)
-        
+
         if self.use_eda:
             self.router_states_scale = mx.ones(self.mlp_expansion)
 
@@ -409,7 +412,9 @@ class ZayaRouter(nn.Module):
         else:
             expert_prob = mx.softmax(logits, axis=-1, precise=True)
 
-        biased = mx.stop_gradient(expert_prob.astype(mx.float32)) + self.balancing_biases
+        biased = (
+            mx.stop_gradient(expert_prob.astype(mx.float32)) + self.balancing_biases
+        )
         # Top-1 only
         expert_choice = mx.argmax(biased, axis=-1)[..., None]
         route_prob = mx.take_along_axis(expert_prob, expert_choice, axis=-1).astype(
@@ -441,9 +446,9 @@ class ZayaBlock(nn.Module):
         )
         if self.args.zaya_use_mod:
             clamped = mx.minimum(indices, self.args.num_experts - 1)
-            expert_y = (self.experts(hidden_states, clamped) * probs[..., None]).squeeze(
-                -2
-            )
+            expert_y = (
+                self.experts(hidden_states, clamped) * probs[..., None]
+            ).squeeze(-2)
             mod_y = hidden_states * probs.squeeze(-1)[..., None]
             mod_mask = indices.squeeze(-1)[..., None] == self.args.num_experts
             y = mx.where(mod_mask, mod_y, expert_y)
@@ -472,7 +477,7 @@ class ZayaDecoderATTLayer(nn.Module):
     ):
         if self.args.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)
-        
+
         # accumulate residual per-layer, then norm the sum.
         if residual is not None:
             residual = residual.astype(mx.float32) + hidden_states.astype(mx.float32)
@@ -503,7 +508,7 @@ class ZayaDecoderMLPLayer(nn.Module):
     ):
         if self.args.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)
-        
+
         # accumulate residual per-layer, then norm the sum.
         if residual is not None:
             residual = residual.astype(mx.float32) + hidden_states.astype(mx.float32)
@@ -528,6 +533,7 @@ class ZayaModel(nn.Module):
         if args.scale_residual_merge:
             self.res_scale = ResidualScaling(args, args.num_hidden_layers)
         self.final_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_epsilon)
+
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
         hidden_states = self.embed_tokens(inputs)
         if cache is None:
@@ -558,10 +564,12 @@ class ZayaModel(nn.Module):
 
         if self.args.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)
-        
+
         # final merge of residual + hidden_states before final norm
         if residual is not None:
-            hidden_states = hidden_states.astype(mx.float32) + residual.astype(mx.float32)
+            hidden_states = hidden_states.astype(mx.float32) + residual.astype(
+                mx.float32
+            )
         else:
             hidden_states = hidden_states.astype(mx.float32)
 
@@ -596,9 +604,11 @@ class Model(nn.Module):
 
     def make_cache(self):
         return [
-            CacheList(KVCache(), ZayaArraysCache(size=2))
-            if l.layer_type == "attention"
-            else ZayaArraysCache(size=0)
+            (
+                CacheList(KVCache(), ZayaArraysCache(size=2))
+                if l.layer_type == "attention"
+                else ZayaArraysCache(size=0)
+            )
             for l in self.layers
         ]
 
@@ -653,7 +663,11 @@ class Model(nn.Module):
                     weights[k] = v.moveaxis(2, 1)
 
         # convert local expert format to SwitchGLU stacked format
-        local_fc1 = [k for k in weights if ".local_experts." in k and k.endswith(".linear_fc1.weight")]
+        local_fc1 = [
+            k
+            for k in weights
+            if ".local_experts." in k and k.endswith(".linear_fc1.weight")
+        ]
         if local_fc1:
             any_converted = False
             for layer_n in range(self.args.num_hidden_layers):

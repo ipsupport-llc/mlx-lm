@@ -75,7 +75,9 @@ def parse_tool_call(text: str, tools: Any | None = None):
                 continue
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] == '"':
-                arguments[key.strip()] = _coerce(value) if "\\" in value else value[1:-1]
+                arguments[key.strip()] = (
+                    _coerce(value) if "\\" in value else value[1:-1]
+                )
             else:
                 arguments[key.strip()] = _coerce(value)
         calls.append({"name": func_name, "arguments": arguments})

@@ -598,7 +598,10 @@ def _adapt_prism_hadamard_repack(config: dict, model_path: Path) -> None:
     produced silently wrong output, since the activations must be rotated.
     """
     hadamard = config.get("hadamard")
-    if not isinstance(hadamard, dict) or hadamard.get("contract") != "prism.hadamard.v1":
+    if (
+        not isinstance(hadamard, dict)
+        or hadamard.get("contract") != "prism.hadamard.v1"
+    ):
         return
     if config.get("model_type") == "prism_hadamard_qwen35":
         # Saved after loading a repack by an mlx-lm that kept this block: the
@@ -621,9 +624,11 @@ def _adapt_prism_hadamard_repack(config: dict, model_path: Path) -> None:
     # own format (with it kept, loading a fused / converted repack failed).
     config.pop("hadamard")
     config["modules"] = [
-        {"path": path(n), "block": block, "embedding": False} for n in hadamard.get("forward_modules", [])
+        {"path": path(n), "block": block, "embedding": False}
+        for n in hadamard.get("forward_modules", [])
     ] + [
-        {"path": path(n), "block": block, "embedding": True} for n in hadamard.get("inverse_modules", [])
+        {"path": path(n), "block": block, "embedding": True}
+        for n in hadamard.get("inverse_modules", [])
     ]
     # The rotated modules are built already quantized (2-bit, group 128) by
     # prism_hadamard_qwen35; the only other quantized entries are the
@@ -638,7 +643,9 @@ def _adapt_prism_hadamard_repack(config: dict, model_path: Path) -> None:
     if jang_config.exists():
         with open(jang_config) as f:
             layout = json.load(f).get("layout", {})
-        config["zero_centered_norms"] = layout.get("language_norms") == "zero-centered-runtime-plus-one"
+        config["zero_centered_norms"] = (
+            layout.get("language_norms") == "zero-centered-runtime-plus-one"
+        )
 
 
 def _shape_quantization(module, weights, path, default):
@@ -650,10 +657,16 @@ def _shape_quantization(module, weights, path, default):
     if weight is None or f"{path}.weight" not in weights:
         return True
     # A non-affine pack (uint8 scales): the mode follows from bits and group.
-    if default.get("mode", "affine") != "affine" or weights[f"{path}.scales"].dtype == mx.uint8:
+    if (
+        default.get("mode", "affine") != "affine"
+        or weights[f"{path}.scales"].dtype == mx.uint8
+    ):
         params = infer_quant_config(path, module, weights)
         same = (params["group_size"], params["bits"], params["mode"]) == (
-            default["group_size"], default["bits"], default.get("mode", "affine"))
+            default["group_size"],
+            default["bits"],
+            default.get("mode", "affine"),
+        )
         return True if same else params
     n_in = weight.shape[-1]
     n_groups = weights[f"{path}.scales"].shape[-1]
@@ -748,9 +761,7 @@ def _load_safetensors_with_e8m0(path: str) -> Dict[str, mx.array]:
                 new_header[name] = new_meta
                 running += len(blob)
 
-        new_header_bytes = json.dumps(
-            new_header, separators=(",", ":")
-        ).encode("utf-8")
+        new_header_bytes = json.dumps(new_header, separators=(",", ":")).encode("utf-8")
         with open(scratch, "wb") as out:
             out.write(struct.pack("<Q", len(new_header_bytes)))
             out.write(new_header_bytes)
@@ -915,7 +926,11 @@ def load_model(
             params = _shape_quantization(m, weights, p, quantization)
             if f"{p}.global_scale" in weights and _takes_global_scale(m):
                 if params is True:
-                    params = {k: quantization[k] for k in ("group_size", "bits", "mode") if k in quantization}
+                    params = {
+                        k: quantization[k]
+                        for k in ("group_size", "bits", "mode")
+                        if k in quantization
+                    }
                 params = dict(params, global_scale=True)
             return params
 
@@ -1141,7 +1156,10 @@ def load(
     """
     model_path = _download(path_or_hf_repo, revision=revision)
 
-    if adapter_path is not None and (model_config or {}).get("experts_on_disk") is not None:
+    if (
+        adapter_path is not None
+        and (model_config or {}).get("experts_on_disk") is not None
+    ):
         raise ValueError("Experts on disk can't be used with adapters.")
     model, config = load_model(
         model_path,

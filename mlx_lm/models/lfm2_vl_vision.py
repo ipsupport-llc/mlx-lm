@@ -61,7 +61,9 @@ class Embeddings(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         p = config.patch_size
-        self.patch_embedding = nn.Linear(config.num_channels * p * p, config.hidden_size)
+        self.patch_embedding = nn.Linear(
+            config.num_channels * p * p, config.hidden_size
+        )
         self.grid = int(config.num_patches**0.5)
         self.position_embedding = PositionTable(config.num_patches, config.hidden_size)
 
@@ -137,7 +139,9 @@ class VisionModel(nn.Module):
         super().__init__()
         self.embeddings = Embeddings(config)
         self.encoder = Encoder(config)
-        self.post_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.post_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
 
     def __call__(self, patches: mx.array, h: int, w: int) -> mx.array:
         """patches [B, h * w, C * p * p] of B crops of the same size."""

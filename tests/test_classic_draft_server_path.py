@@ -18,9 +18,16 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 def _tiny_llama(seed, hidden_size=32):
     mx.random.seed(seed)
     args = llama.ModelArgs(
-        model_type="llama", hidden_size=hidden_size, num_hidden_layers=2, intermediate_size=64,
-        num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=64,
-        rope_theta=10000.0, tie_word_embeddings=True,
+        model_type="llama",
+        hidden_size=hidden_size,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-5,
+        vocab_size=64,
+        rope_theta=10000.0,
+        tie_word_embeddings=True,
     )
     model = llama.Model(args)
     mx.eval(model.parameters())
@@ -66,7 +73,11 @@ class TestClassicDraftServerPath(unittest.TestCase):
         out = [
             r.token
             for r in stream_generate(
-                model, _Tokenizer(), prompt, max_tokens=12, draft_model=draft,
+                model,
+                _Tokenizer(),
+                prompt,
+                max_tokens=12,
+                draft_model=draft,
                 input_embeddings=None,
             )
         ]
@@ -76,11 +87,18 @@ class TestClassicDraftServerPath(unittest.TestCase):
         model, draft = _tiny_llama(0), _tiny_llama(1)
         prompt = mx.array([1, 5, 9, 3])
         emb = model.model.embed_tokens(prompt)
-        ref = [t for t, _ in generate_step(prompt, model, max_tokens=8, input_embeddings=emb)]
+        ref = [
+            t
+            for t, _ in generate_step(prompt, model, max_tokens=8, input_embeddings=emb)
+        ]
         out = [
             r.token
             for r in stream_generate(
-                model, _Tokenizer(), prompt, max_tokens=8, draft_model=draft,
+                model,
+                _Tokenizer(),
+                prompt,
+                max_tokens=8,
+                draft_model=draft,
                 input_embeddings=emb,
             )
         ]
@@ -92,13 +110,30 @@ class TestClassicDraftServerPath(unittest.TestCase):
         model, draft = _tiny_llama(0), _tiny_llama(1)
         prompt = mx.array([1, 5, 9, 3])
         follow = mx.array([7, 2, 11])
-        cases = [(3, 1, None), (3, 2, None), (3, 5, None), (3, 9, None), (3, 20, 3), (3, 20, 6), (0, 4, None), (1, 20, 2)]
+        cases = [
+            (3, 1, None),
+            (3, 2, None),
+            (3, 5, None),
+            (3, 9, None),
+            (3, 20, 3),
+            (3, 20, 6),
+            (0, 4, None),
+            (1, 20, 2),
+        ]
         for num_draft, max_tokens, stop_after in cases:
-            with self.subTest(num_draft=num_draft, max_tokens=max_tokens, stop_after=stop_after):
+            with self.subTest(
+                num_draft=num_draft, max_tokens=max_tokens, stop_after=stop_after
+            ):
                 cache = make_prompt_cache(model) + make_prompt_cache(draft)
                 gen = stream_generate(
-                    model, _Tokenizer(), prompt, max_tokens=max_tokens, draft_model=draft,
-                    num_draft_tokens=num_draft, prompt_cache=cache, input_embeddings=None,
+                    model,
+                    _Tokenizer(),
+                    prompt,
+                    max_tokens=max_tokens,
+                    draft_model=draft,
+                    num_draft_tokens=num_draft,
+                    prompt_cache=cache,
+                    input_embeddings=None,
                 )
                 out = []
                 for r in gen:
@@ -107,11 +142,18 @@ class TestClassicDraftServerPath(unittest.TestCase):
                         break
                 gen.close()
                 n = len(model.layers)
-                self.assertEqual([cache[0].offset, cache[n].offset], [prompt.size + len(out)] * 2)
+                self.assertEqual(
+                    [cache[0].offset, cache[n].offset], [prompt.size + len(out)] * 2
+                )
                 # The reused caches continue like a fresh run over everything.
                 seen = mx.concatenate([prompt, mx.array(out, mx.uint32), follow])
                 for m, c in ((model, cache[:n]), (draft, cache[n:])):
-                    reused = [t for t, _ in generate_step(follow, m, max_tokens=4, prompt_cache=c)]
+                    reused = [
+                        t
+                        for t, _ in generate_step(
+                            follow, m, max_tokens=4, prompt_cache=c
+                        )
+                    ]
                     fresh = [t for t, _ in generate_step(seen, m, max_tokens=4)]
                     self.assertEqual(reused, fresh)
 
@@ -120,14 +162,24 @@ class TestClassicDraftServerPath(unittest.TestCase):
         # unquantized ones, frozen where the swap happened.
         from mlx_lm.models.cache import QuantizedKVCache
 
-        model, draft = _tiny_llama(0, 128), _tiny_llama(1, 128)   # head_dim 32: quantizable
+        model, draft = _tiny_llama(0, 128), _tiny_llama(
+            1, 128
+        )  # head_dim 32: quantizable
         prompt = mx.array([1, 5, 9, 3, 8, 2])
         cache = make_prompt_cache(model) + make_prompt_cache(draft)
         out = [
             r.token
             for r in stream_generate(
-                model, _Tokenizer(), prompt, max_tokens=6, draft_model=draft, prompt_cache=cache,
-                input_embeddings=None, kv_bits=8, kv_group_size=32, quantized_kv_start=0,
+                model,
+                _Tokenizer(),
+                prompt,
+                max_tokens=6,
+                draft_model=draft,
+                prompt_cache=cache,
+                input_embeddings=None,
+                kv_bits=8,
+                kv_group_size=32,
+                quantized_kv_start=0,
             )
         ]
         self.assertTrue(all(isinstance(c, QuantizedKVCache) for c in cache))
@@ -150,8 +202,13 @@ class TestClassicDraftServerPath(unittest.TestCase):
         out = []
         with self.assertRaisesRegex(ValueError, "stays trimmable"):
             for r in stream_generate(
-                model, _Tokenizer(), prompt, max_tokens=4, draft_model=draft,
-                prompt_cache=cache, input_embeddings=None,
+                model,
+                _Tokenizer(),
+                prompt,
+                max_tokens=4,
+                draft_model=draft,
+                prompt_cache=cache,
+                input_embeddings=None,
             ):
                 out.append(r.token)
         self.assertEqual(out, [])
@@ -192,11 +249,16 @@ class TestServerDraftSlots(unittest.TestCase):
         # The Gemma 4 assistant drafter has no cache: nothing to match (every
         # text request recomputed its whole prompt).
         gen = self._generator(_Cached(0))
-        self.assertEqual(gen._match_draft_slots(["m1", "m2"], [4], [1, 4], True), (["m1", "m2"], [4]))
+        self.assertEqual(
+            gen._match_draft_slots(["m1", "m2"], [4], [1, 4], True), (["m1", "m2"], [4])
+        )
 
     def test_no_draft_model_unchanged(self):
         gen = self._generator(None)
-        self.assertEqual(gen._match_draft_slots(["m1", "m2"], [4], [1, 4], False), (["m1", "m2"], [4]))
+        self.assertEqual(
+            gen._match_draft_slots(["m1", "m2"], [4], [1, 4], False),
+            (["m1", "m2"], [4]),
+        )
 
 
 if __name__ == "__main__":

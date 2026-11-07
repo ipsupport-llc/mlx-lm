@@ -39,9 +39,18 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.models.activations import swiglu
-from mlx_lm.models.base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from mlx_lm.models.base import (
+    BaseModelArgs,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.models.switch_layers import SwitchGLU, SwitchLinear, _gather_sort, _scatter_unsort
+from mlx_lm.models.switch_layers import (
+    SwitchGLU,
+    SwitchLinear,
+    _gather_sort,
+    _scatter_unsort,
+)
 
 
 @dataclass
@@ -239,7 +248,9 @@ class Router(nn.Module):
             selection = selection + self.bias.astype(mx.float32)
 
         k = self.top_k
-        inds = mx.stop_gradient(mx.argpartition(-selection, kth=k - 1, axis=-1)[..., :k])
+        inds = mx.stop_gradient(
+            mx.argpartition(-selection, kth=k - 1, axis=-1)[..., :k]
+        )
         # Gather the unbiased scores, as torch.gather(routing_scores, ...) does.
         weights = mx.take_along_axis(scores, inds, axis=-1)
         if self.renormalize:

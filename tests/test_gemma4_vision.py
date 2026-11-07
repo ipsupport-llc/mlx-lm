@@ -81,7 +81,9 @@ class _RemoteSafetensors:
         start, end = meta["data_offsets"]
         if start == end:
             return np.zeros(meta["shape"], dtype=np.float32)
-        raw = _http_get_range(self.url, self.data_start + start, self.data_start + end - 1)
+        raw = _http_get_range(
+            self.url, self.data_start + start, self.data_start + end - 1
+        )
         return _bf16_bytes_to_f32(raw, meta["shape"])
 
 
@@ -93,7 +95,10 @@ def _fetch_real_vision_weights(num_layers: int) -> dict:
     st = _RemoteSafetensors(SAFETENSORS_URL)
     prefix = "model.vision_tower."
 
-    wanted = ["patch_embedder.input_proj.weight", "patch_embedder.position_embedding_table"]
+    wanted = [
+        "patch_embedder.input_proj.weight",
+        "patch_embedder.position_embedding_table",
+    ]
     projs = [
         "self_attn.q_proj",
         "self_attn.k_proj",
@@ -123,7 +128,8 @@ def _fetch_real_vision_weights(num_layers: int) -> dict:
 
 @unittest.skipUnless(_HAS_TORCH, "torch is not installed")
 @unittest.skipUnless(
-    _HAS_TRANSFORMERS_GEMMA4, "installed transformers build has no Gemma4 vision support"
+    _HAS_TRANSFORMERS_GEMMA4,
+    "installed transformers build has no Gemma4 vision support",
 )
 class TestGemma4VisionParity(unittest.TestCase):
     weights = None  # populated lazily by setUpClass, once, over the network
@@ -133,7 +139,7 @@ class TestGemma4VisionParity(unittest.TestCase):
         try:
             cls.weights = _fetch_real_vision_weights(NUM_LAYERS)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise unittest.SkipTest(f"could not reach huggingface.co: {e}")
+            raise unittest.SkipTest(f"could not reach huggingface.co: {e}") from e
 
     def test_patch_embedder_and_encoder_match_real_weights(self):
         weights = self.weights
