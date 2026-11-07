@@ -290,6 +290,8 @@ class ModelDescription:
     model: str
     draft: str
     adapter: str
+    # Looped models (Dory): the request's loop count; None keeps the default.
+    loops: Optional[int] = None
 
 
 @dataclass
@@ -497,6 +499,7 @@ class ModelProvider:
         self.supports_mtp = False
         self.head_mtp = False
         self.image_inputs = None
+        self.default_loops = None
 
         group = mx.distributed.init()
         self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
@@ -616,7 +619,7 @@ class ModelProvider:
         supports_mtp = head_mtp or _model_supports_nemotron_h_mtp(model)
 
         # Update the member variables
-        self.model_key = (model_path, adapter_path, draft_model_path)
+        self._set_model_key((model_path, adapter_path, draft_model_path), model)
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
@@ -629,20 +632,40 @@ class ModelProvider:
         # here, not on the first image request.
         self.image_inputs = load_image_inputs(model, model_path)
 
+    def _set_model_key(self, key, model):
+        # A looped model's key ends with its loop count (load(loops=...)).
+        self.default_loops = _recurrent_loops(model)
+        if self.default_loops is not None:
+            key += (self.default_loops,)
+        self.model_key = key
+
     def load_default(self):
         if self._model_map["default_model"] is not None:
             self.load("default_model", None, "default_model")
 
-    def load(self, model_path, adapter_path=None, draft_model_path=None):
+    def load(self, model_path, adapter_path=None, draft_model_path=None, loops=None):
         adapter_path = self._adapter_map.get(model_path, adapter_path)
         model_path = self._model_map.get(model_path, model_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
-        if self.model_key != model_key:
+        if self.model_key is None or self.model_key[:3] != model_key:
             self._load(*model_key)
+        if self.default_loops is not None:
+            # Same weights, another loop count: its own prompt cache entries.
+            n = loops or self.default_loops
+            if self.model_key[3] != n:
+                self.model.set_recurrent_loops(n)
+                self.model_key = model_key + (n,)
 
         return self.model, self.tokenizer
+
+
+def _recurrent_loops(model):
+    """A looped model's loop count, or None for other models."""
+    if not hasattr(model, "set_recurrent_loops"):
+        return None
+    return model.args.n_recurrent_loops
 
 
 def _make_sampler(args, tokenizer):
@@ -1260,8 +1283,12 @@ class ResponseGenerator:
                     # serve batched
                     elif batch_generator is None:
                         try:
+                            loops = getattr(args.model, "loops", None)
                             model, tokenizer = self.model_provider.load(
-                                args.model.model, args.model.adapter, args.model.draft
+                                args.model.model,
+                                args.model.adapter,
+                                args.model.draft,
+                                **({"loops": loops} if loops else {}),
                             )
                         except Exception as e:
                             rqueue.put(e)
@@ -2434,6 +2461,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         self.thinking_budget = self.body.get("thinking_budget", None)
+        self.recurrent_loops = self.body.get("recurrent_loops", None)
         self.cache_store = self.body.get("cache_store", True)
         try:
             self.validate_model_parameters()
@@ -2497,6 +2525,12 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("thinking_budget must be a non-negative integer")
         if not isinstance(self.cache_store, bool):
             raise ValueError("cache_store must be true or false")
+        if self.recurrent_loops is not None and (
+            not isinstance(self.recurrent_loops, int)
+            or isinstance(self.recurrent_loops, bool)
+            or not 1 <= self.recurrent_loops <= 4
+        ):
+            raise ValueError("recurrent_loops must be an integer from 1 to 4")
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)
@@ -2793,6 +2827,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 model=self.requested_model,
                 draft=self.requested_draft_model,
                 adapter=self.adapter,
+                loops=self.recurrent_loops,
             ),
             sampling=SamplingArguments(
                 temperature=self.temperature,
