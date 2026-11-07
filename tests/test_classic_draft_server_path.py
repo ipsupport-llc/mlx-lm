@@ -147,13 +147,14 @@ class TestClassicDraftServerPath(unittest.TestCase):
         cache = [RotatingKVCache(max_size=4) for _ in model.layers] + [
             RotatingKVCache(max_size=4) for _ in draft.layers
         ]
-        with self.assertRaises(ValueError):
-            list(
-                stream_generate(
-                    model, _Tokenizer(), prompt, max_tokens=4, draft_model=draft,
-                    prompt_cache=cache, input_embeddings=None,
-                )
-            )
+        out = []
+        with self.assertRaisesRegex(ValueError, "stays trimmable"):
+            for r in stream_generate(
+                model, _Tokenizer(), prompt, max_tokens=4, draft_model=draft,
+                prompt_cache=cache, input_embeddings=None,
+            ):
+                out.append(r.token)
+        self.assertEqual(out, [])
 
 
 class _Cached:

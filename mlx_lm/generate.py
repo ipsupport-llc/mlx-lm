@@ -690,15 +690,22 @@ def speculative_generate_step(
         # trimmable once its window fills -- trim_prompt_cache's rejected-
         # draft rewind would then no-op instead of erroring, corrupting
         # generation past that point. Refuse up front instead.
+        def leaves(cs):
+            for c in cs:
+                if c is None:
+                    continue
+                if hasattr(c, "caches"):  # CacheList
+                    yield from leaves(c.caches)
+                else:
+                    yield c
+
         rotating = {
             type(c).__name__
-            for c in model_cache
+            for c in leaves(model_cache)
             if isinstance(c, (RotatingKVCache, QuantizedRotatingKVCache))
         }
         types = rotating or {
-            type(c).__name__
-            for c in model_cache
-            if c is not None and not c.is_trimmable()
+            type(c).__name__ for c in leaves(model_cache) if not c.is_trimmable()
         }
         raise ValueError(
             "Speculative decoding requires a prompt cache that stays "
