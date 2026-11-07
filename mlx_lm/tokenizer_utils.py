@@ -11,6 +11,7 @@ from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional, Tuple
 
+from huggingface_hub.errors import StrictDataclassError
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -808,7 +809,7 @@ def load(
             model_path, **tokenizer_config_extra
         )
     # TODO: Remove this once transformers upstream adds DSV4
-    except (AttributeError, ValueError) as e:
+    except (AttributeError, ValueError, KeyError, StrictDataclassError) as e:
         if "config" in tokenizer_config_extra:
             raise
         from transformers import PretrainedConfig
