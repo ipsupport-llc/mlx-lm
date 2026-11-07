@@ -238,6 +238,11 @@ class Model(nn.Module):
     def layers(self):
         return self.backbone.layers
 
+    def set_recurrent_loops(self, n: int):
+        # Caches made before this have the old loop count's layout.
+        self.args.n_recurrent_loops = n
+        self._plan = None
+
     def _cache_plan(self):
         if self._plan is None:
             a = self.args
