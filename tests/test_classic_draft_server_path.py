@@ -133,6 +133,29 @@ class TestClassicDraftServerPath(unittest.TestCase):
         self.assertTrue(all(isinstance(c, QuantizedKVCache) for c in cache))
         self.assertEqual({c.offset for c in cache}, {prompt.size + len(out)})
 
+    def test_speculative_refuses_rotating_cache(self):
+        # A RotatingKVCache is trimmable at the start (offset 0 < max_size),
+        # so the old check (can_trim_prompt_cache, checked once up front)
+        # let speculative decoding proceed here -- then silently stopped
+        # rewinding rejected draft tokens once the window filled, with no
+        # error. Must refuse before generating anything, not just once the
+        # cache happens to be full already.
+        from mlx_lm.models.cache import RotatingKVCache
+
+        model, draft = _tiny_llama(0), _tiny_llama(1)
+        prompt = mx.array([1, 5, 9, 3])
+        cache = [RotatingKVCache(max_size=4) for _ in model.layers] + [
+            RotatingKVCache(max_size=4) for _ in draft.layers
+        ]
+        out = []
+        with self.assertRaisesRegex(ValueError, "stays trimmable"):
+            for r in stream_generate(
+                model, _Tokenizer(), prompt, max_tokens=4, draft_model=draft,
+                prompt_cache=cache, input_embeddings=None,
+            ):
+                out.append(r.token)
+        self.assertEqual(out, [])
+
 
 class _Cached:
     """A model with `n` cache entries (make_prompt_cache uses make_cache)."""

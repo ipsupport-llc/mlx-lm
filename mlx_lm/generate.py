@@ -24,11 +24,11 @@ from .models.cache import (
     QuantizedRotatingKVCache,
     RotatingKVCache,
     TokenBuffer,
-    can_trim_prompt_cache,
     fit_group_size,
     load_prompt_cache,
     make_prompt_cache,
     quantized_head_dims,
+    stays_trimmable,
     trim_prompt_cache,
 )
 from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
@@ -684,10 +684,32 @@ def speculative_generate_step(
         model_cache = prompt_cache[:n_main]
         draft_cache = prompt_cache[n_main:]
 
-    if not can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+    if not stays_trimmable(model_cache):
+        # A sliding-window cache is trimmable now (at the start of
+        # generation, with an empty/short prompt) but silently stops being
+        # trimmable once its window fills -- trim_prompt_cache's rejected-
+        # draft rewind would then no-op instead of erroring, corrupting
+        # generation past that point. Refuse up front instead.
+        def leaves(cs):
+            for c in cs:
+                if c is None:
+                    continue
+                if hasattr(c, "caches"):  # CacheList
+                    yield from leaves(c.caches)
+                else:
+                    yield c
+
+        rotating = {
+            type(c).__name__
+            for c in leaves(model_cache)
+            if isinstance(c, (RotatingKVCache, QuantizedRotatingKVCache))
+        }
+        types = rotating or {
+            type(c).__name__ for c in leaves(model_cache) if not c.is_trimmable()
+        }
         raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+            "Speculative decoding requires a prompt cache that stays "
+            f"trimmable at any length (got {types})."
         )
 
     sampler = sampler or greedy_sampler
