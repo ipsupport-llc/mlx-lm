@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -103,16 +103,12 @@ class Attention(nn.Module):
         q_size = self.n_heads * self.head_dim
         kv_size = self.n_kv_heads * self.head_dim
 
-        queries, keys, values = mx.split(
-            qkv, [q_size, q_size + kv_size], axis=-1
-        )
+        queries, keys, values = mx.split(qkv, [q_size, q_size + kv_size], axis=-1)
 
         queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
-        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
+        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
@@ -282,9 +278,7 @@ class SarvamMoeModel(nn.Module):
         super().__init__()
         self.vocab_size = args.vocab_size
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [
-            DecoderLayer(args, i) for i in range(args.num_hidden_layers)
-        ]
+        self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(

@@ -121,7 +121,9 @@ class ModelArgs(BaseModelArgs):
             )
             self.time_step_limit = (lower_limit, float("inf"))
         else:
-            self.time_step_limit = tuple(_decode_hf_float(v) for v in self.time_step_limit)
+            self.time_step_limit = tuple(
+                _decode_hf_float(v) for v in self.time_step_limit
+            )
 
         if self.block_configs is not None:
             if self.num_hidden_layers is None:
@@ -917,7 +919,9 @@ class Model(nn.Module):
         for prefix in prefixes:
             n_experts = self.args.n_routed_experts
             if prefix.startswith("backbone.layers."):
-                n_experts = self.args.for_layer(int(prefix.split(".")[2])).n_routed_experts
+                n_experts = self.args.for_layer(
+                    int(prefix.split(".")[2])
+                ).n_routed_experts
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
                 if f"{prefix}.experts.0.{m}.weight" in weights:
                     to_join = [

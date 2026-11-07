@@ -46,7 +46,9 @@ class Model(nn.Module):
             # Older checkpoints take the features of an earlier layer
             # (vision_feature_layer -2) and store only the layers up to it.
             if args.vision_feature_layer not in (None, -1):
-                vision.num_hidden_layers = args.vision_feature_layer % vision.num_hidden_layers + 1
+                vision.num_hidden_layers = (
+                    args.vision_feature_layer % vision.num_hidden_layers + 1
+                )
             self.vision_tower = VisionModel(vision)
             self.multi_modal_projector = Projector(
                 vision.hidden_size,
@@ -88,10 +90,16 @@ class Model(nn.Module):
         embeds = self.language_model.model.embed_tokens(input_ids)
         features = self.image_features(crops)
         mask = (input_ids == self.args.image_token_id)[0]
-        positions = mx.array([i for i, m in enumerate(mask.tolist()) if m], dtype=mx.int32)
+        positions = mx.array(
+            [i for i, m in enumerate(mask.tolist()) if m], dtype=mx.int32
+        )
         if positions.shape[0] != features.shape[0]:
-            raise ValueError(f"{positions.shape[0]} image tokens for {features.shape[0]} image features")
-        return embeds.at[0, positions].add(features.astype(embeds.dtype) - embeds[0, positions])
+            raise ValueError(
+                f"{positions.shape[0]} image tokens for {features.shape[0]} image features"
+            )
+        return embeds.at[0, positions].add(
+            features.astype(embeds.dtype) - embeds[0, positions]
+        )
 
     def sanitize(self, weights):
         text, other = {}, {}
@@ -110,7 +118,10 @@ class Model(nn.Module):
             key = key.replace("vision_tower.vision_model.", "vision_tower.", 1)
             if "position_ids" not in key:
                 other[key] = value
-        out = {"language_model." + k: v for k, v in self.language_model.sanitize(text).items()}
+        out = {
+            "language_model." + k: v
+            for k, v in self.language_model.sanitize(text).items()
+        }
         out.update(other)
         return out
 

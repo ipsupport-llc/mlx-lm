@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, create_causal_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_causal_mask,
+    scaled_dot_product_attention,
+)
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -363,7 +368,12 @@ class DecoderLayer(nn.Module):
 
         h = self.input_layernorm(x)
         h, shared_kv, offset = self.self_attn(
-            h, mask, cache, shared_kv=shared_kv, offset=offset, source_cache=source_cache
+            h,
+            mask,
+            cache,
+            shared_kv=shared_kv,
+            offset=offset,
+            source_cache=source_cache,
         )
         h = self.post_attention_layernorm(h)
         h = residual + h

@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 """MLX implementation of ESM-C (EvolutionaryScale Cambrian) protein language model.
 
 ESM-C is an encoder-only (bidirectional) transformer with RoPE, QK-LayerNorm,

@@ -167,12 +167,15 @@ class CohereMoeSparseMoeBlock(nn.Module):
                 args.intermediate_size * args.moe_num_shared_experts
             )
             self.shared_experts = MLP(
-                args.hidden_size, shared_intermediate_size,
+                args.hidden_size,
+                shared_intermediate_size,
             )
-            self.shared_expert_combination_strategy = \
+            self.shared_expert_combination_strategy = (
                 args.shared_expert_combination_strategy
+            )
             assert self.shared_expert_combination_strategy in [
-                "average", "sum"
+                "average",
+                "sum",
             ], "shared_expert_combination_strategy "
             "must be one of ['average', 'sum']"
         else:

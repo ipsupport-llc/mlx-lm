@@ -39,7 +39,15 @@ def _text_of(content) -> str:
     return "".join(
         p.get("text", "")
         for p in content
-        if p.get("type") in ("input_text", "output_text", "text", "refusal", "summary_text", "reasoning_text")
+        if p.get("type")
+        in (
+            "input_text",
+            "output_text",
+            "text",
+            "refusal",
+            "summary_text",
+            "reasoning_text",
+        )
     )
 
 
@@ -107,7 +115,11 @@ def _messages(body: dict) -> List[dict]:
         cid = call_id(cid)
         unanswered.add(cid)
         assistant().setdefault("tool_calls", []).append(
-            {"id": cid, "type": "function", "function": {"name": name, "arguments": arguments}}
+            {
+                "id": cid,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
         )
 
     def system(text):
@@ -126,22 +138,32 @@ def _messages(body: dict) -> List[dict]:
                 system(_text_of(item.get("content")))
             elif role == "user":
                 turn, reasoning = None, ""
-                messages.append({"role": "user", "content": _user_content(item.get("content"))})
+                messages.append(
+                    {"role": "user", "content": _user_content(item.get("content"))}
+                )
             else:
                 raise ValueError(f"Unsupported message role: {role!r}")
         elif kind == "reasoning":
             # The raw reasoning when the client sent it back, else its summary.
             reasoning += _text_of(item.get("content")) or _text_of(item.get("summary"))
         elif kind == "function_call":
-            call(item.get("name", ""), item.get("arguments") or "{}", item.get("call_id"))
+            call(
+                item.get("name", ""), item.get("arguments") or "{}", item.get("call_id")
+            )
         elif kind == "custom_tool_call":
-            arguments = json.dumps({CUSTOM_INPUT: item.get("input", "")}, ensure_ascii=False)
+            arguments = json.dumps(
+                {CUSTOM_INPUT: item.get("input", "")}, ensure_ascii=False
+            )
             call(item.get("name", ""), arguments, item.get("call_id"))
         elif kind in ("function_call_output", "custom_tool_call_output"):
             turn = None
             unanswered.discard(item.get("call_id"))
             messages.append(
-                {"role": "tool", "tool_call_id": item.get("call_id", ""), "content": _tool_output(item.get("output"))}
+                {
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id", ""),
+                    "content": _tool_output(item.get("output")),
+                }
             )
             if not unanswered:
                 for text in held:
@@ -182,7 +204,16 @@ def _tools(body: dict) -> List[dict]:
             continue
         if not isinstance(name, str) or not name:
             raise ValueError("Every tool needs a name.")
-        out.append({"type": "function", "function": {"name": name, "description": description, "parameters": parameters}})
+        out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+            }
+        )
     return out
 
 
@@ -197,7 +228,10 @@ def to_chat_request(body: dict) -> dict:
             "previous_response_id isn't supported: this server keeps no responses. "
             "Send the whole conversation in input."
         )
-    chat: Dict[str, Any] = {"messages": _messages(body), "stream": bool(body.get("stream", False))}
+    chat: Dict[str, Any] = {
+        "messages": _messages(body),
+        "stream": bool(body.get("stream", False)),
+    }
     # top_k and max_tokens: not Responses fields, but a proxy in front (LLMTray's
     # profile) may add them.
     for key in ("model", "temperature", "top_p", "top_k", "max_tokens"):
@@ -212,7 +246,9 @@ def to_chat_request(body: dict) -> dict:
         # Generation can't force a call: offer only that tool.
         tools = [t for t in tools if t["function"]["name"] == choice["name"]]
         if not tools:
-            raise ValueError(f"tool_choice names a tool this server can't run: {choice['name']!r}")
+            raise ValueError(
+                f"tool_choice names a tool this server can't run: {choice['name']!r}"
+            )
     if tools and choice != "none":
         chat["tools"] = tools
 
@@ -238,14 +274,18 @@ def _usage(prompt_tokens: int, output_tokens: int, cached: Optional[int]) -> dic
     }
 
 
-def _response(rid: str, created: int, model: str, body: dict, status: str, output: list, usage) -> dict:
+def _response(
+    rid: str, created: int, model: str, body: dict, status: str, output: list, usage
+) -> dict:
     out = {
         "id": rid,
         "object": "response",
         "created_at": created,
         "status": status,
         "error": None,
-        "incomplete_details": {"reason": "max_output_tokens"} if status == "incomplete" else None,
+        "incomplete_details": (
+            {"reason": "max_output_tokens"} if status == "incomplete" else None
+        ),
         "model": model,
         "output": output,
         "parallel_tool_calls": body.get("parallel_tool_calls", True),
@@ -293,10 +333,22 @@ def _call_item(call: dict, custom: set, status: str = "completed") -> dict:
             value = json.loads(arguments).get(CUSTOM_INPUT, "")
         except (ValueError, AttributeError):
             value = arguments
-        return {"type": "custom_tool_call", "id": _id("ctc"), "status": status,
-                "call_id": call_id(call.get("id")), "name": name, "input": value}
-    return {"type": "function_call", "id": _id("fc"), "status": status,
-            "call_id": call_id(call.get("id")), "name": name, "arguments": arguments}
+        return {
+            "type": "custom_tool_call",
+            "id": _id("ctc"),
+            "status": status,
+            "call_id": call_id(call.get("id")),
+            "name": name,
+            "input": value,
+        }
+    return {
+        "type": "function_call",
+        "id": _id("fc"),
+        "status": status,
+        "call_id": call_id(call.get("id")),
+        "name": name,
+        "arguments": arguments,
+    }
 
 
 def _status(finish_reason) -> str:
@@ -312,13 +364,25 @@ def to_response(response: dict, model: str, body: dict) -> dict:
     if out.get("reasoning"):
         output.append(_reasoning_item(out["reasoning"]))
     if out.get("content") or not out.get("tool_calls"):
-        output.append(_message_item(out.get("content") or "", _status(choice.get("finish_reason"))))
+        output.append(
+            _message_item(
+                out.get("content") or "", _status(choice.get("finish_reason"))
+            )
+        )
     output.extend(_call_item(c, custom) for c in out.get("tool_calls") or [])
     usage = response.get("usage", {})
     return _response(
-        _id("resp"), int(time.time()), model, body, _status(choice.get("finish_reason")), output,
-        _usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
-               usage.get("prompt_tokens_details", {}).get("cached_tokens")),
+        _id("resp"),
+        int(time.time()),
+        model,
+        body,
+        _status(choice.get("finish_reason")),
+        output,
+        _usage(
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            usage.get("prompt_tokens_details", {}).get("cached_tokens"),
+        ),
     )
 
 
@@ -343,10 +407,14 @@ class ResponseStream:
     def _event(self, name: str, data: dict) -> bytes:
         data = dict(data, type=name, sequence_number=self.seq)
         self.seq += 1
-        return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
+        return (
+            f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
+        )
 
     def _snapshot(self, status: str, usage=None) -> dict:
-        return _response(self.id, self.created, self.model, self.body, status, self.output, usage)
+        return _response(
+            self.id, self.created, self.model, self.body, status, self.output, usage
+        )
 
     def start(self, prompt_tokens: int, cached: Optional[int]) -> bytes:
         self.prompt_tokens, self.cached = prompt_tokens, cached
@@ -364,33 +432,77 @@ class ResponseStream:
         out = b""
         if item["type"] == "message":
             part = item["content"][0]
-            out += self._event("response.output_text.done",
-                               {"item_id": item["id"], "output_index": index, "content_index": 0, "text": part["text"]})
-            out += self._event("response.content_part.done",
-                               {"item_id": item["id"], "output_index": index, "content_index": 0, "part": part})
+            out += self._event(
+                "response.output_text.done",
+                {
+                    "item_id": item["id"],
+                    "output_index": index,
+                    "content_index": 0,
+                    "text": part["text"],
+                },
+            )
+            out += self._event(
+                "response.content_part.done",
+                {
+                    "item_id": item["id"],
+                    "output_index": index,
+                    "content_index": 0,
+                    "part": part,
+                },
+            )
             item["status"] = _status(self.finish_reason)
         elif item["type"] == "reasoning":
             part = item["summary"][0]
-            out += self._event("response.reasoning_summary_text.done",
-                               {"item_id": item["id"], "output_index": index, "summary_index": 0, "text": part["text"]})
-            out += self._event("response.reasoning_summary_part.done",
-                               {"item_id": item["id"], "output_index": index, "summary_index": 0, "part": part})
-        return out + self._event("response.output_item.done", {"output_index": index, "item": item})
+            out += self._event(
+                "response.reasoning_summary_text.done",
+                {
+                    "item_id": item["id"],
+                    "output_index": index,
+                    "summary_index": 0,
+                    "text": part["text"],
+                },
+            )
+            out += self._event(
+                "response.reasoning_summary_part.done",
+                {
+                    "item_id": item["id"],
+                    "output_index": index,
+                    "summary_index": 0,
+                    "part": part,
+                },
+            )
+        return out + self._event(
+            "response.output_item.done", {"output_index": index, "item": item}
+        )
 
     def _begin(self, item: dict) -> bytes:
         out = self._close()
         self.output.append(item)
         self.open = item
         index = len(self.output) - 1
-        out += self._event("response.output_item.added", {"output_index": index, "item": item})
+        out += self._event(
+            "response.output_item.added", {"output_index": index, "item": item}
+        )
         if item["type"] == "message":
-            out += self._event("response.content_part.added",
-                               {"item_id": item["id"], "output_index": index, "content_index": 0,
-                                "part": {"type": "output_text", "text": "", "annotations": []}})
+            out += self._event(
+                "response.content_part.added",
+                {
+                    "item_id": item["id"],
+                    "output_index": index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                },
+            )
         elif item["type"] == "reasoning":
-            out += self._event("response.reasoning_summary_part.added",
-                               {"item_id": item["id"], "output_index": index, "summary_index": 0,
-                                "part": {"type": "summary_text", "text": ""}})
+            out += self._event(
+                "response.reasoning_summary_part.added",
+                {
+                    "item_id": item["id"],
+                    "output_index": index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                },
+            )
         return out
 
     def chunk(self, response: dict) -> bytes:
@@ -404,16 +516,28 @@ class ResponseStream:
                 out += self._begin(_reasoning_item(""))
             self.open["summary"][0]["text"] += delta["reasoning"]
             self.open["content"][0]["text"] += delta["reasoning"]
-            out += self._event("response.reasoning_summary_text.delta",
-                               {"item_id": self.open["id"], "output_index": index(), "summary_index": 0,
-                                "delta": delta["reasoning"]})
+            out += self._event(
+                "response.reasoning_summary_text.delta",
+                {
+                    "item_id": self.open["id"],
+                    "output_index": index(),
+                    "summary_index": 0,
+                    "delta": delta["reasoning"],
+                },
+            )
         if delta.get("content"):
             if self.open is None or self.open["type"] != "message":
                 out += self._begin(_message_item("", status="in_progress"))
             self.open["content"][0]["text"] += delta["content"]
-            out += self._event("response.output_text.delta",
-                               {"item_id": self.open["id"], "output_index": index(), "content_index": 0,
-                                "delta": delta["content"]})
+            out += self._event(
+                "response.output_text.delta",
+                {
+                    "item_id": self.open["id"],
+                    "output_index": index(),
+                    "content_index": 0,
+                    "delta": delta["content"],
+                },
+            )
         for call in delta.get("tool_calls") or []:
             # The server sends a tool call whole, once it has closed.
             item = _call_item(call, self.custom)
@@ -422,29 +546,59 @@ class ResponseStream:
             self.output.append(item)
             i = index()
             if item["type"] == "custom_tool_call":
-                out += self._event("response.output_item.added", {"output_index": i, "item": dict(added, input="")})
-                out += self._event("response.custom_tool_call_input.delta",
-                                   {"item_id": item["id"], "output_index": i, "delta": item["input"]})
-                out += self._event("response.custom_tool_call_input.done",
-                                   {"item_id": item["id"], "output_index": i, "input": item["input"]})
+                out += self._event(
+                    "response.output_item.added",
+                    {"output_index": i, "item": dict(added, input="")},
+                )
+                out += self._event(
+                    "response.custom_tool_call_input.delta",
+                    {"item_id": item["id"], "output_index": i, "delta": item["input"]},
+                )
+                out += self._event(
+                    "response.custom_tool_call_input.done",
+                    {"item_id": item["id"], "output_index": i, "input": item["input"]},
+                )
             else:
-                out += self._event("response.output_item.added", {"output_index": i, "item": dict(added, arguments="")})
-                out += self._event("response.function_call_arguments.delta",
-                                   {"item_id": item["id"], "output_index": i, "delta": item["arguments"]})
-                out += self._event("response.function_call_arguments.done",
-                                   {"item_id": item["id"], "output_index": i, "arguments": item["arguments"]})
-            out += self._event("response.output_item.done", {"output_index": i, "item": item})
+                out += self._event(
+                    "response.output_item.added",
+                    {"output_index": i, "item": dict(added, arguments="")},
+                )
+                out += self._event(
+                    "response.function_call_arguments.delta",
+                    {
+                        "item_id": item["id"],
+                        "output_index": i,
+                        "delta": item["arguments"],
+                    },
+                )
+                out += self._event(
+                    "response.function_call_arguments.done",
+                    {
+                        "item_id": item["id"],
+                        "output_index": i,
+                        "arguments": item["arguments"],
+                    },
+                )
+            out += self._event(
+                "response.output_item.done", {"output_index": i, "item": item}
+            )
         if choice.get("finish_reason"):
             self.finish_reason = choice["finish_reason"]
         return out
 
     def stop(self, output_tokens: int, stop_sequence: Optional[str] = None) -> bytes:
         # An empty answer still has a message, as a whole response does.
-        out = self._begin(_message_item("", status="in_progress")) if not self.output else b""
+        out = (
+            self._begin(_message_item("", status="in_progress"))
+            if not self.output
+            else b""
+        )
         out += self._close()
         status = _status(self.finish_reason)
         name = "response.incomplete" if status == "incomplete" else "response.completed"
-        snap = self._snapshot(status, _usage(self.prompt_tokens, output_tokens, self.cached))
+        snap = self._snapshot(
+            status, _usage(self.prompt_tokens, output_tokens, self.cached)
+        )
         return out + self._event(name, {"response": snap})
 
 

@@ -59,9 +59,7 @@ def _stub_model():
             image_token_id=IMAGE, boi_token_id=BOI, eoi_token_id=EOI
         ),
         language_model=types.SimpleNamespace(
-            model=types.SimpleNamespace(
-                config=types.SimpleNamespace(pad_token_id=PAD)
-            )
+            model=types.SimpleNamespace(config=types.SimpleNamespace(pad_token_id=PAD))
         ),
         _fuse_multimodal_inputs=fuse,
     )
@@ -69,7 +67,11 @@ def _stub_model():
 
 
 PROCESSOR_CONFIG = {
-    "image_processor": {"patch_size": 16, "max_soft_tokens": 280, "pooling_kernel_size": 3}
+    "image_processor": {
+        "patch_size": 16,
+        "max_soft_tokens": 280,
+        "pooling_kernel_size": 3,
+    }
 }
 
 
@@ -104,7 +106,10 @@ class TestMultimodal(unittest.TestCase):
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,!!!"}}
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,!!!"},
+                    }
                 ],
             }
         ]
@@ -112,11 +117,26 @@ class TestMultimodal(unittest.TestCase):
             extract_images(messages)
         with self.assertRaises(ValueError):
             extract_images(
-                [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "ftp://x"}}]}]
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "ftp://x"}}
+                        ],
+                    }
+                ]
             )
 
     def test_text_only_content_still_flattened(self):
-        messages = [{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "text", "text": "b"},
+                ],
+            }
+        ]
         process_message_content(messages)
         self.assertEqual(messages[0]["content"], "ab")
 
@@ -178,9 +198,17 @@ class TestImageInputLimits(unittest.TestCase):
     """Requests are untrusted: what extract_images refuses (-> HTTP 400)."""
 
     def setUp(self):
-        self.saved = {k: getattr(multimodal, k) for k in
-                      ("ALLOW_IMAGE_URLS", "MAX_IMAGES", "MAX_IMAGE_BYTES", "MAX_IMAGE_PIXELS",
-                       "MAX_REQUEST_PIXELS", "URL_FETCH_SECONDS")}
+        self.saved = {
+            k: getattr(multimodal, k)
+            for k in (
+                "ALLOW_IMAGE_URLS",
+                "MAX_IMAGES",
+                "MAX_IMAGE_BYTES",
+                "MAX_IMAGE_PIXELS",
+                "MAX_REQUEST_PIXELS",
+                "URL_FETCH_SECONDS",
+            )
+        }
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -226,7 +254,7 @@ class TestImageInputLimits(unittest.TestCase):
 
         def big(h):
             h.send_response(200)
-            h.end_headers()   # no Content-Length: only the read cap stops it
+            h.end_headers()  # no Content-Length: only the read cap stops it
             h.wfile.write(b"x" * 5000)
 
         base, _ = self._serve(big)
@@ -234,6 +262,7 @@ class TestImageInputLimits(unittest.TestCase):
             extract_images(_msg(_img_part(base + "/big")))
 
         import time as _t
+
         multimodal.MAX_IMAGE_BYTES = 10**6
         multimodal.URL_FETCH_SECONDS = 1
 
@@ -258,6 +287,7 @@ class TestImageInputLimits(unittest.TestCase):
         # Each byte comes inside the socket timeout, and a blocked read
         # never got back to a deadline check between reads.
         import time as _t
+
         multimodal.ALLOW_IMAGE_URLS = True
         multimodal.URL_FETCH_SECONDS = 1
 
@@ -272,11 +302,14 @@ class TestImageInputLimits(unittest.TestCase):
                         _t.sleep(0.2)
                 except OSError:
                     pass
+
             return body
 
         cases = {
             "head": dripped(b"HTTP/1.1 200 OK\r\nX-Slow: ", b"a"),
-            "chunk line": dripped(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", b"0"),
+            "chunk line": dripped(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", b"0"
+            ),
         }
         for name, body in cases.items():
             with self.subTest(name):
@@ -300,8 +333,8 @@ class TestImageInputLimits(unittest.TestCase):
             conn, _ = listener.accept()
             with conn:
                 try:
-                    conn.sendall(b"\x16\x03\x03\x40\x00")   # a 16 KB handshake record...
-                    for _ in range(40):                        # ...that never arrives
+                    conn.sendall(b"\x16\x03\x03\x40\x00")  # a 16 KB handshake record...
+                    for _ in range(40):  # ...that never arrives
                         conn.sendall(b"\x02")
                         _t.sleep(0.2)
                 except OSError:
@@ -312,7 +345,9 @@ class TestImageInputLimits(unittest.TestCase):
         multimodal.URL_FETCH_SECONDS = 1
         start = _t.monotonic()
         with self.assertRaisesRegex(ValueError, "longer than"):
-            extract_images(_msg(_img_part(f"https://127.0.0.1:{listener.getsockname()[1]}/x.png")))
+            extract_images(
+                _msg(_img_part(f"https://127.0.0.1:{listener.getsockname()[1]}/x.png"))
+            )
         self.assertLess(_t.monotonic() - start, 3)
 
     def test_url_deadline_holds_across_addresses_that_time_out(self):
@@ -338,10 +373,15 @@ class TestImageInputLimits(unittest.TestCase):
             def close(self):
                 pass
 
-        addrs = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"10.0.0.{i}", 80)) for i in range(4)]
+        addrs = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"10.0.0.{i}", 80))
+            for i in range(4)
+        ]
         multimodal.ALLOW_IMAGE_URLS = True
         multimodal.URL_FETCH_SECONDS = 1
-        with mock.patch("socket.getaddrinfo", return_value=addrs), mock.patch("socket.socket", Blackhole):
+        with mock.patch("socket.getaddrinfo", return_value=addrs), mock.patch(
+            "socket.socket", Blackhole
+        ):
             start = _t.monotonic()
             with self.assertRaisesRegex(ValueError, "longer than|Could not load"):
                 extract_images(_msg(_img_part("http://many.invalid/x.png")))
@@ -379,18 +419,24 @@ class TestImageInputLimits(unittest.TestCase):
                 raise OSError(47, "Address family not supported")
             return real_socket(family, *a, **kw)
 
-        addrs = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
-                 (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        addrs = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ]
         multimodal.ALLOW_IMAGE_URLS = True
-        with mock.patch("socket.getaddrinfo", return_value=addrs), mock.patch("socket.socket", make):
-            self.assertEqual(extract_images(_msg(_img_part(f"http://dual.invalid:{port}/x"))), [png])
+        with mock.patch("socket.getaddrinfo", return_value=addrs), mock.patch(
+            "socket.socket", make
+        ):
+            self.assertEqual(
+                extract_images(_msg(_img_part(f"http://dual.invalid:{port}/x"))), [png]
+            )
 
     def test_failed_tls_handshake_closes_its_socket(self):
         import gc
         import os
         import warnings
 
-        def plain(h):   # plain HTTP on a port fetched as https://
+        def plain(h):  # plain HTTP on a port fetched as https://
             h.send_response(200)
             h.end_headers()
 
@@ -438,7 +484,10 @@ class TestImageInputLimits(unittest.TestCase):
         threading.Thread(target=proxy, daemon=True).start()
         multimodal.ALLOW_IMAGE_URLS = True
         multimodal.URL_FETCH_SECONDS = 1
-        env = {"https_proxy": f"http://127.0.0.1:{listener.getsockname()[1]}", "no_proxy": ""}
+        env = {
+            "https_proxy": f"http://127.0.0.1:{listener.getsockname()[1]}",
+            "no_proxy": "",
+        }
         saved = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         try:
@@ -464,7 +513,9 @@ class TestImageInputLimits(unittest.TestCase):
         padded = png + b"\0" * (1001 - len(png))
         with self.assertRaisesRegex(ValueError, "larger than"):
             extract_images(_msg(_img_part(_data_uri(padded))))
-        self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(padded[:1000]))))), 1)
+        self.assertEqual(
+            len(extract_images(_msg(_img_part(_data_uri(padded[:1000]))))), 1
+        )
         multimodal.MAX_IMAGE_BYTES = 20 * 1024 * 1024
         # A decompression bomb: a small file declaring a huge canvas.
         buf = io.BytesIO()
@@ -487,11 +538,13 @@ class TestImageInputLimits(unittest.TestCase):
         for fmt in ("PNG", "JPEG", "WEBP", "GIF", "BMP"):
             buf = io.BytesIO()
             Image.new("RGB", (16, 16)).save(buf, format=fmt)
-            self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))), 1, fmt)
+            self.assertEqual(
+                len(extract_images(_msg(_img_part(_data_uri(buf.getvalue()))))), 1, fmt
+            )
 
     def test_request_pixel_budget(self):
         multimodal.MAX_REQUEST_PIXELS = 3000
-        uri = _data_uri(_png(40, 40, 0))   # 1600 px each
+        uri = _data_uri(_png(40, 40, 0))  # 1600 px each
         with self.assertRaisesRegex(ValueError, "add up"):
             extract_images(_msg(_img_part(uri), _img_part(uri)))
 
@@ -534,7 +587,9 @@ class TestImageInputLimits(unittest.TestCase):
         jpg = buf.getvalue()
         with_comment = jpg[:2] + com + jpg[2:]
         Image.open(io.BytesIO(with_comment)).load()
-        self.assertEqual(len(extract_images(_msg(_img_part(_data_uri(with_comment))))), 1)
+        self.assertEqual(
+            len(extract_images(_msg(_img_part(_data_uri(with_comment))))), 1
+        )
         # A junk byte between segments: the decoder skips it, so the scans
         # after it still count.
         app0_end = 4 + int.from_bytes(bomb[4:6], "big")
@@ -547,7 +602,9 @@ class TestImageInputLimits(unittest.TestCase):
             extract_images(_msg(_img_part(_data_uri(padded))))
 
     def test_not_an_image(self):
-        uri = "data:image/png;base64," + base64.b64encode(b"hello, not an image").decode()
+        uri = (
+            "data:image/png;base64," + base64.b64encode(b"hello, not an image").decode()
+        )
         with self.assertRaisesRegex(ValueError, "image data"):
             extract_images(_msg(_img_part(uri)))
 
@@ -560,9 +617,9 @@ class TestImageInputLimits(unittest.TestCase):
     def test_malformed_structure(self):
         uri = _data_uri(_png(8, 8, 0))
         for messages in (
-            _msg("hi", _img_part(uri)),                       # a bare string part
-            ["hello"],                                        # a bare string message
-            _msg({"type": "image"}),                          # a placeholder without an image
+            _msg("hi", _img_part(uri)),  # a bare string part
+            ["hello"],  # a bare string message
+            _msg({"type": "image"}),  # a placeholder without an image
             _msg(_img_part(uri), {"type": "input_audio", "input_audio": {}}),
             _msg(_img_part(uri), {"type": "video"}),
             "not a list",
@@ -570,7 +627,9 @@ class TestImageInputLimits(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(messages)[:80]):
                 extract_images(messages)
         # Text next to images is fine.
-        self.assertEqual(len(extract_images(_msg({"type": "text", "text": "a"}, _img_part(uri)))), 1)
+        self.assertEqual(
+            len(extract_images(_msg({"type": "text", "text": "a"}, _img_part(uri)))), 1
+        )
 
     def test_exif_orientation_applied(self):
         # Stored 40 wide x 20 high, EXIF says "rotate 90" (Orientation=6):
@@ -587,11 +646,24 @@ AUDIO, BOA, EOA = 258881, 256000, 258883
 AUDIO_CONFIG = {
     **PROCESSOR_CONFIG,
     "feature_extractor": {
-        "feature_extractor_type": "Gemma4AudioFeatureExtractor", "dither": 0.0, "feature_size": 128,
-        "fft_length": 512, "fft_overdrive": False, "frame_length": 320, "hop_length": 160,
-        "input_scale_factor": 1.0, "max_frequency": 8000.0, "mel_floor": 0.001, "min_frequency": 0.0,
-        "padding_side": "right", "padding_value": 0.0, "per_bin_mean": None, "per_bin_stddev": None,
-        "preemphasis": 0.0, "preemphasis_htk_flavor": True, "return_attention_mask": True,
+        "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+        "dither": 0.0,
+        "feature_size": 128,
+        "fft_length": 512,
+        "fft_overdrive": False,
+        "frame_length": 320,
+        "hop_length": 160,
+        "input_scale_factor": 1.0,
+        "max_frequency": 8000.0,
+        "mel_floor": 0.001,
+        "min_frequency": 0.0,
+        "padding_side": "right",
+        "padding_value": 0.0,
+        "per_bin_mean": None,
+        "per_bin_stddev": None,
+        "preemphasis": 0.0,
+        "preemphasis_htk_flavor": True,
+        "return_attention_mask": True,
         "sampling_rate": 16000,
     },
 }
@@ -614,7 +686,10 @@ def _wav(seconds, rate=16000, channels=1, freq=440.0):
 
 
 def _audio_part(blob):
-    return {"type": "input_audio", "input_audio": {"data": base64.b64encode(blob).decode(), "format": "wav"}}
+    return {
+        "type": "input_audio",
+        "input_audio": {"data": base64.b64encode(blob).decode(), "format": "wav"},
+    }
 
 
 def _audio_model(unified=False):
@@ -640,32 +715,60 @@ class TestAudioInputs(unittest.TestCase):
     def test_extract_media_decodes_and_rewrites(self):
         from mlx_lm.multimodal import extract_media
 
-        messages = [{"role": "user", "content": [{"type": "text", "text": "what is this?"},
-                                                  _audio_part(_wav(1.5, rate=48000, channels=2))]}]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    _audio_part(_wav(1.5, rate=48000, channels=2)),
+                ],
+            }
+        ]
         images, audios = extract_media(messages)
         self.assertEqual(images, [])
         self.assertEqual(len(audios), 1)
         self.assertEqual(audios[0].dtype, np.float32)
-        self.assertAlmostEqual(len(audios[0]) / 16000, 1.5, places=2)  # 48 kHz stereo -> 16 kHz mono
+        self.assertAlmostEqual(
+            len(audios[0]) / 16000, 1.5, places=2
+        )  # 48 kHz stereo -> 16 kHz mono
         self.assertLess(np.abs(audios[0]).max(), 0.6)
         self.assertEqual(messages[0]["content"][1], {"type": "audio"})
         process_message_content(messages)
-        self.assertEqual(messages[0]["content"][1], {"type": "audio"}, "left for the chat template")
+        self.assertEqual(
+            messages[0]["content"][1], {"type": "audio"}, "left for the chat template"
+        )
 
     def test_bad_audio_is_a_value_error(self):
         from mlx_lm.multimodal import extract_media
 
         bad = [
-            [{"type": "input_audio", "input_audio": {"data": base64.b64encode(b"not a wav").decode(), "format": "wav"}}],
+            [
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": base64.b64encode(b"not a wav").decode(),
+                        "format": "wav",
+                    },
+                }
+            ],
             [{"type": "input_audio", "input_audio": {"data": "AAAA", "format": "mp3"}}],
             [{"type": "input_audio", "input_audio": {}}],
             [{"type": "audio"}],  # only extract_media makes those
             [_audio_part(_wav(31))],  # over 30 s a clip
-            [{"type": "input_audio", "input_audio": {"data": base64.b64encode(
-                bytes.fromhex("524946460c000000574156454a554e4bffffffff")).decode(), "format": "wav"}}],
+            [
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": base64.b64encode(
+                            bytes.fromhex("524946460c000000574156454a554e4bffffffff")
+                        ).decode(),
+                        "format": "wav",
+                    },
+                }
+            ],
             [{"type": "input_audio", "input_audio": {"data": "AAAA", "format": 123}}],
             [_audio_part(_wav(0.05))],  # empty
-            [_audio_part(_wav(1)[:44 + 6400])],  # cut off: 0.2 s of a 1 s header
+            [_audio_part(_wav(1)[: 44 + 6400])],  # cut off: 0.2 s of a 1 s header
             [_audio_part(_wav(1)), {"type": "video"}],  # not for the template
         ]
         for content in bad:
@@ -673,17 +776,27 @@ class TestAudioInputs(unittest.TestCase):
                 extract_media([{"role": "user", "content": content}])
 
     def test_build_expands_audio_as_hf_counts(self):
-        from transformers.models.gemma4.feature_extraction_gemma4 import Gemma4AudioFeatureExtractor
+        from transformers.models.gemma4.feature_extraction_gemma4 import (
+            Gemma4AudioFeatureExtractor,
+        )
 
         model, captured = _audio_model()
         ii = ImageInputs(model, AUDIO_CONFIG)
         self.assertTrue(ii.accepts_audio)
-        clips = [np.random.default_rng(0).standard_normal(16000 * 3).astype(np.float32) * 0.1,
-                 np.zeros(16000 // 2, dtype=np.float32)]
+        clips = [
+            np.random.default_rng(0).standard_normal(16000 * 3).astype(np.float32)
+            * 0.1,
+            np.zeros(16000 // 2, dtype=np.float32),
+        ]
         ids, _, key = ii.build([2, AUDIO, 9, AUDIO, 11], [], clips)
         # HF's processor: the mask through two stride-2 convolutions.
-        fe = Gemma4AudioFeatureExtractor(**{k: v for k, v in AUDIO_CONFIG["feature_extractor"].items()
-                                            if k != "feature_extractor_type"})
+        fe = Gemma4AudioFeatureExtractor(
+            **{
+                k: v
+                for k, v in AUDIO_CONFIG["feature_extractor"].items()
+                if k != "feature_extractor_type"
+            }
+        )
         feats = fe(clips, sampling_rate=16000, return_tensors="np")
         expected = []
         for mask in feats["input_features_mask"]:
@@ -703,7 +816,12 @@ class TestAudioInputs(unittest.TestCase):
 
     def test_unified_counts_frames(self):
         model, _ = _audio_model(unified=True)
-        cfg = {**PROCESSOR_CONFIG, "feature_extractor": {"feature_extractor_type": "Gemma4UnifiedAudioFeatureExtractor"}}
+        cfg = {
+            **PROCESSOR_CONFIG,
+            "feature_extractor": {
+                "feature_extractor_type": "Gemma4UnifiedAudioFeatureExtractor"
+            },
+        }
         ii = ImageInputs(model, cfg)
         self.assertEqual(ii.audio_soft_tokens(np.ones(50, dtype=bool)), 50)
 
@@ -724,7 +842,16 @@ class TestAudioKeys(unittest.TestCase):
     def test_audio_isnt_a_vision_span(self):
         from mlx_lm.multimodal import _AUDIO_KEY_BASE, vision_spans
 
-        key = [1, BOI, _IMAGE_KEY_BASE + 5, _IMAGE_KEY_BASE + 5, EOI, BOA, _AUDIO_KEY_BASE + 7, EOA]
+        key = [
+            1,
+            BOI,
+            _IMAGE_KEY_BASE + 5,
+            _IMAGE_KEY_BASE + 5,
+            EOI,
+            BOA,
+            _AUDIO_KEY_BASE + 7,
+            EOA,
+        ]
         self.assertEqual(vision_spans(key), [(2, 4)])
 
     def test_odd_wav_headers_are_refused(self):

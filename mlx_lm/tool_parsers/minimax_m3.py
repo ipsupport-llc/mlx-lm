@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 """Tool-call parser for MiniMax-M3.
 
 M3's chat template emits tool calls wrapped in a namespaced XML dialect:
@@ -114,7 +116,10 @@ def parse_tool_call(text: str, tools: list | None = None):
             # has primary evidence of M3 emitting malformed argument XML.
             logger.warning(
                 "minimax_m3: malformed argument XML for invoke %r (%s); "
-                "raw body[:300]=%r", name, e, body[:300],
+                "raw body[:300]=%r",
+                name,
+                e,
+                body[:300],
             )
             args = {
                 "__parse_error__": (
@@ -133,7 +138,9 @@ def parse_tool_call(text: str, tools: list | None = None):
                 logger.warning(
                     "minimax_m3: arguments for invoke %r parsed to %s, not "
                     "an object; body[:300]=%r",
-                    name, type(args).__name__, body[:300],
+                    name,
+                    type(args).__name__,
+                    body[:300],
                 )
                 args = {
                     "__parse_error__": (

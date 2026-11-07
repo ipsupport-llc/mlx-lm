@@ -87,9 +87,13 @@ class TestMuseSparkImageInputs(unittest.TestCase):
             return buf.getvalue()
 
         inputs = MuseSparkImageInputs(
-            FakeModel(), {"vision_config": {"patch_size": 14}}, {"<|image_start|>": 5, "<|image_end|>": 6}
+            FakeModel(),
+            {"vision_config": {"patch_size": 14}},
+            {"<|image_start|>": 5, "<|image_end|>": 6},
         )
-        expanded, embeddings, key = inputs.build([1, 7, 2, 7], [png(56, 84), png(28, 28)])
+        expanded, embeddings, key = inputs.build(
+            [1, 7, 2, 7], [png(56, 84), png(28, 28)]
+        )
         self.assertEqual(expanded, [1, 5] + [7] * 6 + [6, 2, 5, 7, 6])
         self.assertEqual(calls["inputs"], expanded)
         self.assertEqual(calls["shapes"], [(3, 56, 84), (3, 28, 28)])

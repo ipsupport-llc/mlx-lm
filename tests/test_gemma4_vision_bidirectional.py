@@ -17,6 +17,7 @@ from mlx_lm.models import gemma4
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.multimodal import _IMAGE_KEY_BASE, vision_spans
 
+
 def setUpModule():
     # CPU: on the GPU, a 1-token pass and a multi-token one already differ
     # by ~2e-2 on this tiny random model (upstream too) -- kernel numerics,
@@ -30,7 +31,9 @@ def tearDownModule():
     mx.set_default_device(_device)
 
 
-CONFIG = json.loads(r'''{"audio_token_id": 258881, "boa_token_id": 256000, "boi_token_id": 255999, "eoi_token_id": 258882, "image_token_id": 258880, "model_type": "gemma4", "text_config": {"attention_bias": false, "attention_dropout": 0.0, "attention_k_eq_v": false, "bos_token_id": 2, "enable_moe_block": false, "eos_token_id": 1, "final_logit_softcapping": 30.0, "global_head_dim": 64, "head_dim": 32, "hidden_activation": "gelu_pytorch_tanh", "hidden_size": 64, "hidden_size_per_layer_input": 8, "intermediate_size": 128, "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"], "max_position_embeddings": 131072, "model_type": "gemma4_text", "moe_intermediate_size": null, "num_attention_heads": 2, "num_experts": null, "num_hidden_layers": 6, "num_key_value_heads": 1, "num_kv_shared_layers": 0, "pad_token_id": 0, "rms_norm_eps": 1e-06, "rope_parameters": {"full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"}, "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}}, "sliding_window": 512, "tie_word_embeddings": true, "top_k_experts": null, "use_bidirectional_attention": "vision", "use_cache": true, "use_double_wide_mlp": false, "vocab_size": 262144, "vocab_size_per_layer_input": 262144}, "tie_word_embeddings": true, "vision_config": {"attention_bias": false, "attention_dropout": 0.0, "head_dim": 32, "hidden_activation": "gelu_pytorch_tanh", "hidden_size": 64, "intermediate_size": 128, "max_position_embeddings": 131072, "model_type": "gemma4_vision", "num_attention_heads": 2, "num_hidden_layers": 1, "num_key_value_heads": 2, "patch_size": 8, "pooling_kernel_size": 2, "position_embedding_size": 64, "rms_norm_eps": 1e-06, "rope_parameters": {"rope_theta": 100.0, "rope_type": "axial"}, "standardize": false, "use_clipped_linears": true}}''')
+CONFIG = json.loads(
+    r"""{"audio_token_id": 258881, "boa_token_id": 256000, "boi_token_id": 255999, "eoi_token_id": 258882, "image_token_id": 258880, "model_type": "gemma4", "text_config": {"attention_bias": false, "attention_dropout": 0.0, "attention_k_eq_v": false, "bos_token_id": 2, "enable_moe_block": false, "eos_token_id": 1, "final_logit_softcapping": 30.0, "global_head_dim": 64, "head_dim": 32, "hidden_activation": "gelu_pytorch_tanh", "hidden_size": 64, "hidden_size_per_layer_input": 8, "intermediate_size": 128, "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"], "max_position_embeddings": 131072, "model_type": "gemma4_text", "moe_intermediate_size": null, "num_attention_heads": 2, "num_experts": null, "num_hidden_layers": 6, "num_key_value_heads": 1, "num_kv_shared_layers": 0, "pad_token_id": 0, "rms_norm_eps": 1e-06, "rope_parameters": {"full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"}, "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}}, "sliding_window": 512, "tie_word_embeddings": true, "top_k_experts": null, "use_bidirectional_attention": "vision", "use_cache": true, "use_double_wide_mlp": false, "vocab_size": 262144, "vocab_size_per_layer_input": 262144}, "tie_word_embeddings": true, "vision_config": {"attention_bias": false, "attention_dropout": 0.0, "head_dim": 32, "hidden_activation": "gelu_pytorch_tanh", "hidden_size": 64, "intermediate_size": 128, "max_position_embeddings": 131072, "model_type": "gemma4_vision", "num_attention_heads": 2, "num_hidden_layers": 1, "num_key_value_heads": 2, "patch_size": 8, "pooling_kernel_size": 2, "position_embedding_size": 64, "rms_norm_eps": 1e-06, "rope_parameters": {"rope_theta": 100.0, "rope_type": "axial"}, "standardize": false, "use_clipped_linears": true}}"""
+)
 IMAGE = CONFIG["image_token_id"]
 
 
@@ -43,7 +46,13 @@ def _model():
 
 def _prompt(model):
     """Two 'images' (random embeddings at image-token positions) in text."""
-    ids = [5, 6, CONFIG["boi_token_id"]] + [IMAGE] * 6 + [CONFIG["eoi_token_id"], 7, CONFIG["boi_token_id"]] + [IMAGE] * 5 + [CONFIG["eoi_token_id"], 8, 9, 10]
+    ids = (
+        [5, 6, CONFIG["boi_token_id"]]
+        + [IMAGE] * 6
+        + [CONFIG["eoi_token_id"], 7, CONFIG["boi_token_id"]]
+        + [IMAGE] * 5
+        + [CONFIG["eoi_token_id"], 8, 9, 10]
+    )
     pad = model.language_model.model.config.pad_token_id
     gen_ids = mx.array([pad if t == IMAGE else t for t in ids])
     emb = model.language_model.model.embed_tokens(gen_ids)
@@ -55,14 +64,28 @@ def _prompt(model):
 
 class TestVisionBidirectional(unittest.TestCase):
     def test_helpers(self):
-        self.assertEqual(gemma4.Model.image_spans([1, IMAGE, IMAGE, 2, IMAGE, 3], IMAGE), [(1, 3), (4, 5)])
-        key = [1, 2, _IMAGE_KEY_BASE + 5, _IMAGE_KEY_BASE + 5, 3, 4, _IMAGE_KEY_BASE + 9, 7]
+        self.assertEqual(
+            gemma4.Model.image_spans([1, IMAGE, IMAGE, 2, IMAGE, 3], IMAGE),
+            [(1, 3), (4, 5)],
+        )
+        key = [
+            1,
+            2,
+            _IMAGE_KEY_BASE + 5,
+            _IMAGE_KEY_BASE + 5,
+            3,
+            4,
+            _IMAGE_KEY_BASE + 9,
+            7,
+        ]
         self.assertEqual(vision_spans(key), [(2, 4), (6, 7)])
         model = _model()
         model.set_vision_spans([(10, 20)])
         self.assertEqual(model.prefill_chunk_size(0, 15), 10, "stops before the image")
         self.assertEqual(model.prefill_chunk_size(10, 4), 10, "or takes it whole")
-        self.assertEqual(model.prefill_chunk_size(0, 25), 25, "an image inside the chunk is fine")
+        self.assertEqual(
+            model.prefill_chunk_size(0, 25), 25, "an image inside the chunk is fine"
+        )
         model.set_vision_spans(None)
         self.assertEqual(model.prefill_chunk_size(0, 15), 15)
 
@@ -72,7 +95,13 @@ class TestVisionBidirectional(unittest.TestCase):
             cache = cache or make_prompt_cache(model)
             out, i = [], cache[0].offset
             for n in split:
-                out.append(model(gen_ids[None, i:i + n], cache=cache, input_embeddings=emb[None, i:i + n]))
+                out.append(
+                    model(
+                        gen_ids[None, i : i + n],
+                        cache=cache,
+                        input_embeddings=emb[None, i : i + n],
+                    )
+                )
                 i += n
         finally:
             model.set_vision_spans(None)
@@ -95,7 +124,11 @@ class TestVisionBidirectional(unittest.TestCase):
             chunked = self._logits(model, gen_ids, emb, spans, split)
             self.assertLess(mx.abs(chunked - one).max().item(), 1e-3, (step, split))
         causal = self._logits(model, gen_ids, emb, None, [L])
-        self.assertGreater(mx.abs(causal - one).max().item(), 1e-3, "the images' tokens do see each other")
+        self.assertGreater(
+            mx.abs(causal - one).max().item(),
+            1e-3,
+            "the images' tokens do see each other",
+        )
 
     def test_generate_step_small_prefill_steps_and_cached_prefix(self):
         model = _model()
@@ -107,10 +140,22 @@ class TestVisionBidirectional(unittest.TestCase):
             model.set_vision_spans(spans)
             try:
                 if cached:
-                    model(gen_ids[None, :cached], cache=cache, input_embeddings=emb[None, :cached])
-                tok, lp = next(generate_step(gen_ids[cached:], model, input_embeddings=emb[cached:],
-                                             prefill_step_size=prefill_step, prompt_cache=cache, max_tokens=1,
-                                             stream=mx.cpu))
+                    model(
+                        gen_ids[None, :cached],
+                        cache=cache,
+                        input_embeddings=emb[None, :cached],
+                    )
+                tok, lp = next(
+                    generate_step(
+                        gen_ids[cached:],
+                        model,
+                        input_embeddings=emb[cached:],
+                        prefill_step_size=prefill_step,
+                        prompt_cache=cache,
+                        max_tokens=1,
+                        stream=mx.cpu,
+                    )
+                )
                 mx.eval(lp)
             finally:
                 model.set_vision_spans(None)

@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 """MLX implementation of ESMFold2 (pure-reference path).
 
 ESMFold2 is a protein structure predictor: a pair-tensor refiner conditioned on

@@ -40,7 +40,11 @@ _DTYPES = {
     "F16": (np.float16, mx.float16),
     "F32": (np.float32, mx.float32),
 }
-_PARTS = [(p, k) for p in ("gate_proj", "up_proj", "down_proj") for k in ("weight", "scales", "biases")]
+_PARTS = [
+    (p, k)
+    for p in ("gate_proj", "up_proj", "down_proj")
+    for k in ("weight", "scales", "biases")
+]
 # Calls with at most this many tokens compute expert by expert.
 _DECODE_TOKENS = 4
 
@@ -74,7 +78,11 @@ def _file_prefix(module_path, index):
             continue
         prefix = k[: -len(".gate_proj.weight")]
         j = prefix.find("layers.")
-        if j >= 0 and prefix[j:] == tail and Counter(filter(None, prefix[:j].split("."))) == head:
+        if (
+            j >= 0
+            and prefix[j:] == tail
+            and Counter(filter(None, prefix[:j].split("."))) == head
+        ):
             found.append(prefix)
     return found[0] if len(found) == 1 else None
 
@@ -191,7 +199,9 @@ class OffloadedSwitchGLU(switch_layers.SwitchGLU):
                 for e in flat[t].tolist():
                     if (t, e) not in done:
                         a = arrays[e]
-                        h = self.activation(store.qmm(xt, a, "up_proj"), store.qmm(xt, a, "gate_proj"))
+                        h = self.activation(
+                            store.qmm(xt, a, "up_proj"), store.qmm(xt, a, "gate_proj")
+                        )
                         done[(t, e)] = store.qmm(h, a, "down_proj")
                     row.append(done[(t, e)])
                 rows.append(mx.concatenate(row, axis=0))
@@ -223,11 +233,19 @@ def offload_experts(model, model_path, share):
     reader = _Reader()
     done = 0
     for name, m in model.named_modules():
-        if not isinstance(m, switch_layers.SwitchGLU) or isinstance(m, OffloadedSwitchGLU):
+        if not isinstance(m, switch_layers.SwitchGLU) or isinstance(
+            m, OffloadedSwitchGLU
+        ):
             continue
-        if not all(isinstance(getattr(m, p), switch_layers.QuantizedSwitchLinear) for p in ("gate_proj", "up_proj", "down_proj")):
+        if not all(
+            isinstance(getattr(m, p), switch_layers.QuantizedSwitchLinear)
+            for p in ("gate_proj", "up_proj", "down_proj")
+        ):
             continue
-        if any(getattr(getattr(m, p), "global_scale", None) is not None for p in ("gate_proj", "up_proj", "down_proj")):
+        if any(
+            getattr(getattr(m, p), "global_scale", None) is not None
+            for p in ("gate_proj", "up_proj", "down_proj")
+        ):
             continue  # per-expert nvfp4 scales: not handled here
         if any("bias" in getattr(m, p) for p in ("gate_proj", "up_proj", "down_proj")):
             continue  # experts with a linear bias: kept in memory
@@ -250,13 +268,17 @@ def offload_experts(model, model_path, share):
             continue
         capacity = max(1, int(round(experts * share)))
         store = _ExpertStore(m, slices, capacity, reader)
-        for (p, k), (f, off, stride, dt, shape) in slices.items():
+        for (p, k), (_f, _off, _stride, dt, _shape) in slices.items():
             setattr(getattr(m, p), k, mx.zeros((1,), dtype=_DTYPES[dt][1]))
         m.__class__ = OffloadedSwitchGLU
         object.__setattr__(m, "_expert_store", store)
         done += 1
     if done:
-        logging.info(f"Experts on disk: {done} MoE layers, {share:.0%} of each layer's experts kept in memory")
+        logging.info(
+            f"Experts on disk: {done} MoE layers, {share:.0%} of each layer's experts kept in memory"
+        )
     else:
-        logging.warning("Experts on disk: no MoE layer found that can be read from the checkpoint")
+        logging.warning(
+            "Experts on disk: no MoE layer found that can be read from the checkpoint"
+        )
     return done

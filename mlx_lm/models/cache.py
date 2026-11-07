@@ -168,7 +168,10 @@ def quantized_head_dims(cache) -> tuple:
     and values (each ``(packed, scales, biases)``), () when it holds none."""
     if cache.keys is None:
         return ()
-    return (cache.keys[1].shape[-1] * cache.group_size, cache.values[1].shape[-1] * cache.group_size)
+    return (
+        cache.keys[1].shape[-1] * cache.group_size,
+        cache.values[1].shape[-1] * cache.group_size,
+    )
 
 
 def fit_group_size(group_size: int, *dims: int) -> int:
@@ -445,7 +448,9 @@ class KVCache(_BaseCache):
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         if self.keys is not None:
-            group_size = fit_group_size(group_size, self.keys.shape[-1], self.values.shape[-1])
+            group_size = fit_group_size(
+                group_size, self.keys.shape[-1], self.values.shape[-1]
+            )
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
         if self.keys is not None:
@@ -649,7 +654,9 @@ class RotatingKVCache(_RotatingKVCacheBase):
         self, group_size: int = 64, bits: int = 4
     ) -> "QuantizedRotatingKVCache":
         if self.keys is not None:
-            group_size = fit_group_size(group_size, self.keys.shape[-1], self.values.shape[-1])
+            group_size = fit_group_size(
+                group_size, self.keys.shape[-1], self.values.shape[-1]
+            )
         quant_cache = QuantizedRotatingKVCache(
             max_size=self.max_size,
             keep=self.keep,
@@ -702,7 +709,9 @@ class QuantizedRotatingKVCache(_RotatingKVCacheBase):
 
     def update_and_fetch(self, keys, values):
         if self.keys is None:
-            self.group_size = fit_group_size(self.group_size, keys.shape[-1], values.shape[-1])
+            self.group_size = fit_group_size(
+                self.group_size, keys.shape[-1], values.shape[-1]
+            )
         return super().update_and_fetch(keys, values)
 
     def _q_slice(self, q, start, stop):
@@ -917,8 +926,12 @@ class QuantizedRotatingKVCache(_RotatingKVCacheBase):
         cache.offset = self.offset
         cache._idx = self._idx
         if self.keys is not None:
-            cache.keys = mx.dequantize(*self.keys, group_size=self.group_size, bits=self.bits)
-            cache.values = mx.dequantize(*self.values, group_size=self.group_size, bits=self.bits)
+            cache.keys = mx.dequantize(
+                *self.keys, group_size=self.group_size, bits=self.bits
+            )
+            cache.values = mx.dequantize(
+                *self.values, group_size=self.group_size, bits=self.bits
+            )
         return cache
 
 
@@ -997,9 +1010,7 @@ class ArraysCache(_BaseCache):
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
-        cache.cache = [
-            None if c is None else c[idx : idx + 1] for c in self.cache
-        ]
+        cache.cache = [None if c is None else c[idx : idx + 1] for c in self.cache]
         return cache
 
     def prepare(self, lengths=None, **kwargs):
@@ -1433,9 +1444,13 @@ class BatchKVCache(_BaseCache):
             return 0
         return self.keys.nbytes + self.values.nbytes
 
-    def to_quantized(self, group_size: int = 64, bits: int = 8) -> "BatchQuantizedKVCache":
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 8
+    ) -> "BatchQuantizedKVCache":
         if self.keys is not None:
-            group_size = fit_group_size(group_size, self.keys.shape[-1], self.values.shape[-1])
+            group_size = fit_group_size(
+                group_size, self.keys.shape[-1], self.values.shape[-1]
+            )
         cache = BatchQuantizedKVCache([0], group_size=group_size, bits=bits)
         cache.left_padding = self.left_padding
         cache.offset = self.offset
@@ -1443,7 +1458,9 @@ class BatchKVCache(_BaseCache):
         cache._right_padding = self._right_padding
         if self.keys is not None:
             cache.keys = tuple(mx.quantize(self.keys, group_size=group_size, bits=bits))
-            cache.values = tuple(mx.quantize(self.values, group_size=group_size, bits=bits))
+            cache.values = tuple(
+                mx.quantize(self.values, group_size=group_size, bits=bits)
+            )
         return cache
 
 
@@ -1488,7 +1505,9 @@ class BatchQuantizedKVCache(_BaseCache):
         prev = self._idx
         n = keys.shape[2]
         if self.keys is None:
-            self.group_size = fit_group_size(self.group_size, keys.shape[-1], values.shape[-1])
+            self.group_size = fit_group_size(
+                self.group_size, keys.shape[-1], values.shape[-1]
+            )
         if self.keys is None or (prev + n) > self.keys[0].shape[2]:
             B, H, _, k_dim = keys.shape
             v_dim = values.shape[3]
@@ -1499,8 +1518,12 @@ class BatchQuantizedKVCache(_BaseCache):
                 if prev % self.step != 0:
                     self.keys = self._map(lambda x: x[..., :prev, :], self.keys)
                     self.values = self._map(lambda x: x[..., :prev, :], self.values)
-                self.keys = tuple(mx.concatenate([a, b], axis=2) for a, b in zip(self.keys, new_k))
-                self.values = tuple(mx.concatenate([a, b], axis=2) for a, b in zip(self.values, new_v))
+                self.keys = tuple(
+                    mx.concatenate([a, b], axis=2) for a, b in zip(self.keys, new_k)
+                )
+                self.values = tuple(
+                    mx.concatenate([a, b], axis=2) for a, b in zip(self.values, new_v)
+                )
             else:
                 self.keys, self.values = new_k, new_v
 
@@ -1546,13 +1569,29 @@ class BatchQuantizedKVCache(_BaseCache):
     def state(self):
         # The quantization rides along, as QuantizedKVCache's does: a saved
         # cache keeps the size fitted to its heads.
-        return self.keys, self.values, self.offset, self.left_padding, self._idx, self.group_size, self.bits
+        return (
+            self.keys,
+            self.values,
+            self.offset,
+            self.left_padding,
+            self._idx,
+            self.group_size,
+            self.bits,
+        )
 
     @state.setter
     def state(self, v):
         # Saved before the quantization rode along: the defaults.
-        self.keys, self.values, self.offset, self.left_padding, self._idx, self.group_size, self.bits = (
-            tuple(v) + (64, 8)[len(v) - 5:] if len(v) < 7 else v
+        (
+            self.keys,
+            self.values,
+            self.offset,
+            self.left_padding,
+            self._idx,
+            self.group_size,
+            self.bits,
+        ) = (
+            tuple(v) + (64, 8)[len(v) - 5 :] if len(v) < 7 else v
         )
         if not hasattr(self, "_right_padding"):
             self._right_padding = None
@@ -1591,7 +1630,9 @@ class BatchQuantizedKVCache(_BaseCache):
         # two filled ones must agree on it; this one takes a filled other's.
         both = self.keys is not None and other.keys is not None
         if other.bits != self.bits or (both and other.group_size != self.group_size):
-            raise ValueError("Can't extend a BatchQuantizedKVCache with other quantization")
+            raise ValueError(
+                "Can't extend a BatchQuantizedKVCache with other quantization"
+            )
         if self.keys is None and other.keys is not None:
             self.group_size = other.group_size
         if self.keys is None and other.keys is None:
@@ -1608,8 +1649,14 @@ class BatchQuantizedKVCache(_BaseCache):
             k, v = c.keys, c.values
             if k is None:
                 Bc = c.offset.shape[0]
-                k = tuple(mx.zeros((Bc, *x.shape[1:2], 0, x.shape[3]), dtype=x.dtype) for x in ref.keys)
-                v = tuple(mx.zeros((Bc, *x.shape[1:2], 0, x.shape[3]), dtype=x.dtype) for x in ref.values)
+                k = tuple(
+                    mx.zeros((Bc, *x.shape[1:2], 0, x.shape[3]), dtype=x.dtype)
+                    for x in ref.keys
+                )
+                v = tuple(
+                    mx.zeros((Bc, *x.shape[1:2], 0, x.shape[3]), dtype=x.dtype)
+                    for x in ref.values
+                )
             left = max_idx - c._idx
             right = max_size - k[0].shape[2] - left
             if right < 0:
@@ -1633,8 +1680,13 @@ class BatchQuantizedKVCache(_BaseCache):
         cache = QuantizedKVCache(group_size=self.group_size, bits=self.bits)
         mx.eval(self.left_padding)
         padding = self.left_padding.tolist()[idx]
-        cache.keys = self._map(lambda x: mx.contiguous(x[idx : idx + 1, :, padding : self._idx]), self.keys)
-        cache.values = self._map(lambda x: mx.contiguous(x[idx : idx + 1, :, padding : self._idx]), self.values)
+        cache.keys = self._map(
+            lambda x: mx.contiguous(x[idx : idx + 1, :, padding : self._idx]), self.keys
+        )
+        cache.values = self._map(
+            lambda x: mx.contiguous(x[idx : idx + 1, :, padding : self._idx]),
+            self.values,
+        )
         cache.offset = cache.keys[0].shape[2]
         return cache
 
@@ -1645,8 +1697,12 @@ class BatchQuantizedKVCache(_BaseCache):
         # Empty caches haven't fitted their group size to the heads yet.
         filled = [c for c in caches if c.keys is not None]
         group_size, bits = (filled or caches)[0].group_size, caches[0].bits
-        if any(c.group_size != group_size for c in filled) or any(c.bits != bits for c in caches):
-            raise ValueError("Can't merge QuantizedKVCaches with different quantization")
+        if any(c.group_size != group_size for c in filled) or any(
+            c.bits != bits for c in caches
+        ):
+            raise ValueError(
+                "Can't merge QuantizedKVCaches with different quantization"
+            )
         lengths = [c.offset if c.keys is not None else 0 for c in caches]
         max_length = max(lengths)
         if max_length == 0:
@@ -1655,14 +1711,22 @@ class BatchQuantizedKVCache(_BaseCache):
         padding = [max_length - l for l in lengths]
         B = len(caches)
         ref = next(c for c in caches if c.keys is not None)
-        keys = tuple(mx.zeros((B, x.shape[1], max_length, x.shape[3]), dtype=x.dtype) for x in ref.keys)
-        values = tuple(mx.zeros((B, x.shape[1], max_length, x.shape[3]), dtype=x.dtype) for x in ref.values)
+        keys = tuple(
+            mx.zeros((B, x.shape[1], max_length, x.shape[3]), dtype=x.dtype)
+            for x in ref.keys
+        )
+        values = tuple(
+            mx.zeros((B, x.shape[1], max_length, x.shape[3]), dtype=x.dtype)
+            for x in ref.values
+        )
         for i, (p, c) in enumerate(zip(padding, caches)):
             if c.keys is None or c.offset == 0:
                 continue
             for j in range(3):
                 keys[j][i : i + 1, :, p : p + c.offset] = c.keys[j][..., : c.offset, :]
-                values[j][i : i + 1, :, p : p + c.offset] = c.values[j][..., : c.offset, :]
+                values[j][i : i + 1, :, p : p + c.offset] = c.values[j][
+                    ..., : c.offset, :
+                ]
 
         cache = cls(padding, group_size=group_size, bits=bits)
         cache.keys = keys

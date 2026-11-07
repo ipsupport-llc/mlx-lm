@@ -723,16 +723,22 @@ def gated_delta_chunkwise(
         beta_c, gamma_c, ratio_c = beta[:, :, c], gammas[:, :, c], ratios[:, :, c]
         k_t = mx.swapaxes(k_c, -1, -2)
 
-        system = eye + mx.where(strict, beta_c[..., :, None] * (k_c @ k_t) * ratio_c, 0.0)
+        system = eye + mx.where(
+            strict, beta_c[..., :, None] * (k_c @ k_t) * ratio_c, 0.0
+        )
         u = _unit_tri_inv(system) @ (
-            beta_c[..., None] * (v_c - gamma_c[..., None] * (k_c @ mx.swapaxes(s, -1, -2)))
+            beta_c[..., None]
+            * (v_c - gamma_c[..., None] * (k_c @ mx.swapaxes(s, -1, -2)))
         )
 
         attn = mx.where(causal, (q_c @ k_t) * ratio_c, 0.0)
         ys.append(gamma_c[..., None] * (q_c @ mx.swapaxes(s, -1, -2)) + attn @ u)
 
         tail = ratio_c[..., -1, :]  # G_C / G_i
-        s = gamma_c[..., -1, None, None] * s + mx.swapaxes(tail[..., None] * u, -1, -2) @ k_c
+        s = (
+            gamma_c[..., -1, None, None] * s
+            + mx.swapaxes(tail[..., None] * u, -1, -2) @ k_c
+        )
 
     y = mx.stack(ys, axis=2).reshape(B, Hv, T_pad, Dv)
     if pad:

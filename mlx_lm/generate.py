@@ -317,6 +317,7 @@ class PrefillBudget:
     min_step: int = MIN_PREFILL_STEP
     score_bytes: int = DEFAULT_PREFILL_SCORE_BYTES
 
+
 # Head dims mx.fast.scaled_dot_product_attention runs fused (no scores array)
 # for a prefill chunk (query length > 8), MLX 0.32. 192 and 256 are sent to
 # the unfused path in most cases.
@@ -415,9 +416,7 @@ def make_prefill_step(
 
 
 def _cache_offset(cache) -> int:
-    return next(
-        (c.offset for c in cache if getattr(c, "offset", None) is not None), 0
-    )
+    return next((c.offset for c in cache if getattr(c, "offset", None) is not None), 0)
 
 
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
@@ -576,7 +575,11 @@ def generate_step(
             n_to_process = min(step, remaining)
             if chunk_size is not None:
                 n_to_process = max(
-                    1, min(chunk_size(cached + prompt_processed_tokens, n_to_process), remaining)
+                    1,
+                    min(
+                        chunk_size(cached + prompt_processed_tokens, n_to_process),
+                        remaining,
+                    ),
                 )
             processed = prompt[:n_to_process]
             _model_call(
@@ -1045,6 +1048,7 @@ def nemotron_h_mtp_generate_step(
                 quantize_cache_fn(model_cache)
                 mx.eval([c.state for c in model_cache if c is not None])
 
+
 def _mtp_language_model(model: nn.Module) -> Optional[nn.Module]:
     """The language model whose MTP head mtp_generate_step drafts with
     (Qwen3.5 / 3.5-MoE, a VL checkpoint's or a text-only one), or None."""
@@ -1203,7 +1207,9 @@ def mtp_generate_step(
         if rows_together or logprobs.ndim == 1 or logprobs.shape[0] == 1:
             return sampler(logprobs), logprobs
         return (
-            mx.concatenate([sampler(logprobs[i : i + 1]) for i in range(logprobs.shape[0])]),
+            mx.concatenate(
+                [sampler(logprobs[i : i + 1]) for i in range(logprobs.shape[0])]
+            ),
             logprobs,
         )
 
@@ -1241,7 +1247,9 @@ def mtp_generate_step(
             n = min(step, total - done - 1)
             h = lm.backbone(prompt[done : done + n][None], cache=cache)
             quantize_cache_fn(cache)
-            hs = h[:, :-1] if prev is None else mx.concatenate([prev, h[:, :-1]], axis=1)
+            hs = (
+                h[:, :-1] if prev is None else mx.concatenate([prev, h[:, :-1]], axis=1)
+            )
             _feed_head(hs, prompt[done + (prev is None) : done + n][None])
             prev = h[:, -1:]
             mx.eval([c.state for c in cache] + [c.state for c in mtp_cache])
@@ -1296,7 +1304,9 @@ def mtp_generate_step(
                         else:
                             # In float32: the ratios and the residual need it.
                             last = logits[:, -1, :].astype(mx.float32)
-                            q = distribution(last - mx.logsumexp(last, axis=-1, keepdims=True))
+                            q = distribution(
+                                last - mx.logsumexp(last, axis=-1, keepdims=True)
+                            )
                             draft_q.append(q)
                             d = mx.random.categorical(q).reshape(1, 1)
                         drafts.append(d)
@@ -1329,14 +1339,17 @@ def mtp_generate_step(
                     q = mx.concatenate(draft_q, axis=0)
                     idx = draft_ids[:, None].astype(mx.int32)
                     log_ratio = (
-                        mx.take_along_axis(p, idx, axis=-1) - mx.take_along_axis(q, idx, axis=-1)
+                        mx.take_along_axis(p, idx, axis=-1)
+                        - mx.take_along_axis(q, idx, axis=-1)
                     )[:, 0]
                     accept = mx.log(mx.random.uniform(shape=(k,))) < log_ratio
                     # Where a draft is rejected the token comes from max(0, p - q).
                     residual = mx.maximum(mx.exp(p) - mx.exp(q), 0)
                     # No residual mass left (rounding): p itself.
                     empty = residual.sum(axis=-1, keepdims=True) <= 0
-                    replace = mx.random.categorical(mx.where(empty, p, mx.log(residual)))
+                    replace = mx.random.categorical(
+                        mx.where(empty, p, mx.log(residual))
+                    )
                     mx.eval(toks, lps, draft_ids, accept, replace)
                 else:
                     mx.eval(toks, lps, draft_ids)
@@ -1659,6 +1672,7 @@ def gemma4_mtp_generate_step(
                     quantize_cache_fn(cache)
                     mx.eval([c.state for c in cache])
 
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -1949,10 +1963,15 @@ def _batch_layers(cache, kv_bits, kv_group_size):
         elif isinstance(layer, QuantizedKVCache):
             if kv_bits is None:
                 layer = layer.to_unquantized()
-            elif (layer.group_size, layer.bits) != (fit_group_size(kv_group_size, *quantized_head_dims(layer)), kv_bits):
+            elif (layer.group_size, layer.bits) != (
+                fit_group_size(kv_group_size, *quantized_head_dims(layer)),
+                kv_bits,
+            ):
                 # Not what the batch quantizes to (its size fitted to these
                 # heads, as the layer's was): quantized again.
-                layer = layer.to_unquantized().to_quantized(group_size=kv_group_size, bits=kv_bits)
+                layer = layer.to_unquantized().to_quantized(
+                    group_size=kv_group_size, bits=kv_bits
+                )
         elif isinstance(layer, QuantizedRotatingKVCache):
             layer = layer.to_unquantized()
         out.append(layer)
@@ -2205,7 +2224,9 @@ def make_text_state_machine(tokenizer, stop_words=None):
         # A response format that goes to "tool" decides where calls start.
         targets = {dst for edges in response_transitions.values() for _, dst in edges}
         if "tool" not in targets:
-            transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
+            transitions.setdefault("normal", []).append(
+                (tokenizer.tool_call_start, "tool")
+            )
         if tokenizer.has_thinking:
             transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
         transitions["tool"] = (
@@ -3247,7 +3268,12 @@ def main():
                 raise ValueError(
                     "--kv-bits does not match the kv cache loaded from --prompt-cache-file."
                 )
-            if fit_group_size(args.kv_group_size, *quantized_head_dims(prompt_cache[0])) != prompt_cache[0].group_size:
+            if (
+                fit_group_size(
+                    args.kv_group_size, *quantized_head_dims(prompt_cache[0])
+                )
+                != prompt_cache[0].group_size
+            ):
                 raise ValueError(
                     "--kv-group-size does not match the kv cache loaded from --prompt-cache-file."
                 )

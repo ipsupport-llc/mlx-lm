@@ -289,8 +289,12 @@ class TestMuseGlimmerAnswerFormat(unittest.TestCase):
         from mlx_lm.utils import _tokenizer_defaults
 
         with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "config.json").write_text(json.dumps({"model_type": "muse_glimmer"}))
-            self.assertEqual(_tokenizer_defaults(Path(d))["chat_template_type"], "muse_spark")
+            (Path(d) / "config.json").write_text(
+                json.dumps({"model_type": "muse_glimmer"})
+            )
+            self.assertEqual(
+                _tokenizer_defaults(Path(d))["chat_template_type"], "muse_spark"
+            )
 
 
 if __name__ == "__main__":

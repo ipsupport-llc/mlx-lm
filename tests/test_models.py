@@ -42,6 +42,7 @@ class TestModels(unittest.TestCase):
         device = mx.default_device()
         mx.set_default_device(mx.cpu)
         self.addCleanup(mx.set_default_device, device)
+
     def test_kv_cache(self):
         cache = KVCache()
 
@@ -172,7 +173,7 @@ class TestModels(unittest.TestCase):
         self.assertEqual(cache.offset, 1)
 
         # Fill up to max_size
-        for i in range(7):
+        for _ in range(7):
             k = mx.random.normal(shape=(b, h, 1, d))
             v = mx.random.normal(shape=(b, h, 1, d))
             qk, qv = cache.update_and_fetch(k, v)
@@ -2414,7 +2415,10 @@ class TestModels(unittest.TestCase):
                     "mm_posemb_size": 4,
                     "output_proj_dims": 6,
                 },
-                "audio_config": {"model_type": "gemma4_unified_audio", "audio_embed_dim": 5},
+                "audio_config": {
+                    "model_type": "gemma4_unified_audio",
+                    "audio_embed_dim": 5,
+                },
             }
         )
         return gemma4.Model(args)
@@ -2476,8 +2480,12 @@ class TestModels(unittest.TestCase):
         # A conversion that dropped the media weights (an mlx-lm that loaded
         # the 12B text-only): it still loads, without vision and audio.
         model = self._gemma4_unified_model()
-        kept = model.sanitize({"language_model.model.layers.0.input_layernorm.weight": mx.ones((4,))})
-        self.assertEqual(list(kept), ["language_model.model.layers.0.input_layernorm.weight"])
+        kept = model.sanitize(
+            {"language_model.model.layers.0.input_layernorm.weight": mx.ones((4,))}
+        )
+        self.assertEqual(
+            list(kept), ["language_model.model.layers.0.input_layernorm.weight"]
+        )
         self.assertIsNone(model.vision_embedder)
         self.assertIsNone(model.embed_vision)
         self.assertIsNone(model.embed_audio)
@@ -2489,14 +2497,20 @@ class TestModels(unittest.TestCase):
         positions = mx.array([[[0, 0], [1, 0], [-1, -1]]])
         frames = mx.random.uniform(shape=(1, 3, 5))
         ids = mx.array([[1, 30, 30, 2, 31, 31, 31, 3]])
-        fused, _ = model._fuse_multimodal_inputs(ids, pixels, positions, frames, mx.ones((1, 3), dtype=mx.bool_))
+        fused, _ = model._fuse_multimodal_inputs(
+            ids, pixels, positions, frames, mx.ones((1, 3), dtype=mx.bool_)
+        )
         scale = model.language_model.model.embed_scale
         h, valid = model.vision_embedder(pixels, positions)
         self.assertEqual(valid.tolist(), [[True, True, False]])
         image = model.embed_vision(h)[0, :2] / scale
         audio = model.embed_audio(frames)[0] / scale
-        self.assertTrue(mx.allclose(fused[0, 1:3], image.astype(fused.dtype), atol=1e-5))
-        self.assertTrue(mx.allclose(fused[0, 4:7], audio.astype(fused.dtype), atol=1e-5))
+        self.assertTrue(
+            mx.allclose(fused[0, 1:3], image.astype(fused.dtype), atol=1e-5)
+        )
+        self.assertTrue(
+            mx.allclose(fused[0, 4:7], audio.astype(fused.dtype), atol=1e-5)
+        )
         text = model.language_model.model.embed_tokens(mx.array([1, 2, 3]))
         self.assertTrue(mx.allclose(fused[0, mx.array([0, 3, 7])], text))
 
@@ -2512,24 +2526,39 @@ class TestModels(unittest.TestCase):
         def hf(img, p=16, k=3):
             C, H, W = img.shape
             ph, pw = H // p, W // p
-            t = img.reshape(C, ph, p, pw, p).transpose(1, 3, 2, 4, 0).reshape(ph * pw, -1)
+            t = (
+                img.reshape(C, ph, p, pw, p)
+                .transpose(1, 3, 2, 4, 0)
+                .reshape(ph * pw, -1)
+            )
             gx, gy = np.meshgrid(np.arange(pw), np.arange(ph), indexing="xy")
             pos = np.stack([gx, gy], -1).reshape(-1, 2)
             L, max_x = len(t) // (k * k), pos[:, 0].max() + 1
             kid, win = pos // k, pos % k
-            order = win[:, 0] + win[:, 1] * k + k * k * kid[:, 0] + k * max_x * kid[:, 1]
+            order = (
+                win[:, 0] + win[:, 1] * k + k * k * kid[:, 0] + k * max_x * kid[:, 1]
+            )
             perm = np.argsort(order, kind="stable")
-            merged = t[perm].reshape(L, k, k, p, p, 3).transpose(0, 1, 3, 2, 4, 5).reshape(L, -1)
+            merged = (
+                t[perm]
+                .reshape(L, k, k, p, p, 3)
+                .transpose(0, 1, 3, 2, 4, 5)
+                .reshape(L, -1)
+            )
             return merged, (pos[perm].reshape(L, k * k, 2) // k).min(1)
 
-        proc = UnifiedImageProcessor(patch_size=16, max_soft_tokens=280, pooling_kernel_size=3)
+        proc = UnifiedImageProcessor(
+            patch_size=16, max_soft_tokens=280, pooling_kernel_size=3
+        )
         rng = np.random.default_rng(0)
         for size in ((480, 640), (1000, 300), (37, 900)):
             image = Image.fromarray(rng.integers(0, 256, (*size, 3), dtype=np.uint8))
             out = proc([image])
             n = out["num_soft_tokens_per_image"][0]
             h, w = proc.size(*size)
-            ref = np.asarray(image.resize((w, h), Image.BICUBIC), dtype=np.float32) / 255
+            ref = (
+                np.asarray(image.resize((w, h), Image.BICUBIC), dtype=np.float32) / 255
+            )
             patches, positions = hf(ref.transpose(2, 0, 1))
             np.testing.assert_allclose(out["pixel_values"][0, :n], patches, atol=1e-6)
             np.testing.assert_array_equal(out["image_position_ids"][0, :n], positions)
@@ -4042,7 +4071,6 @@ class TestModels(unittest.TestCase):
             self.assertEqual(last_row & real_sinks, real_sinks)
 
     def test_deepseek_v4_rope_inverse(self):
-        import math as _math
 
         from mlx_lm.models.deepseek_v4 import DeepseekV4RoPE
 
@@ -4068,9 +4096,7 @@ class TestModels(unittest.TestCase):
         mixes = mx.random.normal(shape=(n, mix_hc))
         hc_scale = mx.ones((3,)) * 0.1
         hc_base = mx.zeros((mix_hc,))
-        _pre, _post, comb = hc_split_sinkhorn(
-            mixes, hc_scale, hc_base, hc, 20, 1e-6
-        )
+        _pre, _post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, hc, 20, 1e-6)
         row_sums = comb.sum(axis=-1)
         col_sums = comb.sum(axis=-2)
         self.assertTrue(mx.all(mx.abs(row_sums - 1.0) < 1e-3))
@@ -4119,6 +4145,7 @@ class TestModels(unittest.TestCase):
 
         caches = model.make_cache()
         from mlx_lm.models.cache import ArraysCache, CacheList
+
         self.assertIsInstance(caches[0], RotatingKVCache)
         self.assertIsInstance(caches[1], RotatingKVCache)
         self.assertIsInstance(caches[2], CacheList)
@@ -4292,7 +4319,7 @@ class TestModels(unittest.TestCase):
             head_dim=16,
             rms_norm_eps=1e-4,
             vocab_size=128,
-            num_key_value_heads=4,   # repeats == 2
+            num_key_value_heads=4,  # repeats == 2
         )
         model = gemma2.Model(args)
         mx.eval(model.parameters())
@@ -4303,17 +4330,19 @@ class TestModels(unittest.TestCase):
         B, L = len(left_padding), 6
         tokens = mx.broadcast_to(mx.arange(1, L + 1, dtype=mx.int32), (B, L))
 
-        batched = model(tokens, cache=[
-            BatchKVCache(left_padding) for _ in range(args.num_hidden_layers)
-        ])
+        batched = model(
+            tokens,
+            cache=[BatchKVCache(left_padding) for _ in range(args.num_hidden_layers)],
+        )
         mx.eval(batched)
         self.assertEqual(batched.shape, (B, L, args.vocab_size))
 
         # Each row on its own, with its padding dropped, is the reference.
         for i, pad in enumerate(left_padding):
-            ref = model(tokens[i : i + 1, pad:], cache=[
-                KVCache() for _ in range(args.num_hidden_layers)
-            ])
+            ref = model(
+                tokens[i : i + 1, pad:],
+                cache=[KVCache() for _ in range(args.num_hidden_layers)],
+            )
             mx.eval(ref)
             self.assertTrue(
                 mx.allclose(batched[i, pad:], ref[0], atol=1e-4),

@@ -29,7 +29,6 @@ class TestGenerate(unittest.TestCase):
         cls.model, cls.tokenizer = load(cls.HF_MODEL_PATH)
         cls.model.set_dtype(mx.float32)
 
-
     def assertLogprobsClose(self, a, b):
         """Batched vs unbatched log-probabilities: the same top token, and
         within a few float16 ulps of each other. A batch's matmuls have
@@ -56,6 +55,7 @@ class TestGenerate(unittest.TestCase):
 
         self.addCleanup(restore)
         self.model.make_cache = make_cache
+
     def test_generate(self):
         # Simple test that generation runs
         generate(self.model, self.tokenizer, "hello", max_tokens=5, verbose=False)
@@ -409,9 +409,9 @@ class TestGenerate(unittest.TestCase):
             for p in prompts
         ]
 
-        self._patch_make_cache(lambda: [
-            RotatingKVCache(max_size=4) for _ in self.model.layers
-        ])
+        self._patch_make_cache(
+            lambda: [RotatingKVCache(max_size=4) for _ in self.model.layers]
+        )
         batch_gen = BatchGenerator(
             self.model,
             stop_tokens=self.tokenizer.eos_token_ids,
@@ -650,9 +650,9 @@ class TestGenerate(unittest.TestCase):
     def test_batch_continued_generation(self):
         for rotating in [False, True]:
             if rotating:
-                self._patch_make_cache(lambda: [
-                    RotatingKVCache(max_size=4) for _ in self.model.layers
-                ])
+                self._patch_make_cache(
+                    lambda: [RotatingKVCache(max_size=4) for _ in self.model.layers]
+                )
 
             # Make the prompts
             prompts_a = [
@@ -845,23 +845,51 @@ class TestGenerate(unittest.TestCase):
         cpu = self._on_cpu()
         random.seed(1)
         mx.random.seed(4)
-        model = qwen3_next.Model(qwen3_next.ModelArgs(
-            model_type="qwen3_next", hidden_size=128, num_hidden_layers=4, intermediate_size=128,
-            num_attention_heads=8, num_key_value_heads=4, vocab_size=1000, linear_num_value_heads=4,
-            linear_num_key_heads=4, linear_key_head_dim=32, linear_value_head_dim=32, linear_conv_kernel_dim=3,
-            num_experts=4, num_experts_per_tok=2, decoder_sparse_step=1, shared_expert_intermediate_size=128,
-            mlp_only_layers=[0], moe_intermediate_size=128, rms_norm_eps=1e-5, head_dim=64, rope_theta=1000.0,
-            partial_rotary_factor=0.5, max_position_embeddings=1000,
-        ))
+        model = qwen3_next.Model(
+            qwen3_next.ModelArgs(
+                model_type="qwen3_next",
+                hidden_size=128,
+                num_hidden_layers=4,
+                intermediate_size=128,
+                num_attention_heads=8,
+                num_key_value_heads=4,
+                vocab_size=1000,
+                linear_num_value_heads=4,
+                linear_num_key_heads=4,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=3,
+                num_experts=4,
+                num_experts_per_tok=2,
+                decoder_sparse_step=1,
+                shared_expert_intermediate_size=128,
+                mlp_only_layers=[0],
+                moe_intermediate_size=128,
+                rms_norm_eps=1e-5,
+                head_dim=64,
+                rope_theta=1000.0,
+                partial_rotary_factor=0.5,
+                max_position_embeddings=1000,
+            )
+        )
         prompts = [[random.randint(0, 999) for _ in range(n)] for n in (8, 2, 5)]
-        gen = BatchGenerator(model, stream=cpu, stop_tokens={}, max_tokens=1, prefill_batch_size=4, completion_batch_size=4)
+        gen = BatchGenerator(
+            model,
+            stream=cpu,
+            stop_tokens={},
+            max_tokens=1,
+            prefill_batch_size=4,
+            completion_batch_size=4,
+        )
         uids = gen.insert(prompts)
         got = {}
         while responses := gen.next_generated():
             for r in responses:
                 got[r.uid] = r.logprobs
         for uid, prompt in zip(uids, prompts):
-            (_, single), = list(generate_step(mx.array(prompt), model, max_tokens=1, stream=cpu))
+            ((_, single),) = list(
+                generate_step(mx.array(prompt), model, max_tokens=1, stream=cpu)
+            )
             self.assertLess(mx.abs(got[uid] - single).max().item(), 1e-4)
 
     def test_batch_continued_generation_gated_delta(self):
@@ -1216,9 +1244,7 @@ class TestBatchGeneratorTeardown(unittest.TestCase):
         gen._old_wired_limit = 4096
         with patch(
             "mlx_lm.generate.mx.synchronize",
-            side_effect=RuntimeError(
-                "There is no Stream(gpu, 3) in current thread"
-            ),
+            side_effect=RuntimeError("There is no Stream(gpu, 3) in current thread"),
         ):
             gen.close()
         self.assertIsNone(gen._old_wired_limit)
@@ -1231,9 +1257,7 @@ class TestBatchGeneratorTeardown(unittest.TestCase):
         gen._old_wired_limit = 4096
         with patch(
             "mlx_lm.generate.mx.synchronize",
-            side_effect=RuntimeError(
-                "There is no Stream(gpu, 3) in current thread"
-            ),
+            side_effect=RuntimeError("There is no Stream(gpu, 3) in current thread"),
         ):
             gen.__del__()
         self.assertIsNone(gen._old_wired_limit)

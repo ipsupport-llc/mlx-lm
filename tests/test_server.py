@@ -4,9 +4,9 @@ import http
 import http.client
 import io
 import json
+import sys
 import tempfile
 import threading
-import sys
 import time
 import types
 import unittest
@@ -35,11 +35,11 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 from mlx_lm.server import (
-    Response,
     APIHandler,
     GenerationContext,
     LogitsProcessorArguments,
     LRUPromptCache,
+    Response,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
@@ -400,7 +400,12 @@ class TestToolCallFormatter(unittest.TestCase):
 
 def _complete(port, prompt, max_tokens=8):
     url = f"http://localhost:{port}/v1/completions"
-    body = {"model": "default_model", "prompt": prompt, "max_tokens": max_tokens, "temperature": 0.0}
+    body = {
+        "model": "default_model",
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+    }
     response = requests.post(url, json=body)
     return response.status_code, json.loads(response.text)
 
@@ -505,33 +510,67 @@ class TestServer(unittest.TestCase):
         # answer goes on as a new request of the prompt, the tokens so far
         # and the close -- not a logits processor, which would turn off
         # MTP and speculative decoding.
-        sm = TextStateMachine({"normal": [("<think>", "reasoning")], "reasoning": [("</think>", "normal")]})
+        sm = TextStateMachine(
+            {
+                "normal": [("<think>", "reasoning")],
+                "reasoning": [("</think>", "normal")],
+            }
+        )
+
         def ctx(prompt):
-            return GenerationContext(has_tool_calling=False, has_thinking=True, tool_parser=None,
-                                     text_sm=sm, initial_state="reasoning", prompt=prompt,
-                                     model_key=self.response_generator.model_provider.model_key)
+            return GenerationContext(
+                has_tool_calling=False,
+                has_thinking=True,
+                tool_parser=None,
+                text_sm=sm,
+                initial_state="reasoning",
+                prompt=prompt,
+                model_key=self.response_generator.model_provider.model_key,
+            )
+
         def gen(text, token, finish=None):
-            return types.SimpleNamespace(text=text, token=token, logprob=0.0, finish_reason=finish, top_tokens=())
+            return types.SimpleNamespace(
+                text=text, token=token, logprob=0.0, finish_reason=finish, top_tokens=()
+            )
+
         thinking = [gen(" step", 10 + i) for i in range(50)]
         answer = [gen("Answer", 40), gen("", 41, "stop")]
         first = ctx([1, 2, 3])
         calls = []
+
         def fake_generate(request, args, progress_callback=None):
             calls.append((request, args))
-            return (first, iter(thinking)) if len(calls) == 1 else (ctx(request.prompt_tokens), iter(answer))
-        tokenizer = types.SimpleNamespace(has_thinking=True, think_end="</think>",
-                                          encode=lambda s, add_special_tokens=False: [7, 8])
-        with mock.patch.object(self.response_generator, "generate", side_effect=fake_generate), \
-                mock.patch.object(self.response_generator.model_provider, "tokenizer", tokenizer):
+            return (
+                (first, iter(thinking))
+                if len(calls) == 1
+                else (ctx(request.prompt_tokens), iter(answer))
+            )
+
+        tokenizer = types.SimpleNamespace(
+            has_thinking=True,
+            think_end="</think>",
+            encode=lambda s, add_special_tokens=False: [7, 8],
+        )
+        with mock.patch.object(
+            self.response_generator, "generate", side_effect=fake_generate
+        ), mock.patch.object(
+            self.response_generator.model_provider, "tokenizer", tokenizer
+        ):
             response = requests.post(
                 f"http://localhost:{self.port}/v1/chat/completions",
-                json={"model": "default_model", "messages": [{"role": "user", "content": "hi"}],
-                      "thinking_budget": 3, "max_tokens": 100},
+                json={
+                    "model": "default_model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "thinking_budget": 3,
+                    "max_tokens": 100,
+                },
             )
         self.assertEqual(response.status_code, 200, response.text)
         message = response.json()["choices"][0]["message"]
         self.assertEqual(message["content"].strip(), "Answer")
-        self.assertEqual(message["reasoning"], " step step step\n\nI have to answer now.\n")
+        self.assertEqual(
+            message["reasoning"], " step step step\n\nI have to answer now.\n"
+        )
         self.assertEqual(len(calls), 2)
         carried, args = calls[1]
         self.assertEqual(carried.prompt_tokens, [1, 2, 3, 10, 11, 12, 7, 8])
@@ -541,27 +580,62 @@ class TestServer(unittest.TestCase):
         self.assertEqual(response.json()["usage"]["prompt_tokens"], 3)
 
     def _budget_run(self, thinking, budget, max_tokens=100, answer=None):
-        sm = TextStateMachine({"normal": [("<think>", "reasoning")], "reasoning": [("</think>", "normal")]})
+        sm = TextStateMachine(
+            {
+                "normal": [("<think>", "reasoning")],
+                "reasoning": [("</think>", "normal")],
+            }
+        )
+
         def ctx(prompt):
-            return GenerationContext(has_tool_calling=False, has_thinking=True, tool_parser=None,
-                                     text_sm=sm, initial_state="reasoning", prompt=prompt,
-                                     model_key=self.response_generator.model_provider.model_key)
+            return GenerationContext(
+                has_tool_calling=False,
+                has_thinking=True,
+                tool_parser=None,
+                text_sm=sm,
+                initial_state="reasoning",
+                prompt=prompt,
+                model_key=self.response_generator.model_provider.model_key,
+            )
+
         def gen(text, token, finish=None):
-            return types.SimpleNamespace(text=text, token=token, logprob=0.0, finish_reason=finish, top_tokens=())
-        gens = [gen(t, 10 + i) if isinstance(t, str) else gen(t[0], 10 + i, t[1]) for i, t in enumerate(thinking)]
+            return types.SimpleNamespace(
+                text=text, token=token, logprob=0.0, finish_reason=finish, top_tokens=()
+            )
+
+        gens = [
+            gen(t, 10 + i) if isinstance(t, str) else gen(t[0], 10 + i, t[1])
+            for i, t in enumerate(thinking)
+        ]
         answer = answer or [gen("Answer", 40), gen("", 41, "stop")]
         calls = []
+
         def fake_generate(request, args, progress_callback=None):
             calls.append((request, args))
-            return (ctx([1, 2, 3]), iter(gens)) if len(calls) == 1 else (ctx(request.prompt_tokens), iter(answer))
-        tokenizer = types.SimpleNamespace(has_thinking=True, think_end="</think>",
-                                          encode=lambda s, add_special_tokens=False: [7, 8])
-        with mock.patch.object(self.response_generator, "generate", side_effect=fake_generate), \
-                mock.patch.object(self.response_generator.model_provider, "tokenizer", tokenizer):
+            return (
+                (ctx([1, 2, 3]), iter(gens))
+                if len(calls) == 1
+                else (ctx(request.prompt_tokens), iter(answer))
+            )
+
+        tokenizer = types.SimpleNamespace(
+            has_thinking=True,
+            think_end="</think>",
+            encode=lambda s, add_special_tokens=False: [7, 8],
+        )
+        with mock.patch.object(
+            self.response_generator, "generate", side_effect=fake_generate
+        ), mock.patch.object(
+            self.response_generator.model_provider, "tokenizer", tokenizer
+        ):
             response = requests.post(
                 f"http://localhost:{self.port}/v1/chat/completions",
-                json={"model": "default_model", "messages": [{"role": "user", "content": "hi"}],
-                      "thinking_budget": budget, "max_tokens": max_tokens},
+                json={
+                    "model": "default_model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "thinking_budget": budget,
+                    "max_tokens": max_tokens,
+                },
             )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json(), calls
@@ -569,7 +643,9 @@ class TestServer(unittest.TestCase):
     def test_thinking_budget_edges(self):
         # Zero: closed before any reasoning token.
         out, calls = self._budget_run([" a", " b"], 0)
-        self.assertEqual(out["choices"][0]["message"]["reasoning"], "\n\nI have to answer now.\n")
+        self.assertEqual(
+            out["choices"][0]["message"]["reasoning"], "\n\nI have to answer now.\n"
+        )
         self.assertEqual(calls[1][0].prompt_tokens, [1, 2, 3, 7, 8])
         # The close uses what max_tokens leaves: the answer ends there.
         out, calls = self._budget_run([" a", " b", " c"], 2, max_tokens=4)
@@ -594,7 +670,11 @@ class TestServer(unittest.TestCase):
         for bad in (-1, "2", 1.5, True):
             response = requests.post(
                 f"http://localhost:{self.port}/v1/chat/completions",
-                json={"model": "default_model", "messages": [{"role": "user", "content": "hi"}], "thinking_budget": bad},
+                json={
+                    "model": "default_model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "thinking_budget": bad,
+                },
             )
             self.assertEqual(response.status_code, 400, bad)
 
@@ -602,7 +682,9 @@ class TestServer(unittest.TestCase):
         # The log says what the model wrote, not only that it failed.
         formatter = ToolCallFormatter(pythonic.parse_tool_call, None, False)
         with self.assertLogs(level="WARNING") as logs:
-            self.assertEqual(formatter(['{"name": "get_time"} and much more' + "x" * 400]), [])
+            self.assertEqual(
+                formatter(['{"name": "get_time"} and much more' + "x" * 400]), []
+            )
         line = logs.output[0]
         self.assertIn('the model wrote: "{\\"name\\": \\"get_time\\"}', line)
         self.assertIn(" … ", line, "a long one is cut in the middle")
@@ -620,14 +702,22 @@ class TestServer(unittest.TestCase):
         )
         gens = [
             types.SimpleNamespace(
-                text=t, token=i, logprob=0.0, finish_reason=None, top_tokens=(),
+                text=t,
+                token=i,
+                logprob=0.0,
+                finish_reason=None,
+                top_tokens=(),
                 from_draft=d,
             )
             for i, (t, d) in enumerate([("a", False), ("b", True), ("c", True)])
         ]
         gens.append(
             types.SimpleNamespace(
-                text="", token=99, logprob=0.0, finish_reason="stop", top_tokens=(),
+                text="",
+                token=99,
+                logprob=0.0,
+                finish_reason="stop",
+                top_tokens=(),
                 from_draft=False,
             )
         )
@@ -635,8 +725,9 @@ class TestServer(unittest.TestCase):
         clock = iter([10.0, 12.0, 13.0, 14.0, 15.5])
         with mock.patch.object(
             self.response_generator, "generate", return_value=(ctx, iter(gens))
-        ), mock.patch("mlx_lm.server._now", lambda: next(clock)), \
-                self.assertLogs(level="INFO") as logs:
+        ), mock.patch("mlx_lm.server._now", lambda: next(clock)), self.assertLogs(
+            level="INFO"
+        ) as logs:
             response = requests.post(
                 f"http://localhost:{self.port}/v1/chat/completions",
                 json={
@@ -654,18 +745,36 @@ class TestServer(unittest.TestCase):
 
     def test_request_stats_name_the_client(self):
         ctx = GenerationContext(
-            has_tool_calling=False, has_thinking=False, tool_parser=None,
-            text_sm=TextStateMachine({}), initial_state="normal", prompt=[1], prompt_cache_count=0,
+            has_tool_calling=False,
+            has_thinking=False,
+            tool_parser=None,
+            text_sm=TextStateMachine({}),
+            initial_state="normal",
+            prompt=[1],
+            prompt_cache_count=0,
         )
-        gens = [types.SimpleNamespace(text="a", token=1, logprob=0.0, finish_reason="stop", top_tokens=(),
-                                      from_draft=False, made_at=11.0)]
+        gens = [
+            types.SimpleNamespace(
+                text="a",
+                token=1,
+                logprob=0.0,
+                finish_reason="stop",
+                top_tokens=(),
+                from_draft=False,
+                made_at=11.0,
+            )
+        ]
         with mock.patch.object(
             self.response_generator, "generate", return_value=(ctx, iter(gens))
         ), self.assertLogs(level="INFO") as logs:
             requests.post(
                 f"http://localhost:{self.port}/v1/chat/completions",
                 headers={"X-LLMTray-Client": "Claude Code; rm"},
-                json={"model": "default_model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                json={
+                    "model": "default_model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
             )
         line = next(l for l in logs.output if "Request stats:" in l)
         self.assertTrue(line.endswith(" client=Claude Code rm"), line)
@@ -683,22 +792,41 @@ class TestServer(unittest.TestCase):
         # A slow client doesn't stretch the decode time: tokens carry when
         # the generation thread made them.
         ctx = GenerationContext(
-            has_tool_calling=False, has_thinking=False, tool_parser=None,
-            text_sm=TextStateMachine({}), initial_state="normal", prompt=[1, 2], prompt_cache_count=0,
+            has_tool_calling=False,
+            has_thinking=False,
+            tool_parser=None,
+            text_sm=TextStateMachine({}),
+            initial_state="normal",
+            prompt=[1, 2],
+            prompt_cache_count=0,
         )
         gens = [
-            types.SimpleNamespace(text=t, token=i, logprob=0.0, finish_reason=f, top_tokens=(),
-                                  from_draft=False, made_at=at)
-            for i, (t, f, at) in enumerate([("a", None, 11.0), ("b", None, 11.5), ("", "stop", 12.0)])
+            types.SimpleNamespace(
+                text=t,
+                token=i,
+                logprob=0.0,
+                finish_reason=f,
+                top_tokens=(),
+                from_draft=False,
+                made_at=at,
+            )
+            for i, (t, f, at) in enumerate(
+                [("a", None, 11.0), ("b", None, 11.5), ("", "stop", 12.0)]
+            )
         ]
-        clock = iter([10.0] + [99.0] * 20)   # the handler's own clock: much later
+        clock = iter([10.0] + [99.0] * 20)  # the handler's own clock: much later
         with mock.patch.object(
             self.response_generator, "generate", return_value=(ctx, iter(gens))
-        ), mock.patch("mlx_lm.server._now", lambda: next(clock)), \
-                self.assertLogs(level="INFO") as logs:
+        ), mock.patch("mlx_lm.server._now", lambda: next(clock)), self.assertLogs(
+            level="INFO"
+        ) as logs:
             requests.post(
                 f"http://localhost:{self.port}/v1/chat/completions",
-                json={"model": "default_model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                json={
+                    "model": "default_model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
             )
         line = next(l for l in logs.output if "Request stats:" in l)
         self.assertIn("first_token_s=1.000 tokens=3 decode_s=1.000", line)
@@ -757,9 +885,16 @@ class TestServer(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         r = requests.post(url + "/v1/completions", json={"model": "default_model"})
         self.assertEqual(r.status_code, 400)
-        r = requests.post(url + "/v1/chat/completions", json={
-            "model": "default_model", "max_tokens": 4, "stream": True, "stream_options": {"x": 1},
-            "messages": [{"role": "user", "content": "Hi"}]})
+        r = requests.post(
+            url + "/v1/chat/completions",
+            json={
+                "model": "default_model",
+                "max_tokens": 4,
+                "stream": True,
+                "stream_options": {"x": 1},
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         self.assertEqual(r.status_code, 200)
         self.assertIn(b"[DONE]", r.content)
 
@@ -1014,10 +1149,17 @@ class TestServer(unittest.TestCase):
 
         base = f"http://localhost:{self.port}"
         ids = [m["id"] for m in response_body["data"]]
-        self.assertEqual([m["id"] for m in requests.get(f"{base}/api/v0/models").json()["data"]], ids)
-        self.assertEqual([m["id"] for m in requests.get(f"{base}/v1/models/?x=1").json()["data"]], ids)
-        for model_id in ids:   # a local model's id is an absolute path
-            listed = requests.get(f"{base}/v1/models/{model_id.lstrip('/')}").json()["data"]
+        self.assertEqual(
+            [m["id"] for m in requests.get(f"{base}/api/v0/models").json()["data"]], ids
+        )
+        self.assertEqual(
+            [m["id"] for m in requests.get(f"{base}/v1/models/?x=1").json()["data"]],
+            ids,
+        )
+        for model_id in ids:  # a local model's id is an absolute path
+            listed = requests.get(f"{base}/v1/models/{model_id.lstrip('/')}").json()[
+                "data"
+            ]
             self.assertEqual([m["id"] for m in listed], [model_id])
         self.assertEqual(requests.get(f"{base}/v1/modelsX").status_code, 404)
 
@@ -1343,7 +1485,9 @@ class TestServerKVCacheQuantization(unittest.TestCase):
         # error for a valid request); with quantized KV, batched too.
         status, first = _complete(self.port, "In a small village")
         self.assertEqual(status, 200)
-        status, second = _complete(self.port, "In a small village" + first["choices"][0]["text"])
+        status, second = _complete(
+            self.port, "In a small village" + first["choices"][0]["text"]
+        )
         self.assertEqual(status, 200)
         self.assertIn("choices", second)
 
@@ -1660,22 +1804,32 @@ class TestServerSingleCheckpoints(unittest.TestCase):
                     {"role": "user", "content": "Hello!"},
                 ]
                 self._chat(url, first)
-                time.sleep(0.5)   # a warmed next turn lands meanwhile
-                before = {k: v["n_sequences"] for k, v in prompt_cache.stats_by_type().items()}
+                time.sleep(0.5)  # a warmed next turn lands meanwhile
+                before = {
+                    k: v["n_sequences"] for k, v in prompt_cache.stats_by_type().items()
+                }
                 n_bytes = prompt_cache.nbytes
                 other = [first[0], {"role": "user", "content": "Read these notes."}]
                 cached = self._chat(url, other, cache_store=False)
                 time.sleep(0.5)
-                self.assertGreater(cached, 0)   # the system checkpoint served it
-                after = {k: v["n_sequences"] for k, v in prompt_cache.stats_by_type().items()}
+                self.assertGreater(cached, 0)  # the system checkpoint served it
+                after = {
+                    k: v["n_sequences"] for k, v in prompt_cache.stats_by_type().items()
+                }
                 self.assertEqual(after, before)
                 self.assertEqual(prompt_cache.nbytes, n_bytes)
 
     def test_cache_store_must_be_a_bool(self):
         provider, prompt_cache, url = self._serve()
-        response = requests.post(f"{url}/v1/chat/completions",
-                                 json={"model": "chat_model", "max_tokens": 2,
-                                       "messages": [{"role": "user", "content": "hi"}], "cache_store": "no"})
+        response = requests.post(
+            f"{url}/v1/chat/completions",
+            json={
+                "model": "chat_model",
+                "max_tokens": 2,
+                "messages": [{"role": "user", "content": "hi"}],
+                "cache_store": "no",
+            },
+        )
         self.assertEqual(response.status_code, 400)
 
     def test_prompt_cache_bytes_batched(self):
@@ -1760,12 +1914,12 @@ class TestServerSingleCheckpoints(unittest.TestCase):
         ok = make_parser().parse_args(
             ["--memory-headroom-fraction", "1", "--prefill-memory-mb", "0"]
         )
-        self.assertEqual(
-            (ok.memory_headroom_fraction, ok.prefill_memory_mb), (1.0, 0)
-        )
+        self.assertEqual((ok.memory_headroom_fraction, ok.prefill_memory_mb), (1.0, 0))
         # Unset by default: MLX's own cache limit stays.
         self.assertIsNone(make_parser().parse_args([]).buffer_cache_mb)
-        self.assertEqual(make_parser().parse_args(["--buffer-cache-mb", "512"]).buffer_cache_mb, 512)
+        self.assertEqual(
+            make_parser().parse_args(["--buffer-cache-mb", "512"]).buffer_cache_mb, 512
+        )
 
     def test_foreign_cli_args_are_clamped(self):
         gen = self._generator(prefill_step_size=128)
@@ -1914,7 +2068,10 @@ class TestServerSingleCheckpoints(unittest.TestCase):
             except requests.ConnectionError:
                 pass
         # Only the request's own failure: no retry, no skipped checkpoint.
-        self.assertTrue(all("Request failed during generation" in m for m in logs.output), logs.output)
+        self.assertTrue(
+            all("Request failed during generation" in m for m in logs.output),
+            logs.output,
+        )
         self.assertEqual(len(prompt_cache), n_before)
         self.assertEqual(prompt_cache.nbytes, bytes_before)
 
@@ -2146,7 +2303,9 @@ class TestLRUPromptCache(unittest.TestCase):
         # A system and a user checkpoint, then the answered prompt.
         cache = LRUPromptCache()
         model = "m"
-        cache.insert_cache(model, list(range(16)), self._hybrid(16), cache_type="system")
+        cache.insert_cache(
+            model, list(range(16)), self._hybrid(16), cache_type="system"
+        )
         cache.insert_cache(model, list(range(32)), self._hybrid(32), cache_type="user")
         cache.insert_cache(model, list(range(48)), self._hybrid(48))
         return cache, model
@@ -2162,7 +2321,9 @@ class TestLRUPromptCache(unittest.TestCase):
             sum(c.nbytes for c in self._hybrid(32)),
         )
         stats = cache.stats_by_type()
-        self.assertEqual(stats["system"]["n_bytes"], self._windows(16) + self._kv_bytes(16))
+        self.assertEqual(
+            stats["system"]["n_bytes"], self._windows(16) + self._kv_bytes(16)
+        )
 
         # Each one comes back whole, its own positions only.
         for n in (16, 32, 48):
@@ -2183,7 +2344,8 @@ class TestLRUPromptCache(unittest.TestCase):
         cache, model = self._chain()
         cache.insert_cache(model, list(range(32)) + [7] * 16, self._hybrid(48))
         self.assertEqual(
-            cache.nbytes, self._windows(16, 32, 48, 48) + self._kv_bytes(48) + self._kv_bytes(16)
+            cache.nbytes,
+            self._windows(16, 32, 48, 48) + self._kv_bytes(48) + self._kv_bytes(16),
         )
         c, _ = cache.fetch_nearest_cache(model, list(range(32)) + [7] * 16 + [99])
         self.assertEqual(self._positions(c[1]), list(range(48)))
@@ -2237,7 +2399,9 @@ class TestLRUPromptCache(unittest.TestCase):
         # The window as stored, and the 16 new positions, unpadded.
         self.assertEqual(add, self._windows(64) + self._kv_bytes(64) // 4)
         cache.insert_cache(model, list(range(64)), self._hybrid(64))
-        self.assertEqual(cache.nbytes, self._windows(16, 32, 48, 64) + self._kv_bytes(64))
+        self.assertEqual(
+            cache.nbytes, self._windows(16, 32, 48, 64) + self._kv_bytes(64)
+        )
 
     def test_layers_of_another_kind_are_not_shared(self):
         # A checkpoint before --quantized-kv-start and a quantized answer.
@@ -2246,13 +2410,19 @@ class TestLRUPromptCache(unittest.TestCase):
         cache.insert_cache("m", list(range(48)), self._hybrid(48, quantized=True))
         self.assertEqual(
             cache.nbytes,
-            self._windows(16, 48) + self._kv_bytes(16) + self._kv_bytes(48, quantized=True),
+            self._windows(16, 48)
+            + self._kv_bytes(16)
+            + self._kv_bytes(48, quantized=True),
         )
         # Both quantized: shared.
         cache = LRUPromptCache()
-        cache.insert_cache("m", list(range(16)), self._hybrid(16, quantized=True), cache_type="system")
+        cache.insert_cache(
+            "m", list(range(16)), self._hybrid(16, quantized=True), cache_type="system"
+        )
         cache.insert_cache("m", list(range(48)), self._hybrid(48, quantized=True))
-        self.assertEqual(cache.nbytes, self._windows(16, 48) + self._kv_bytes(48, quantized=True))
+        self.assertEqual(
+            cache.nbytes, self._windows(16, 48) + self._kv_bytes(48, quantized=True)
+        )
         for n in (16, 48):
             c, _ = cache.fetch_nearest_cache("m", list(range(n)) + [99])
             self.assertIsInstance(c[1], QuantizedKVCache)
@@ -2297,7 +2467,10 @@ class TestLRUPromptCache(unittest.TestCase):
                 self.assertTrue(mx.array_equal(a, b).item())
                 self.assertEqual((live.offset, live._idx), (stored.offset, stored._idx))
                 self.assertTrue(
-                    mx.array_equal(live.make_mask(1, window_size=8), stored.make_mask(1, window_size=8)).item()
+                    mx.array_equal(
+                        live.make_mask(1, window_size=8),
+                        stored.make_mask(1, window_size=8),
+                    ).item()
                     if live.make_mask(1, window_size=8) is not None
                     else stored.make_mask(1, window_size=8) is None
                 )
@@ -2306,7 +2479,10 @@ class TestLRUPromptCache(unittest.TestCase):
         cache = LRUPromptCache()
         cache.insert_cache("m", list(range(16)), self._hybrid(16), cache_type="system")
         cache.insert_cache("m", list(range(8)) + [99] * 24, self._hybrid(32))
-        self.assertEqual(cache.nbytes, self._windows(16, 32) + self._kv_bytes(16) + self._kv_bytes(32))
+        self.assertEqual(
+            cache.nbytes,
+            self._windows(16, 32) + self._kv_bytes(16) + self._kv_bytes(32),
+        )
 
     def test_trim_to_keeps_an_entry(self):
         cache = LRUPromptCache()

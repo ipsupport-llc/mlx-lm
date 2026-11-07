@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 """Parsing for OpenAI's "harmony" multi-channel response format (gpt-oss).
 
 gpt-oss models separate internal reasoning from user-facing output with a
@@ -21,8 +23,8 @@ against 0.31.3 with mlx-community/gpt-oss-20b-MXFP4-Q8 via aider's
 whole-file-edit client).
 """
 
-import weakref
 import re
+import weakref
 
 HARMONY_CONTROL_TOKENS = ("<|channel|>", "<|message|>", "<|start|>", "<|end|>")
 

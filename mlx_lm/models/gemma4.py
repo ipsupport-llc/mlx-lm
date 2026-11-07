@@ -156,7 +156,9 @@ class MultimodalEmbedder(nn.Module):
         return self.embedding_projection(self.embedding_pre_projection_norm(x))
 
 
-def _masked_scatter(embeddings: mx.array, mask: mx.array, features: mx.array) -> mx.array:
+def _masked_scatter(
+    embeddings: mx.array, mask: mx.array, features: mx.array
+) -> mx.array:
     """Equivalent to `torch.Tensor.masked_scatter(mask, features)`: fills
     the `True` positions of `mask` (row-major order) with successive rows of
     `features` (`features.shape[0]` must equal `mask.sum()`).
@@ -172,7 +174,9 @@ def _masked_scatter(embeddings: mx.array, mask: mx.array, features: mx.array) ->
     positions = mx.cumsum(flat_mask.astype(mx.int32)) - 1
     positions = mx.clip(positions, 0, max(features.shape[0] - 1, 0))
     gathered = mx.take(features, positions, axis=0)
-    flat_out = mx.where(flat_mask[:, None], gathered.astype(flat_embeddings.dtype), flat_embeddings)
+    flat_out = mx.where(
+        flat_mask[:, None], gathered.astype(flat_embeddings.dtype), flat_embeddings
+    )
     return flat_out.reshape(B, L, D)
 
 
@@ -200,7 +204,9 @@ class UnifiedVisionEmbedder(nn.Module):
 
     def __init__(self, vision_config: dict):
         super().__init__()
-        patch = vision_config.get("patch_size", 16) * vision_config.get("pooling_kernel_size", 3)
+        patch = vision_config.get("patch_size", 16) * vision_config.get(
+            "pooling_kernel_size", 3
+        )
         dim = vision_config["mm_embed_dim"]
         self.patch_ln1 = nn.LayerNorm(patch * patch * 3)
         self.patch_dense = nn.Linear(patch * patch * 3, dim)
@@ -216,7 +222,10 @@ class UnifiedVisionEmbedder(nn.Module):
         x = self.patch_ln2(self.patch_dense(self.patch_ln1(x)))
         valid = positions != -1
         clamped = mx.maximum(positions, 0)
-        pos = self.pos_embedding[clamped[..., 0], 0] * valid[..., 0:1] + self.pos_embedding[clamped[..., 1], 1] * valid[..., 1:2]
+        pos = (
+            self.pos_embedding[clamped[..., 0], 0] * valid[..., 0:1]
+            + self.pos_embedding[clamped[..., 1], 1] * valid[..., 1:2]
+        )
         return self.pos_norm(x + pos.astype(x.dtype)), valid.all(axis=-1)
 
 
@@ -333,9 +342,7 @@ class Model(nn.Module):
                     f"{n_image_tokens} placeholder tokens vs. "
                     f"{image_features.shape[0]} pooled image features."
                 )
-            fused = _masked_scatter(
-                fused, image_mask, image_features / embed_scale
-            )
+            fused = _masked_scatter(fused, image_mask, image_features / embed_scale)
 
         if input_features is not None:
             if self.embed_audio is None:
@@ -362,9 +369,7 @@ class Model(nn.Module):
                     f"{n_audio_tokens} placeholder tokens vs. "
                     f"{audio_features.shape[0]} pooled audio features."
                 )
-            fused = _masked_scatter(
-                fused, audio_mask, audio_features / embed_scale
-            )
+            fused = _masked_scatter(fused, audio_mask, audio_features / embed_scale)
 
         return fused, per_layer_inputs
 
@@ -389,7 +394,9 @@ class Model(nn.Module):
         meets both: every image ends with its end-of-image token, and all of
         an image's soft tokens share one prompt-cache key."""
         self._text_model().vision_spans = (
-            list(spans) if spans and self.uses_vision_bidirectional_attention() else None
+            list(spans)
+            if spans and self.uses_vision_bidirectional_attention()
+            else None
         )
 
     @staticmethod
@@ -456,7 +463,12 @@ class Model(nn.Module):
         if pixel_values is not None and saved is None and inputs.shape[0] == 1:
             base = next((c.offset for c in (cache or []) if c is not None), 0)
             self.set_vision_spans(
-                [(base + s, base + e) for s, e in self.image_spans(inputs[0].tolist(), self.args.image_token_id)]
+                [
+                    (base + s, base + e)
+                    for s, e in self.image_spans(
+                        inputs[0].tolist(), self.args.image_token_id
+                    )
+                ]
             )
         try:
             return self.language_model(
@@ -490,10 +502,16 @@ class Model(nn.Module):
             # checkpoints are already in the vision_embedder layout below):
             # embed_vision holds the patch layers and a multimodal_embedder.
             if self.unified and k.startswith("embed_vision.multimodal_embedder."):
-                embed_vision_weights[k.removeprefix("embed_vision.multimodal_embedder.")] = v
+                embed_vision_weights[
+                    k.removeprefix("embed_vision.multimodal_embedder.")
+                ] = v
                 continue
-            if self.unified and k.startswith(("embed_vision.patch_", "embed_vision.pos_")):
-                vision_embedder_weights["vision_embedder." + k.removeprefix("embed_vision.")] = v
+            if self.unified and k.startswith(
+                ("embed_vision.patch_", "embed_vision.pos_")
+            ):
+                vision_embedder_weights[
+                    "vision_embedder." + k.removeprefix("embed_vision.")
+                ] = v
                 continue
             if k.startswith("embed_vision."):
                 embed_vision_weights[k.removeprefix("embed_vision.")] = v
@@ -548,7 +566,10 @@ class Model(nn.Module):
         # The other way round -- weights for a tower the config doesn't
         # describe -- is what a conversion by an older mlx-lm left (it dropped
         # vision_config on save): they can only be ignored, so say so.
-        for name, tower, found in (("vision", self.vision_tower, vision_weights), ("audio", self.audio_tower, audio_weights)):
+        for name, tower, found in (
+            ("vision", self.vision_tower, vision_weights),
+            ("audio", self.audio_tower, audio_weights),
+        ):
             if tower is None and found:
                 warnings.warn(
                     f"The checkpoint has {name} weights but its config has no {name}_config: "

@@ -57,12 +57,12 @@ class TestToolParsing(unittest.TestCase):
                 minicpm5,
             ),
             (
-                ']<]minimax[>[<tool_call>'
+                "]<]minimax[>[<tool_call>"
                 ']<]minimax[>[<invoke name="multiply">'
-                ']<]minimax[>[<a>12234585]<]minimax[>[</a>'
-                ']<]minimax[>[<b>48838483920]<]minimax[>[</b>'
-                ']<]minimax[>[</invoke>'
-                ']<]minimax[>[</tool_call>',
+                "]<]minimax[>[<a>12234585]<]minimax[>[</a>"
+                "]<]minimax[>[<b>48838483920]<]minimax[>[</b>"
+                "]<]minimax[>[</invoke>"
+                "]<]minimax[>[</tool_call>",
                 minimax_m3,
             ),
             (
@@ -148,11 +148,11 @@ class TestToolParsing(unittest.TestCase):
                 minicpm5,
             ),
             (
-                ']<]minimax[>[<tool_call>'
+                "]<]minimax[>[<tool_call>"
                 ']<]minimax[>[<invoke name="get_current_temperature">'
-                ']<]minimax[>[<location>London]<]minimax[>[</location>'
-                ']<]minimax[>[</invoke>'
-                ']<]minimax[>[</tool_call>',
+                "]<]minimax[>[<location>London]<]minimax[>[</location>"
+                "]<]minimax[>[</invoke>"
+                "]<]minimax[>[</tool_call>",
                 minimax_m3,
             ),
             (
@@ -827,14 +827,13 @@ class TestToolParsing(unittest.TestCase):
 
     def test_olmo3(self):
         # Multiple tool calls
-        test_case = (
-            'search(query="weather")\n'
-            'read_file(path="/tmp/test.txt")'
-        )
+        test_case = 'search(query="weather")\n' 'read_file(path="/tmp/test.txt")'
         tool_calls = olmo3.parse_tool_call(test_case, None)
         self.assertIsInstance(tool_calls, list)
         self.assertEqual(len(tool_calls), 2)
-        self.assertEqual(tool_calls[0], {"name": "search", "arguments": {"query": "weather"}})
+        self.assertEqual(
+            tool_calls[0], {"name": "search", "arguments": {"query": "weather"}}
+        )
         self.assertEqual(
             tool_calls[1],
             {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
@@ -865,7 +864,7 @@ class TestToolParsing(unittest.TestCase):
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
 
-    def test_muse_spark(self):
+    def test_muse_spark_without_markers(self):
         # The server strips the markers.
         test_case = (
             '\n<atem:invoke name="search">\n'
@@ -1098,14 +1097,14 @@ class TestToolParsing(unittest.TestCase):
         # Multiple tool calls in a single <tool_call> block (M3 wraps all
         # invokes in one wrapper per its chat template instructions).
         test_case = (
-            ']<]minimax[>[<tool_call>'
+            "]<]minimax[>[<tool_call>"
             ']<]minimax[>[<invoke name="search">'
-            ']<]minimax[>[<query>weather]<]minimax[>[</query>'
-            ']<]minimax[>[</invoke>'
+            "]<]minimax[>[<query>weather]<]minimax[>[</query>"
+            "]<]minimax[>[</invoke>"
             ']<]minimax[>[<invoke name="read_file">'
-            ']<]minimax[>[<path>/tmp/test.txt]<]minimax[>[</path>'
-            ']<]minimax[>[</invoke>'
-            ']<]minimax[>[</tool_call>'
+            "]<]minimax[>[<path>/tmp/test.txt]<]minimax[>[</path>"
+            "]<]minimax[>[</invoke>"
+            "]<]minimax[>[</tool_call>"
         )
         expected = [
             {"name": "search", "arguments": {"query": "weather"}},
@@ -1117,20 +1116,20 @@ class TestToolParsing(unittest.TestCase):
         # Nested array of objects (mapping renders <key>val</key>;
         # iterable renders <item>...</item> per M3's to_xml macro).
         test_case = (
-            ']<]minimax[>[<tool_call>'
+            "]<]minimax[>[<tool_call>"
             ']<]minimax[>[<invoke name="filter">'
-            ']<]minimax[>[<rules>'
-            ']<]minimax[>[<item>'
-            ']<]minimax[>[<field>city]<]minimax[>[</field>'
-            ']<]minimax[>[<value>Paris]<]minimax[>[</value>'
-            ']<]minimax[>[</item>'
-            ']<]minimax[>[<item>'
-            ']<]minimax[>[<field>year]<]minimax[>[</field>'
-            ']<]minimax[>[<value>2026]<]minimax[>[</value>'
-            ']<]minimax[>[</item>'
-            ']<]minimax[>[</rules>'
-            ']<]minimax[>[</invoke>'
-            ']<]minimax[>[</tool_call>'
+            "]<]minimax[>[<rules>"
+            "]<]minimax[>[<item>"
+            "]<]minimax[>[<field>city]<]minimax[>[</field>"
+            "]<]minimax[>[<value>Paris]<]minimax[>[</value>"
+            "]<]minimax[>[</item>"
+            "]<]minimax[>[<item>"
+            "]<]minimax[>[<field>year]<]minimax[>[</field>"
+            "]<]minimax[>[<value>2026]<]minimax[>[</value>"
+            "]<]minimax[>[</item>"
+            "]<]minimax[>[</rules>"
+            "]<]minimax[>[</invoke>"
+            "]<]minimax[>[</tool_call>"
         )
         expected = {
             "name": "filter",
@@ -1148,10 +1147,10 @@ class TestToolParsing(unittest.TestCase):
         # short "I'll do X..." sentence before the <tool_call> wrapper).
         test_case = (
             "I'll look up the current time for you."
-            ']<]minimax[>[<tool_call>'
+            "]<]minimax[>[<tool_call>"
             ']<]minimax[>[<invoke name="get_time">'
-            ']<]minimax[>[</invoke>'
-            ']<]minimax[>[</tool_call>'
+            "]<]minimax[>[</invoke>"
+            "]<]minimax[>[</tool_call>"
         )
         expected = {"name": "get_time", "arguments": {}}
         tool_call = minimax_m3.parse_tool_call(test_case, None)
@@ -1168,11 +1167,11 @@ class TestToolParsing(unittest.TestCase):
         # __parse_error__ payload instead so the calling harness/model can
         # see why and retry (observed in production agent loops).
         test_case = (
-            ']<]minimax[>[<tool_call>'
+            "]<]minimax[>[<tool_call>"
             ']<]minimax[>[<invoke name="exec">'
-            ']<]minimax[>[<command>ls & rm <oops'
-            ']<]minimax[>[</invoke>'
-            ']<]minimax[>[</tool_call>'
+            "]<]minimax[>[<command>ls & rm <oops"
+            "]<]minimax[>[</invoke>"
+            "]<]minimax[>[</tool_call>"
         )
         tool_call = minimax_m3.parse_tool_call(test_case, None)
         self.assertEqual("exec", tool_call["name"])
@@ -1181,11 +1180,11 @@ class TestToolParsing(unittest.TestCase):
         # Top-level non-object arguments (bare <item> list) also surface
         # __parse_error__ — OpenAI arguments must be an object.
         test_case = (
-            ']<]minimax[>[<tool_call>'
+            "]<]minimax[>[<tool_call>"
             ']<]minimax[>[<invoke name="exec">'
-            ']<]minimax[>[<item>a]<]minimax[>[</item>'
-            ']<]minimax[>[</invoke>'
-            ']<]minimax[>[</tool_call>'
+            "]<]minimax[>[<item>a]<]minimax[>[</item>"
+            "]<]minimax[>[</invoke>"
+            "]<]minimax[>[</tool_call>"
         )
         tool_call = minimax_m3.parse_tool_call(test_case, None)
         self.assertIn("__parse_error__", tool_call["arguments"])
@@ -1193,8 +1192,19 @@ class TestToolParsing(unittest.TestCase):
     def test_olmo3_structured_arguments(self):
         # Commas inside arrays, objects and strings don't split arguments.
         self.assertEqual(
-            olmo3.parse_tool_call('f(nums=[1, 2], opts={"a": 1, "b": 2}, s="x, y", on=true, n=null)'),
-            {"name": "f", "arguments": {"nums": [1, 2], "opts": {"a": 1, "b": 2}, "s": "x, y", "on": True, "n": None}},
+            olmo3.parse_tool_call(
+                'f(nums=[1, 2], opts={"a": 1, "b": 2}, s="x, y", on=true, n=null)'
+            ),
+            {
+                "name": "f",
+                "arguments": {
+                    "nums": [1, 2],
+                    "opts": {"a": 1, "b": 2},
+                    "s": "x, y",
+                    "on": True,
+                    "n": None,
+                },
+            },
         )
 
     def test_deepseek_dsml_parallel(self):

@@ -784,7 +784,9 @@ def load(
 
         if "decoder" in tokenizer_content:
             decoder = tokenizer_content["decoder"]
-            if _is_bpe_decoder(decoder) or _has_byte_level_pretokenizer(tokenizer_content):
+            if _is_bpe_decoder(decoder) or _has_byte_level_pretokenizer(
+                tokenizer_content
+            ):
                 # A byte-level vocabulary needs the BPE detokenizer even with an
                 # SPM-style decoder (e.g. Mistral tekken v13): the SPM one would
                 # leave the byte-level space marker in the output.
@@ -805,9 +807,7 @@ def load(
 
     tokenizer_config_extra = tokenizer_config_extra or {}
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path, **tokenizer_config_extra
-        )
+        tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra)
     # TODO: Remove this once transformers upstream adds DSV4
     except (AttributeError, ValueError, KeyError, StrictDataclassError) as e:
         if "config" in tokenizer_config_extra:
