@@ -3607,8 +3607,10 @@ def make_parser():
         choices=["per_loop", "last_loop"],
         default=None,
         help="Looped models (Dory): per_loop keeps a KV cache for every loop "
-        "(the trained setting); last_loop keeps only the last loop's, less "
-        "memory at long contexts. Default: the model's config",
+        "(the trained setting); last_loop keeps only the last loop's: less "
+        "memory at long contexts, but earlier loops then read the last "
+        "loop's KV, so output depends on prefill chunking. Default: the "
+        "model's config",
     )
     parser.add_argument(
         "--experts-on-disk",
