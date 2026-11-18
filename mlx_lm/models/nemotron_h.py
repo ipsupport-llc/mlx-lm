@@ -913,6 +913,28 @@ class Model(nn.Module):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
 
+        # JANG exports name the experts up_proj/down_proj and quantize the
+        # router. MoEGate is not a Linear, so the router is dequantized.
+        for old, new in [
+            (".switch_mlp.up_proj.", ".switch_mlp.fc1."),
+            (".switch_mlp.down_proj.", ".switch_mlp.fc2."),
+        ]:
+            for k in [k for k in weights if old in k]:
+                weights[k.replace(old, new)] = weights.pop(k)
+        for k in [k for k in weights if k.endswith(".gate.scales")]:
+            prefix = k[: -len(".scales")]
+            w = weights[f"{prefix}.weight"]
+            scales = weights.pop(k)
+            biases = weights.pop(f"{prefix}.biases", None)
+            n_in = self.args.hidden_size
+            weights[f"{prefix}.weight"] = mx.dequantize(
+                w,
+                scales,
+                biases,
+                group_size=n_in // scales.shape[-1],
+                bits=w.shape[-1] * 32 // n_in,
+            )
+
         # Stack experts (backbone and mtp layers alike). Puzzle blocks can
         # each have their own expert count.
         prefixes = {k.rsplit(".experts.", 1)[0] for k in weights if ".experts." in k}
