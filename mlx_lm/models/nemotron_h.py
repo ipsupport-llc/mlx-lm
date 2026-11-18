@@ -920,12 +920,17 @@ class Model(nn.Module):
             (".switch_mlp.down_proj.", ".switch_mlp.fc2."),
         ]:
             for k in [k for k in weights if old in k]:
-                weights[k.replace(old, new)] = weights.pop(k)
+                if k.replace(old, new) not in weights:
+                    weights[k.replace(old, new)] = weights.pop(k)
         for k in [k for k in weights if k.endswith(".gate.scales")]:
             prefix = k[: -len(".scales")]
             w = weights[f"{prefix}.weight"]
             scales = weights.pop(k)
             biases = weights.pop(f"{prefix}.biases", None)
+            if biases is None or scales.dtype == mx.uint8:
+                raise ValueError(
+                    f"{prefix}: only an affine quantized router is supported"
+                )
             n_in = self.args.hidden_size
             weights[f"{prefix}.weight"] = mx.dequantize(
                 w,
