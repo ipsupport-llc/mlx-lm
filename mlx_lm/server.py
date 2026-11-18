@@ -1154,6 +1154,8 @@ class ResponseGenerator:
 
         # Load the default model if it is given
         self.model_provider.load_default()
+        # Clients watching the log tell a failed load from a later failure.
+        logging.info("Model loaded")
 
         current_model = None
         current_tokenizer = None
