@@ -64,6 +64,7 @@ MODEL_REMAPPING = {
     "qwen3_5_text": "qwen3_5",
     "qwen3_5_moe_text": "qwen3_5_moe",
     "nemotron_h_puzzle": "nemotron_h",
+    "inkling2_loop": "inkling2",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
@@ -364,6 +365,19 @@ def _transform_compressed_tensors_int4_weights(
             new_weights[key] = weights[key]
 
     return new_weights, {"group_size": group_size, "bits": bits, "mode": "affine"}
+
+
+def model_package(config: dict) -> str:
+    """The package in ``mlx_lm.models`` of the model of a configuration."""
+    model_type = config["model_type"]
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    for architecture in architectures:
+        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
+        if remapped is not None:
+            return remapped
+    return MODEL_REMAPPING.get(model_type, model_type)
 
 
 def _get_classes(config: dict):
