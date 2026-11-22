@@ -99,8 +99,11 @@ def sanitize(model, weights: dict[str, mx.array]) -> dict[str, mx.array]:
                 denominator[name] = v
             elif suffix == "_scale":
                 sanitized[f"{name}.scales"] = v
-            else:
+            elif v.dtype == mx.uint8:
                 sanitized[f"{name}.weight"] = v.view(mx.uint32)
+            else:
+                # Unquantized experts.
+                sanitized[f"{name}.weight"] = v
             continue
         sanitized[k] = v
 

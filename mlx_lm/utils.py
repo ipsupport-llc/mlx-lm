@@ -1658,6 +1658,8 @@ def save_config(
         "lfm2_vl",
         "lfm2-vl",
         "muse_spark",
+        "inkling2",
+        "inkling2_loop",
     ):
         config.pop("vision_config", None)
     if "quantization" in config:
