@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import find_packages, setup
 
 package_dir = Path(__file__).parent / "mlx_lm"
 sys.path.append(str(package_dir))
@@ -35,14 +35,8 @@ setup(
         # uses HF's PIL-backed Gemma 4 image processor; no torch needed).
         "pillow",
     ],
-    packages=[
-        "mlx_lm",
-        "mlx_lm.models",
-        "mlx_lm.quant",
-        "mlx_lm.tuner",
-        "mlx_lm.tool_parsers",
-        "mlx_lm.chat_templates",
-    ],
+    # Every subpackage; mlx_lm.quant has no __init__.py.
+    packages=sorted({*find_packages(include=["mlx_lm", "mlx_lm.*"]), "mlx_lm.quant"}),
     python_requires=">=3.8",
     extras_require={
         "test": ["datasets", "lm-eval"],

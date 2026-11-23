@@ -1415,6 +1415,141 @@ def mtp_generate_step(
                 mx.eval([c.state for c in cache])
 
 
+def _has_dspark(model: nn.Module) -> bool:
+    return "dspark" in model and hasattr(model, "forward_features")
+
+
+def dspark_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    num_draft_tokens: Optional[int] = None,
+    adaptive: bool = True,
+    max_tokens: int = 256,
+    sampler: Optional[Sampler] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """Speculative decoding with the model's DSpark draft (Inkling 2).
+
+    The draft proposes up to ``block_size - 1`` tokens in one pass (``adaptive``:
+    as many as DraftLength expects to be fastest); the model runs once over
+    ``[last token, drafts...]``, samples its own token at every position and
+    accepts the longest prefix of drafts equal to those samples, then emits
+    its sample right after it. Every emitted token is the model's own sample:
+    the output is plain decoding's, with any sampler. The rejected tokens are
+    rolled back exactly (rollback_speculative_cache).
+
+    The draft's context holds the model's features of every committed
+    position of this call (a reused prompt cache's prefix is not in it: the
+    drafts are then worse, the output the same).
+
+    Single sequence only; no logits processors, KV quantization or input
+    embeddings (stream_generate falls back to plain decoding for those).
+
+    Yields:
+        Tuple[int, mx.array, bool]: (token, log-probabilities, from_draft).
+    """
+    if prompt.ndim != 1:
+        raise ValueError("dspark_generate_step supports a single sequence only.")
+    sampler = sampler or greedy_sampler
+    max_drafts = model.dspark.block_size - 1
+    if num_draft_tokens is not None:
+        max_drafts = max(0, min(max_drafts, num_draft_tokens))
+    cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
+    draft_cache = model.dspark.make_cache()
+    if prompt_progress_callback is None:
+        prompt_progress_callback = lambda *_: None
+
+    def _sample(logits):
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if logprobs.shape[0] == 1 or sampler is greedy_sampler:
+            return sampler(logprobs), logprobs
+        rows = [sampler(logprobs[i : i + 1]) for i in range(logprobs.shape[0])]
+        return mx.concatenate(rows), logprobs
+
+    total = len(prompt)
+    position = _cache_offset(cache)
+    with mx.stream(stream):
+        done = 0
+        prompt_progress_callback(0, total)
+        while done < total:
+            n = min(prefill_step_size, total - done)
+            logits, features = model.forward_features(
+                prompt[done : done + n][None], cache
+            )
+            model.dspark.add_context(features, position + done, draft_cache)
+            mx.eval([c.state for c in cache] + [c.state for c in draft_cache])
+            done += n
+            prompt_progress_callback(done, total)
+            mx.clear_cache()
+        tok, logprobs = _sample(logits[:, -1])
+        last = features[:, -1]
+        position += total
+        mx.eval(tok, logprobs, last)
+
+    # On exit the cache holds exactly prompt + every token yielded so far, as
+    # plain generate_step leaves it: the last yielded token is fed, or the
+    # accepted drafts after the stop are rolled back.
+    fixup = ("feed", tok)
+    n_out = 1
+    try:
+        yield tok.item(), logprobs.squeeze(0), False
+        limit = max_tokens if max_tokens >= 0 else float("inf")
+        lengths = DraftLength(max_drafts) if adaptive else None
+        while n_out < limit:
+            k = lengths.choose() if lengths else max_drafts
+            k = int(min(k, limit - n_out))
+            started = time.perf_counter()
+            fixup = None  # mid-iteration: cache state not well defined
+            with mx.stream(stream):
+                if k > 0:
+                    drafts = model.draft(tok, position, last, draft_cache, k)
+                    block = mx.concatenate([tok.reshape(1, 1), drafts], axis=1)
+                else:
+                    drafts = mx.array([[]], mx.uint32)
+                    block = tok.reshape(1, 1)
+                model.record_conv_windows(cache, True)
+                logits, features = model.forward_features(block, cache, all_logits=True)
+                model.record_conv_windows(cache, False)
+                toks, lps = _sample(logits[0])
+                mx.eval(toks, lps, drafts, features)
+            toks_l, draft_l = toks.tolist(), drafts[0].tolist()
+            n_acc = 0
+            while n_acc < k and draft_l[n_acc] == toks_l[n_acc]:
+                n_acc += 1
+            if lengths:
+                lengths.update(k, n_acc, time.perf_counter() - started)
+            with mx.stream(stream):
+                model.rollback_speculative_cache(cache, n_acc + 1, k + 1)
+                model.dspark.add_context(
+                    features[:, : n_acc + 1], position, draft_cache
+                )
+                last = features[:, n_acc]
+            position += n_acc + 1
+            tok = toks[n_acc]
+            for i in range(n_acc):
+                # Stopping here keeps the anchor and the first i + 1 drafts.
+                fixup = ("keep", i + 2, n_acc + 1)
+                yield draft_l[i], lps[i], True
+                n_out += 1
+                if n_out >= limit:
+                    return
+            fixup = ("feed", tok)
+            yield toks_l[n_acc], lps[n_acc], False
+            n_out += 1
+    finally:
+        if fixup is not None:
+            with mx.stream(stream):
+                if fixup[0] == "keep":
+                    model.rollback_speculative_cache(cache, fixup[1], fixup[2])
+                else:
+                    model(fixup[1].reshape(1, 1), cache=cache)
+                mx.eval([c.state for c in cache])
+
+
 def _is_gemma4_assistant(draft_model: Optional[nn.Module]) -> bool:
     return getattr(draft_model, "model_type", None) == "gemma4_assistant"
 
@@ -1736,8 +1871,19 @@ def stream_generate(
         # docstring for why rollback needs no quantization-aware branch).
         # A Qwen3.5 MTP head: any sampler (the drafts are checked against
         # the backbone's own samples).
+        # An Inkling 2 DSpark draft: any sampler, as the MTP head.
+        use_dspark = (
+            _has_dspark(model)
+            and num_head_drafts != 0
+            and prompt.ndim == 1
+            and not kwargs.get("logits_processors")
+            and kwargs.get("max_kv_size") is None
+            and kwargs.get("input_embeddings") is None
+            and kwargs.get("kv_bits") is None
+        )
         use_head = (
-            _mtp_language_model(model) is not None
+            not use_dspark
+            and _mtp_language_model(model) is not None
             and num_head_drafts != 0
             and prompt.ndim == 1
             and not kwargs.get("logits_processors")
@@ -1753,7 +1899,19 @@ def stream_generate(
             and kwargs.get("max_kv_size") is None
             and kwargs.get("input_embeddings") is None
         )
-        if use_head:
+        if use_dspark:
+            token_generator = dspark_generate_step(
+                prompt,
+                model,
+                num_draft_tokens=num_head_drafts,
+                max_tokens=kwargs["max_tokens"],
+                sampler=kwargs.get("sampler"),
+                prompt_cache=kwargs.get("prompt_cache"),
+                prefill_step_size=kwargs.get("prefill_step_size", 2048),
+                prompt_progress_callback=kwargs.get("prompt_progress_callback"),
+                stream=stream,
+            )
+        elif use_head:
             token_generator = mtp_generate_step(
                 prompt,
                 model,
