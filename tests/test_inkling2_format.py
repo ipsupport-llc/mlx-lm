@@ -58,6 +58,9 @@ class TestInkling2ResponseFormat(unittest.TestCase):
         self.assertEqual(
             parser.parse_tool_call('{"name":"f"}'), {"name": "f", "arguments": {}}
         )
+        for bad in ('{"args":{}}', "[1]"):
+            with self.assertRaises(ValueError):
+                parser.parse_tool_call(bad)
 
     def test_loop_checkpoint_gets_the_format(self):
         from mlx_lm.utils import _tokenizer_defaults
