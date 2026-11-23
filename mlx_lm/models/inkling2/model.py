@@ -24,6 +24,12 @@ from mlx_lm.models.inkling2.layers import (
 from mlx_lm.models.inkling2.vision import VisionModel
 from mlx_lm.models.muse_spark import shard_experts_inplace
 
+# The answer's messages (chat_templates.inkling2) and its tool calls.
+TOKENIZER_DEFAULTS = {
+    "chat_template_type": "inkling2",
+    "tool_parser_type": "inkling2",
+}
+
 __all__ = [
     "Inkling2Model",
     "Model",

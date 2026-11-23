@@ -739,6 +739,8 @@ def _infer_tool_parser(tokenizer):
             return "deepseek_dsml"
         elif "<atem:function_calls>" in chat_template:
             return "muse_spark"
+        elif "<|content_invoke_tool_json|>" in chat_template:
+            return "inkling2"
         elif "<function_calls>" in chat_template:
             return "olmo3"
         elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
