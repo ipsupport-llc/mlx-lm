@@ -1,3 +1,5 @@
+# Copyright © 2026 IPSupport LLC
+
 """The DSpark draft of Inkling 2 (``mtp.safetensors``).
 
 A block of an anchor (the last sampled token) and ``block_size - 1`` mask

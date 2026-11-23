@@ -1,3 +1,5 @@
+# Copyright © 2026 IPSupport LLC
+
 import unittest
 
 import mlx.core as mx

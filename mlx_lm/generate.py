@@ -1477,7 +1477,9 @@ def dspark_generate_step(
         prompt_progress_callback(0, total)
         while done < total:
             n = min(prefill_step_size, total - done)
-            logits, features = model.forward_features(prompt[done : done + n][None], cache)
+            logits, features = model.forward_features(
+                prompt[done : done + n][None], cache
+            )
             model.dspark.add_context(features, position + done, draft_cache)
             mx.eval([c.state for c in cache] + [c.state for c in draft_cache])
             done += n
@@ -1522,7 +1524,9 @@ def dspark_generate_step(
                 lengths.update(k, n_acc, time.perf_counter() - started)
             with mx.stream(stream):
                 model.rollback_speculative_cache(cache, n_acc + 1, k + 1)
-                model.dspark.add_context(features[:, : n_acc + 1], position, draft_cache)
+                model.dspark.add_context(
+                    features[:, : n_acc + 1], position, draft_cache
+                )
                 last = features[:, n_acc]
             position += n_acc + 1
             tok = toks[n_acc]
