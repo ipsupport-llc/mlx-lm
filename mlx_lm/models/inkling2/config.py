@@ -73,6 +73,7 @@ class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
     vision_config: dict | None = None
+    mtp_config: dict | None = None
     image_token_id: int = 200054
 
     def __post_init__(self):

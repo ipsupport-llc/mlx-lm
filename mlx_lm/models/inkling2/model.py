@@ -11,6 +11,7 @@ from mlx_lm.layers.distributed import PipelineMixin, gather_last_axis
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 from mlx_lm.models.inkling2 import checkpoint
 from mlx_lm.models.inkling2.config import ModelArgs, TextArgs
+from mlx_lm.models.inkling2.dspark import DSpark, DSparkArgs
 from mlx_lm.models.inkling2.layers import (
     BlockAttentionResidual,
     DecoderLayer,
@@ -71,12 +72,13 @@ class TextModel(PipelineMixin, nn.Module):
             raise ValueError("Pipeline parallel does not support looped models.")
         super().pipeline(group, split)
 
-    def _run_loop(self, hidden_states, cache, conv_mask):
+    def _run_loop(self, hidden_states, cache, conv_mask, tap):
         core = self.args.loop_core
         caches = iter(cache)
 
         def run(layers, hidden_states, block_states, bank=None):
             for i, layer in enumerate(layers):
+                tap(hidden_states)
                 messages = None if bank is None else self.message_input(bank, i)
                 hidden_states, block_states = layer(
                     hidden_states,
@@ -107,7 +109,17 @@ class TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: list[Any] | None = None,
         input_embeddings: mx.array | None = None,
-    ) -> mx.array:
+        capture: list[int] | None = None,
+    ) -> mx.array | tuple[mx.array, list[mx.array]]:
+        """capture: layer visits (the loop's passes counted) whose input
+        hidden states are returned too; the number of visits is the output."""
+        taps, visit = [], [0]
+
+        def tap(hidden_states):
+            if capture is not None and visit[0] in capture:
+                taps.append(hidden_states)
+            visit[0] += 1
+
         if input_embeddings is None:
             input_embeddings = self.embed(inputs)
         hidden_states = input_embeddings
@@ -130,12 +142,13 @@ class TextModel(PipelineMixin, nn.Module):
 
         if self.args.loop_config is None:
             for layer, c in zip(layers, cache):
+                tap(hidden_states)
                 hidden_states, block_states = layer(
                     hidden_states, block_states, cache=c, conv_mask=conv_mask
                 )
         else:
             hidden_states, block_states = self._run_loop(
-                hidden_states, cache, conv_mask
+                hidden_states, cache, conv_mask, tap
             )
 
         if rank != 0:
@@ -156,7 +169,10 @@ class TextModel(PipelineMixin, nn.Module):
         if size > 1:
             batch = hidden_states.shape[0]
             hidden_states = mx.distributed.all_gather(hidden_states)[:batch]
-        return hidden_states
+        if capture is None:
+            return hidden_states
+        tap(hidden_states)
+        return hidden_states, taps
 
 
 class Inkling2Model(nn.Module):
@@ -192,6 +208,9 @@ class Model(nn.Module):
         text = args.text
         self.lm_head = nn.Linear(text.hidden_size, text.vocab_size, bias=False)
         self.sharding_group = None
+        # The DSpark draft (mtp.safetensors); sanitize drops it without weights.
+        if args.mtp_config and args.mtp_config.get("markov_head_type") == "rnn_hidden":
+            self.dspark = DSpark(DSparkArgs.from_dict(args.mtp_config), text.vocab_size)
 
     def encode_image(self, pixel_values: mx.array | list[mx.array]) -> mx.array:
         """pixel_values: one image (num_channels, H, W) or a list of images of
@@ -231,6 +250,9 @@ class Model(nn.Module):
         hidden_states = self.model.language_model(
             inputs, cache=cache, input_embeddings=input_embeddings
         )
+        return self.logits(hidden_states)
+
+    def logits(self, hidden_states: mx.array) -> mx.array:
         logits = self.lm_head(hidden_states)
         if self.sharding_group is not None:
             logits = gather_last_axis(logits, self.sharding_group)
@@ -240,8 +262,63 @@ class Model(nn.Module):
         logits = mx.tanh(logits / softcap) * softcap
         return logits[..., : text.unpadded_vocab_size]
 
+    def forward_features(
+        self, inputs: mx.array, cache: list[Any], *, all_logits: bool = False
+    ) -> tuple[mx.array, mx.array]:
+        """Logits (of the last position only unless all_logits) and the DSpark
+        target features (B, L, taps, hidden) of every position."""
+        hidden, taps = self.model.language_model(
+            inputs, cache=cache, capture=self.dspark.args.target_layer_ids
+        )
+        if not all_logits:
+            hidden = hidden[:, -1:]
+        return self.logits(hidden), mx.stack(taps, axis=2)
+
+    def draft(self, token, position, last_features, draft_cache, k: int):
+        """k DSpark draft tokens after `token` at `position`."""
+        lm = self.model.language_model
+        anchor = lm.embed(token.reshape(1, 1))
+        return self.dspark.draft(
+            token, anchor, position, last_features, draft_cache, self.logits, k
+        )
+
+    @staticmethod
+    def record_conv_windows(cache: list[Any], on: bool):
+        """On: the next forward keeps its convolution windows (until the
+        next forward recorded) for rollback_speculative_cache."""
+        for c in cache:
+            c[1].record_windows = on
+
+    @staticmethod
+    def rollback_speculative_cache(cache: list[Any], keep: int, held: int):
+        """Of the tokens of the last recorded forward, the cache holds the
+        first `held`: keep the first `keep`. The key/value caches lose the
+        rest (exact also past the sliding window: the multi-token forward
+        left the rotating buffer in temporal order), the convolution states
+        are taken from the recorded windows."""
+        from mlx_lm.generate import _gemma4_trim_cache
+
+        drop = held - keep
+        if drop <= 0:
+            return
+        _gemma4_trim_cache([c[0] for c in cache], drop)
+        for c in cache:
+            conv = c[1]
+            n = conv[0].shape[1]
+            for i, window in enumerate(conv.windows):
+                conv[i] = mx.contiguous(window[:, keep : keep + n])
+
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
-        return checkpoint.sanitize(self, weights)
+        # The draft: mtp.* as published, dspark.* once converted.
+        draft = {k: v for k, v in weights.items() if k.startswith(("mtp.", "dspark."))}
+        weights = {k: v for k, v in weights.items() if k not in draft}
+        if not draft and "dspark" in self:
+            del self["dspark"]
+        weights = checkpoint.sanitize(self, weights)
+        if "dspark" in self:
+            for k, v in draft.items():
+                weights["dspark." + k.split(".", 1)[1]] = v
+        return weights
 
     def shard(self, group: mx.distributed.Group | None = None) -> None:
         group = group or mx.distributed.init()
@@ -297,8 +374,10 @@ class Model(nn.Module):
     def quant_predicate(self) -> Callable[[str, nn.Module], bool]:
 
         def predicate(path: str, module: nn.Module) -> bool:
-            return not path.startswith("model.vision_tower.") and (
-                "_message_gate." not in path
+            # The draft's recurrence stays float, as the reference's fp32 path.
+            return not path.startswith("model.vision_tower.") and not (
+                "_message_gate." in path
+                or path.endswith(("rnn_proj", "markov_head.hidden_out"))
             )
 
         return predicate

@@ -669,6 +669,10 @@ class DecoderLayer(nn.Module):
 
         if conv is not None:
             n = self.post_mlp_convolution.kernel_size - 1
+            if getattr(conv, "record_windows", False):
+                # A speculative verify keeps the windows: the rollback sets the
+                # states to the last accepted token.
+                conv.windows = list(conv_states)
             for i, window in enumerate(conv_states):
                 conv[i] = _conv_state(window, conv.lengths, n)
             conv.advance(block_residual.shape[1])
