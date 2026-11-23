@@ -33,7 +33,10 @@ setup(
         "jinja2",
         # Image inputs in mlx_lm.server chat completions (mlx_lm/multimodal.py
         # uses HF's PIL-backed Gemma 4 image processor; no torch needed).
-        "pillow",
+        # Pillow 13's PIL._typing imports numbers._IntegralLike, which only
+        # Python 3.15 has, so `from PIL import Image` fails on 3.14 and older.
+        "pillow<13; python_version < '3.15'",
+        "pillow; python_version >= '3.15'",
     ],
     # Every subpackage; mlx_lm.quant has no __init__.py.
     packages=sorted({*find_packages(include=["mlx_lm", "mlx_lm.*"]), "mlx_lm.quant"}),
